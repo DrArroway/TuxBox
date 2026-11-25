@@ -3,18 +3,22 @@ use super::*;
 
 impl<'a> Emitter<'a> {
     // READLANE ignores EXEC. Publish each lane's current VGPR even when
-    // that lane skipped the guest branch, then guard only the scalar write.
-    pub(in crate::hlsl) fn emit_indexed_read(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+    // that lane skipped the guest branch, then guard only the load (for
+    // partial-group bounds) and scalar write while keeping barriers uniform.
+    pub(in crate::hlsl) fn emit_indexed_read(&mut self, idx: usize, ins: &Insn, active: &[usize]) -> Result<(), String> {
         if self.dispatched {
             return Err("indexed lane read in a block-dispatched program".into());
         }
         let mask = if ins.aux.imm == 31 { 31u32 } else { 63u32 };
         self.line(&format!("tb_swizzle[tb_lane] = {};", r(&ins.src[0])?));
         self.line("GroupMemoryBarrierWithGroupSync();");
-        self.line(&format!(
-            "uint readlane{idx} = tb_swizzle_read((tb_lane & ~{mask}u) | ({} & {mask}u));",
-            r(&ins.src[1])?
-        ));
+        let load = format!("tb_swizzle_read((tb_lane & ~{mask}u) | ({} & {mask}u))", r(&ins.src[1])?);
+        if active.is_empty() {
+            self.line(&format!("uint readlane{idx} = {load};"));
+        } else {
+            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+            self.line(&format!("uint readlane{idx} = ({}) ? {load} : 0u;", guard.join(" && ")));
+        }
         self.line("GroupMemoryBarrierWithGroupSync();");
         Ok(())
     }

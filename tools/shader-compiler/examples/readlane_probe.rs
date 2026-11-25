@@ -199,6 +199,72 @@ fn main() {
                 false,
             )
         }
+        "wave32_ctl_dep_guard_31" => {
+            // F2 live-GPU repro: lane 31 skips overwrite+readlane via control-dependent SCC.
+            // Lanes 0..30 MUST read lane 31's original input, NOT 0xdead0000.
+            let [r0, r1] = readlane(7, 1, 31);
+            (
+                [32, 1, 1],
+                vec![
+                    0xbe87_0380,             // s_mov_b32 s7, 0
+                    0xbe8a_0380,             // s_mov_b32 s10, 0
+                    0x7d84_009f,             // v_cmp_eq_u32 vcc, 31, v0
+                    0xbf87_0001,             // s_cbranch_vccnz +1 (lane 31 keeps s10=0)
+                    0xbe8a_0381,             // s_mov_b32 s10, 1 (lanes 0..30 get s10=1)
+                    0xbf06_800a,             // s_cmp_eq_u32 s10, 0
+                    0xbf85_0004,             // s_cbranch_scc1 +4 (lane 31 skips)
+                    0x7e02_02ff, 0xdead0000, // v_mov_b32 v1, 0xdead0000
+                    r0, r1,                  // v_readlane_b32 s7, v1, 31
+                    0xbf81_0000,
+                ],
+                "s7",
+                false,
+            )
+        }
+        "wave32_64t_and_exec_31" => {
+            // F4 live-GPU repro: [64, 1, 1] Wave32 using s_and_b32/s_or_b32 on exec_lo.
+            // Wave 0 (0..31) reads thread 31; Wave 1 (32..63) reads thread 63.
+            let [r0, r1] = readlane(7, 1, 31);
+            (
+                [64, 1, 1],
+                vec![
+                    0x3604_009f,             // v_and_b32 v2, 31, v0
+                    0x7e06_029f,             // v_mov_b32 v3, 31
+                    0x7d82_0702,             // v_cmp_lt_u32 vcc, v2, v3
+                    0x877e_6a7e,             // s_and_b32 exec_lo, exec_lo, vcc_lo
+                    0x7e02_02ff, 0xbad00000, // v_mov_b32 v1, 0xbad00000
+                    r0, r1,                  // v_readlane_b32 s7, v1, 31
+                    0x887e_c17e,             // s_or_b32 exec_lo, exec_lo, -1
+                    0xbf81_0000,
+                ],
+                "s7",
+                false,
+            )
+        }
+        "wave32_mbcnt_exec_31" => {
+            // F5 live-GPU repro: [32, 1, 1] Wave32 combining s_and_saveexec_b32,
+            // v_mbcnt_lo_u32_b32 v2, exec_lo, 0, and v_readlane_b32 s7, v1, 31.
+            // Stores `(v2 << 24) | (s7 & 0x00ffffff)` to verify both prefix count and readlane!
+            let [r0, r1] = readlane(7, 1, 31);
+            (
+                [32, 1, 1],
+                vec![
+                    0x7e04_029f,              // v_mov_b32 v2, 31
+                    0x7d82_0500,              // v_cmp_lt_u32 vcc, v0, v2 (lanes 0..30 active)
+                    0xbe84_3c6a,              // s_and_saveexec_b32 s4, vcc_lo
+                    0xd765_0002, 0x0001_007e, // v_mbcnt_lo_u32_b32 v2, exec_lo, 0 (0..30)
+                    r0, r1,                   // v_readlane_b32 s7, v1, 31
+                    0xbefe_0304,              // s_mov_b32 exec_lo, s4 (restore all 32 lanes)
+                    0x3404_0498,              // v_lshlrev_b32 v2, 24, v2
+                    0x7e06_0207,              // v_mov_b32 v3, s7
+                    0x3606_06ff, 0x00ffffff,  // v_and_b32 v3, 0x00ffffff, v3
+                    0x3804_0702,              // v_or_b32 v2, v2, v3
+                    0xbf81_0000,
+                ],
+                "v2",
+                true,
+            )
+        }
         other => panic!("unknown readlane probe case: {other}"),
     };
     let end_off = (words.len() - 1) * 4;

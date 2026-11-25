@@ -414,3 +414,256 @@ fn refuses_out_of_range_unproven_dynamic_and_non_uniform_loop_readlanes() {
     .expect("unwritten spill lane must stay refused");
     assert!(err.contains("v72 lane 1 read before any v_writelane"), "{err}");
 }
+
+#[test]
+fn f1_refuses_non_uniform_branch_skipping_entire_readlane_loop_and_prior_non_uniform_loop() {
+    let [r0, r1] = readlane_const(7, 1, 31);
+    // F1a: `if (exec != 0) { for (s10 = 4; s10 != 0; --s10) v_readlane_b32 ... }`
+    let skip_loop = [
+        0xbe8a_0384, // 0x00: s_mov_b32 s10, 4
+        0xbe84_3c6a, // 0x04: s_and_saveexec_b32 s4, vcc_lo
+        0xbf88_0005, // 0x08: s_cbranch_execz +5 -> 0x20 (past loop end!)
+        r0, r1,      // 0x0c: L_loop: v_readlane_b32 s7, v1, 31
+        0x818a_810a, // 0x14: s_sub_i32 s10, s10, 1
+        0xbf07_800a, // 0x18: s_cmp_lg_u32 s10, 0
+        0xbf85_fffb, // 0x1c: s_cbranch_scc1 L_loop
+        0xbf81_0000, // 0x20: s_endpgm
+    ];
+    let err = crate::hlsl::translate(&compute_shader([32, 1, 1], &skip_loop, None))
+        .err()
+        .expect("non-uniform branch skipping entire barrier loop must be refused");
+    assert!(err.contains("non-uniform loop"), "{err}");
+
+    // F1b: Preceding non-uniform loop would desync function-wide `tb_guard` before barrier loop.
+    let prior_non_uniform = [
+        0x7e02_0300, // 0x00: L0: v_mov_b32 v1, v0
+        0xbf87_fffe, // 0x04: s_cbranch_vccnz L0 (non-uniform!)
+        0xbe8a_0384, // 0x08: s_mov_b32 s10, 4
+        r0, r1,      // 0x0c: L1: v_readlane_b32 s7, v1, 31
+        0x818a_810a, // 0x14: s_sub_i32 s10, s10, 1
+        0xbf07_800a, // 0x18: s_cmp_lg_u32 s10, 0
+        0xbf85_fffb, // 0x1c: s_cbranch_scc1 L1
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &prior_non_uniform, None))
+        .err()
+        .expect("barrier loop after non-uniform loop must be refused");
+    assert!(err.contains("follows non-uniform loop"), "{err}");
+}
+
+#[test]
+fn f2_control_dependence_taints_sgpr_and_scc_under_non_uniform_branch() {
+    let [r0, r1] = readlane_const(7, 1, 31);
+    // F2a: `s10 = 4; if (v0 != 0) s10 = 1;` then loop on s10 around v_readlane_b32 -> refused!
+    let divergent_trip = [
+        0xbe8a_0384, // s_mov_b32 s10, 4
+        0x7d84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xbf87_0001, // s_cbranch_vccnz +1 (lane 0 keeps s10=4, others set s10=1)
+        0xbe8a_0381, // s_mov_b32 s10, 1
+        r0, r1,      // L_loop: v_readlane_b32 s7, v1, 31
+        0x818a_810a, // s_sub_i32 s10, s10, 1
+        0xbf07_800a, // s_cmp_lg_u32 s10, 0
+        0xbf85_fffb, // s_cbranch_scc1 L_loop
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &divergent_trip, None))
+        .err()
+        .expect("control-dependent trip count must be refused");
+    assert!(err.contains("non-uniform loop"), "{err}");
+
+    // F2b: Control-dependent guard over v_readlane_b32 on [32,1,1] MUST NOT use WaveReadLaneAt.
+    let divergent_guard = [
+        0xbe8a_0380,             // s_mov_b32 s10, 0
+        0x7d84_009f,             // v_cmp_eq_u32 vcc, 31, v0 (lane 31 sets vcc=1)
+        0xbf87_0001,             // s_cbranch_vccnz +1 (lane 31 keeps s10=0)
+        0xbe8a_0381,             // s_mov_b32 s10, 1 (lanes 0..30 get s10=1)
+        0xbf06_800a,             // s_cmp_eq_u32 s10, 0 (lane 31 sets scc=1)
+        0xbf85_0004,             // s_cbranch_scc1 +4 (lane 31 skips overwrite+readlane!)
+        0x7e02_02ff, 0xdead0000, // v_mov_b32 v1, 0xdead0000
+        r0, r1,                  // v_readlane_b32 s7, v1, 31
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([32, 1, 1], &divergent_guard, None))
+        .expect("control-dependent guard must fall back to hoisted groupshared");
+    assert!(!tr.hlsl.contains("WaveReadLaneAt("), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("tb_swizzle[tb_lane] = v1;"), "{}", tr.hlsl);
+
+    // F2c: Control-dependent bounded SGPR selector MUST NOT use WaveReadLaneAt.
+    let [rs0, rs1] = readlane_sgpr(7, 1, 10);
+    let divergent_sel = [
+        0xbe8a_0385, // s_mov_b32 s10, 5
+        0x7d84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xbf87_0001, // s_cbranch_vccnz +1
+        0xbe8a_0383, // s_mov_b32 s10, 3
+        rs0, rs1,    // v_readlane_b32 s7, v1, s10
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([32, 1, 1], &divergent_sel, None))
+        .expect("control-dependent bounded selector falls back to groupshared");
+    assert!(!tr.hlsl.contains("WaveReadLaneAt("), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("tb_swizzle["), "{}", tr.hlsl);
+}
+
+#[test]
+fn f3_uniformity_tracks_sop1_rmw_scc_preserving_ops_and_smem_soffset() {
+    let [r0, r1] = readlane_const(7, 1, 31);
+    // F3a-1: SOP1 RMW `s_bitset0_b32 s6, 31` must keep tainted s6 tainted.
+    let bitset_poc = [
+        0xd4c2_0006, 0x0002_0080, // v_cmp_eq_u32 s[6:7], 0, v0
+        0xbe86_1b9f,              // s_bitset0_b32 s6, 31
+        r0, r1,                   // L_loop: v_readlane_b32 s7, v1, 31
+        0xbf07_8006,              // s_cmp_lg_u32 s6, 0
+        0xbf85_fffc,              // s_cbranch_scc1 L_loop
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &bitset_poc, None))
+        .err()
+        .expect("s_bitset0 on tainted SGPR must stay non-uniform");
+    assert!(err.contains("non-uniform loop"), "{err}");
+
+    // F3a-2: SOP1 RMW `s_cmov_b32 s6, 0` must keep tainted s6 tainted.
+    let cmov_poc = [
+        0xd4c2_0006, 0x0002_0080, // v_cmp_eq_u32 s[6:7], 0, v0
+        0xbf06_8180,              // s_cmp_eq_u32 0, 1 (uniform scc = 0)
+        0xbe86_0580,              // s_cmov_b32 s6, 0 (preserves tainted s6!)
+        r0, r1,                   // L_loop: v_readlane_b32 s7, v1, 31
+        0xbf07_8006,              // s_cmp_lg_u32 s6, 0
+        0xbf85_fffc,              // s_cbranch_scc1 L_loop
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &cmov_poc, None))
+        .err()
+        .expect("s_cmov on tainted SGPR must stay non-uniform");
+    assert!(err.contains("non-uniform loop"), "{err}");
+
+    // F3b: SCC-preserving `s_mulk_i32 s10, 2` after non-uniform `s_cmp_lg_u32` must keep scc tainted.
+    let mulk_poc = [
+        0xd4c2_0006, 0x0002_0080, // v_cmp_eq_u32 s[6:7], 0, v0
+        0xbe8a_0384,              // s_mov_b32 s10, 4
+        r0, r1,                   // L_loop: v_readlane_b32 s7, v1, 31
+        0xbf07_8006,              // s_cmp_lg_u32 s6, 0 (tainted scc)
+        0xb80a_0002,              // s_mulk_i32 s10, 2 (preserves scc!)
+        0xbf85_fffb,              // s_cbranch_scc1 L_loop
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &mulk_poc, None))
+        .err()
+        .expect("s_mulk_i32 must not clear tainted SCC");
+    assert!(err.contains("non-uniform loop"), "{err}");
+
+    // F3c: SMEM with non-NULL special soffset (106 = VCC_LO) must be non-uniform.
+    let smem_vcc_soffset = [
+        0xf400_0180, 0xd400_0000, // s_load_dword s6, s[0:1], vcc_lo (soffset=106)
+        r0, r1,                   // L_loop: v_readlane_b32 s7, v1, 31
+        0xbf07_8006,              // s_cmp_lg_u32 s6, 0
+        0xbf85_fffc,              // s_cbranch_scc1 L_loop
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &smem_vcc_soffset, None))
+        .err()
+        .expect("SMEM with VCC soffset must be non-uniform");
+    assert!(err.contains("non-uniform loop"), "{err}");
+}
+
+#[test]
+fn f4_detects_all_exec_width_ops_and_checks_conflicts_on_small_groups() {
+    let [r0, r1] = readlane_const(7, 1, 31);
+    // F4a: [64, 1, 1] using `s_and_b32 exec_lo, exec_lo, vcc_lo` + `s_or_b32 exec_lo, exec_lo, -1`
+    // MUST be classified as Wave32 (stride 31u, NOT 63u).
+    let wave32_logic_exec = [
+        0x877e_6a7e, // s_and_b32 exec_lo, exec_lo, vcc_lo
+        r0, r1,      // v_readlane_b32 s7, v1, 31
+        0x887e_c17e, // s_or_b32 exec_lo, exec_lo, -1
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave32_logic_exec, None))
+        .expect("wave32 s_and_b32 exec_lo readlane");
+    assert!(
+        tr.hlsl.contains("tb_swizzle[(tb_lane & ~31u) | (0x1fu & 31u)]"),
+        "{}",
+        tr.hlsl
+    );
+    assert!(!tr.hlsl.contains("~63u"), "{}", tr.hlsl);
+
+    // F4b: [32, 1, 1] with conflicting 32-bit and 64-bit EXEC saves MUST be refused.
+    let conflict_small = [
+        0xbe84_3c6a, // s_and_saveexec_b32 s4, vcc_lo
+        0xbe86_246a, // s_and_saveexec_b64 s[6:7], vcc
+        r0, r1,
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([32, 1, 1], &conflict_small, None))
+        .err()
+        .expect("conflicting wave32/wave64 on 32-thread group must be refused");
+    assert!(err.contains("conflicting wave32 and wave64"), "{err}");
+
+    // F4c: [32, 1, 1] with Wave64 EXEC marker stays portable (no [WaveSize(32)]).
+    let wave64_small = [
+        0xbefe_04c1, // s_mov_b64 exec, -1
+        r0, r1,
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([32, 1, 1], &wave64_small, None))
+        .expect("wave64 32-thread group uses portable groupshared");
+    assert_eq!(tr.required_wave_size, None);
+    assert!(!tr.hlsl.contains("[WaveSize(32)]"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("tb_swizzle["), "{}", tr.hlsl);
+}
+
+#[test]
+fn f5_indexed_lane_preserves_exec_ballot_for_v_mbcnt_lo() {
+    let [r0, r1] = readlane_const(7, 1, 31);
+    let words = [
+        0xbe84_3c6a,              // s_and_saveexec_b32 s4, vcc_lo
+        0xd765_0002, 0x0001_007e, // v_mbcnt_lo_u32_b32 v2, exec_lo, 0
+        r0, r1,                   // v_readlane_b32 s7, v1, 31
+        0xbefe_0304,              // s_mov_b32 exec_lo, s4
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([32, 1, 1], &words, None))
+        .expect("wave32 indexed_lane with v_mbcnt_lo(exec_lo)");
+    assert_eq!(tr.required_wave_size, Some(32));
+    assert!(
+        tr.hlsl.contains("WaveActiveBallot((exec_lo & 1u) != 0u).x"),
+        "{}",
+        tr.hlsl
+    );
+    assert!(!tr.hlsl.contains("countbits(exec_lo &"), "{}", tr.hlsl);
+}
+
+#[test]
+fn f6_hoisted_indexed_read_guards_load_against_oob_on_partial_groups() {
+    // [7, 3, 1] -> tb_swizzle[21]. Lane 0 sets s24 = 30 and skips past s24 = 5 + readlane.
+    // The hoisted load MUST guard tb_swizzle[...] on `!j...` while keeping both barriers unconditional.
+    let [rs0, rs1] = readlane_sgpr(7, 1, 24);
+    let words = [
+        0xbe98_039e, // s_mov_b32 s24, 30
+        0x7d84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xbf87_0003, // s_cbranch_vccnz +3 (lane 0 skips s24=5 and readlane)
+        0xbe98_0385, // s_mov_b32 s24, 5
+        rs0, rs1,    // v_readlane_b32 s7, v1, s24
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([7, 3, 1], &words, None))
+        .expect("partial group guarded hoisted readlane");
+    assert!(tr.hlsl.contains("groupshared uint tb_swizzle[21];"), "{}", tr.hlsl);
+    assert!(
+        tr.hlsl.contains("(!j5) ? tb_swizzle[(tb_lane & ~31u) | (s24 & 31u)] : 0u;"),
+        "{}",
+        tr.hlsl
+    );
+}
+
+#[test]
+fn minor_refuses_flagged_vop3_readlane_encoding() {
+    // Set CLAMP bit (bit 15) on v_readlane_b32 VOP3 word 0.
+    let [r0, r1] = readlane_const(7, 1, 31);
+    let err = crate::hlsl::translate(&compute_shader(
+        [32, 1, 1],
+        &[r0 | (1 << 15), r1, 0xbf81_0000],
+        None,
+    ))
+    .err()
+    .expect("CLAMP-flagged v_readlane_b32 must be refused");
+    assert!(err.contains("modifiers"), "{err}");
+}

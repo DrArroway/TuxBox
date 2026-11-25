@@ -319,10 +319,15 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     {
         return Err("asymmetric DPP16 row mask requires a known guest wave width".into());
     }
-    if wave32_readlane && required_wave_size == Some(64) {
+    let wave32_mbcnt_mask = indexed_lane_wave32
+        && em.insns.iter().any(|i| {
+            i.mnemonic == "v_mbcnt_lo_u32_b32"
+                && matches!(i.src.first(), Some(Opnd::ExecLo | Opnd::ExecHi))
+        });
+    if (wave32_readlane || wave32_mbcnt_mask) && required_wave_size == Some(64) {
         return Err("conflicting wave widths for Wave32 lane read".into());
     }
-    let required_wave_size = required_wave_size.or((uses_quad_add && em.straight_pixel_quad.is_none() && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema || wave32_readlane).then_some(32));
+    let required_wave_size = required_wave_size.or((uses_quad_add && em.straight_pixel_quad.is_none() && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema || wave32_readlane || wave32_mbcnt_mask).then_some(32));
     // A ballot or minimum over active invocations also works in the final
     // partial subgroup. Keep the full-wave requirement for every other user.
     let partial_election = required_wave_size.is_none() && election == Some(ElectionLowering::Native32);

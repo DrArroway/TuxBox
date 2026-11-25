@@ -168,6 +168,10 @@ impl UniformState {
         Self { sgpr: [true; 106], scc: false }
     }
 
+    fn all_tainted() -> Self {
+        Self { sgpr: [false; 106], scc: false }
+    }
+
     fn opnd(&self, op: &Opnd, wide: bool) -> bool {
         match *op {
             Opnd::ConstInt(_) | Opnd::ConstF32(_) | Opnd::Literal(_) => true,
@@ -196,9 +200,10 @@ impl UniformState {
     }
 }
 
-fn scalar_preserves_scc(name: &str) -> bool {
+/// Explicit allowlist of scalar instructions known to leave `SCC` untouched.
+fn scalar_preserves_scc(ins: &Insn) -> bool {
     matches!(
-        name,
+        ins.mnemonic.as_str(),
         "s_mov_b32"
             | "s_mov_b64"
             | "s_movk_i32"
@@ -209,20 +214,120 @@ fn scalar_preserves_scc(name: &str) -> bool {
             | "s_cmovk_i32"
             | "s_getpc_b64"
             | "s_brev_b32"
+            | "s_brev_b64"
             | "s_bitset0_b32"
+            | "s_bitset0_b64"
             | "s_bitset1_b32"
+            | "s_bitset1_b64"
             | "s_bfm_b32"
             | "s_bfm_b64"
             | "s_mul_i32"
+            | "s_mulk_i32"
             | "s_mul_hi_u32"
             | "s_mul_hi_i32"
+            | "s_ff1_i32_b32"
+            | "s_ff1_i32_b64"
+            | "s_ff0_i32_b32"
+            | "s_ff0_i32_b64"
+            | "s_flbit_i32_b32"
+            | "s_flbit_i32_b64"
+            | "s_flbit_i32"
+            | "s_flbit_i32_i64"
+            | "s_sext_i32_i8"
+            | "s_sext_i32_i16"
             | "s_pack_ll_b32_b16"
             | "s_pack_lh_b32_b16"
             | "s_pack_hh_b32_b16"
+            | "s_setreg_b32"
+            | "s_setreg_imm32_b32"
+            | "s_getreg_b32"
     )
 }
 
-fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> Vec<UniformState> {
+/// Explicit allowlist of scalar instructions known to write `SCC` solely from their
+/// inputs (defaulting every unrecognized scalar instruction to `scc = false`).
+fn scalar_writes_scc(ins: &Insn) -> bool {
+    let m = ins.mnemonic.as_str();
+    match ins.enc {
+        Enc::Sopc => m.starts_with("s_cmp_") || m.starts_with("s_bitcmp"),
+        Enc::Sopk => m.starts_with("s_cmpk_") || m == "s_addk_i32",
+        Enc::Sop2 => matches!(
+            m,
+            "s_add_u32"
+                | "s_sub_u32"
+                | "s_add_i32"
+                | "s_sub_i32"
+                | "s_addc_u32"
+                | "s_subb_u32"
+                | "s_min_i32"
+                | "s_min_u32"
+                | "s_max_i32"
+                | "s_max_u32"
+                | "s_and_b32"
+                | "s_and_b64"
+                | "s_or_b32"
+                | "s_or_b64"
+                | "s_xor_b32"
+                | "s_xor_b64"
+                | "s_andn2_b32"
+                | "s_andn2_b64"
+                | "s_orn2_b32"
+                | "s_orn2_b64"
+                | "s_nand_b32"
+                | "s_nand_b64"
+                | "s_nor_b32"
+                | "s_nor_b64"
+                | "s_xnor_b32"
+                | "s_xnor_b64"
+                | "s_lshl_b32"
+                | "s_lshl_b64"
+                | "s_lshr_b32"
+                | "s_lshr_b64"
+                | "s_ashr_i32"
+                | "s_ashr_i64"
+                | "s_bfe_u32"
+                | "s_bfe_i32"
+                | "s_bfe_u64"
+                | "s_bfe_i64"
+                | "s_absdiff_i32"
+                | "s_lshl1_add_u32"
+                | "s_lshl2_add_u32"
+                | "s_lshl3_add_u32"
+                | "s_lshl4_add_u32"
+        ),
+        Enc::Sop1 => matches!(
+            m,
+            "s_not_b32"
+                | "s_not_b64"
+                | "s_bcnt0_i32_b32"
+                | "s_bcnt0_i32_b64"
+                | "s_bcnt1_i32_b32"
+                | "s_bcnt1_i32_b64"
+                | "s_abs_i32"
+        ),
+        _ => false,
+    }
+}
+
+fn scalar_reads_dst(ins: &Insn) -> bool {
+    let m = ins.mnemonic.as_str();
+    (ins.enc == Enc::Sopk && !m.starts_with("s_movk") && !m.starts_with("s_getreg"))
+        || matches!(
+            m,
+            "s_bitset0_b32"
+                | "s_bitset0_b64"
+                | "s_bitset1_b32"
+                | "s_bitset1_b64"
+                | "s_cmov_b32"
+                | "s_cmov_b64"
+        )
+}
+
+fn analyze_uniformity_pass(
+    insns: &[Insn],
+    cfg: &CfgInfo,
+    non_uniform_ctl: &[bool],
+) -> Vec<UniformState> {
     let n = insns.len();
     let mut states: Vec<Option<UniformState>> = vec![None; n];
     if n == 0 {
@@ -234,27 +339,33 @@ fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> Vec<UniformState> {
     while let Some(i) = work.pop_front() {
         iters += 1;
         if iters > n.saturating_mul(64) {
-            return vec![UniformState { sgpr: [false; 106], scc: false }; n];
+            return vec![UniformState::all_tainted(); n];
         }
         let ins = &insns[i];
-        let mut out = states[i].clone().expect("reachable");
+        let incoming = states[i].as_ref().expect("reachable");
+        let mut out = incoming.clone();
         let m = ins.mnemonic.as_str();
+        let ctl_ok = !non_uniform_ctl[i];
         if m != "v_nop" {
             match ins.enc {
                 Enc::Smem => {
+                    let is_load = m.starts_with("s_load_") || m.starts_with("s_buffer_load_");
                     let base_wide = m.starts_with("s_buffer");
                     let base_ok = ins.src.iter().all(|o| match *o {
                         Opnd::Sgpr(r @ 0..=105) => {
                             let width = if base_wide { 4 } else { 2 };
-                            (0..width).all(|k| (r as usize + k) < 106 && out.sgpr[r as usize + k])
+                            (0..width)
+                                .all(|k| (r as usize + k) < 106 && incoming.sgpr[r as usize + k])
                         }
-                        _ => out.opnd(o, false),
+                        _ => incoming.opnd(o, false),
                     });
-                    let off_ok = ins.raw.get(1).is_none_or(|w| {
-                        let off = (w >> 25) as usize;
-                        off >= 106 || out.sgpr[off]
+                    // 7-bit SMEM soffset: 0..=105 are SGPRs, 125 is NULL (no scalar offset);
+                    // 106..=124 and 126..=127 (VCC/M0/EXEC) are non-uniform.
+                    let off_ok = ins.raw.get(1).is_some_and(|w| {
+                        let off = ((w >> 25) & 0x7f) as usize;
+                        off == 125 || (off < 106 && incoming.sgpr[off])
                     });
-                    let uniform = base_ok && off_ok;
+                    let uniform = ctl_ok && is_load && base_ok && off_ok;
                     for r in 0..106u8 {
                         if clobbers_scalar(ins, r) {
                             out.sgpr[r as usize] = uniform;
@@ -273,7 +384,9 @@ fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> Vec<UniformState> {
                             | "s_addc_u32"
                             | "s_subb_u32"
                     );
-                    let uniform = if m == "s_getpc_b64" {
+                    let uniform = if !ctl_ok {
+                        false
+                    } else if m == "s_getpc_b64" {
                         true
                     } else if m.contains("exec")
                         || m.starts_with("s_wqm")
@@ -282,19 +395,18 @@ fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> Vec<UniformState> {
                     {
                         false
                     } else {
-                        let src_ok = ins.src.iter().all(|o| out.opnd(o, wide));
-                        let dst_in_ok = ins.enc != Enc::Sopk
-                            || m.starts_with("s_movk")
-                            || ins.dst.iter().all(|o| out.opnd(o, false));
-                        src_ok && dst_in_ok && (!reads_scc || out.scc)
+                        let src_ok = ins.src.iter().all(|o| incoming.opnd(o, wide));
+                        let dst_in_ok = !scalar_reads_dst(ins)
+                            || ins.dst.iter().all(|o| incoming.opnd(o, wide));
+                        src_ok && dst_in_ok && (!reads_scc || incoming.scc)
                     };
                     for r in 0..106u8 {
                         if clobbers_scalar(ins, r) {
                             out.sgpr[r as usize] = uniform;
                         }
                     }
-                    if ins.enc == Enc::Sopc || !scalar_preserves_scc(m) {
-                        out.scc = uniform;
+                    if !scalar_preserves_scc(ins) {
+                        out.scc = if scalar_writes_scc(ins) { uniform } else { false };
                     }
                 }
                 Enc::Sopp => {}
@@ -341,18 +453,75 @@ fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> Vec<UniformState> {
     }
     states
         .into_iter()
-        .map(|s| s.unwrap_or(UniformState { sgpr: [false; 106], scc: false }))
+        .map(|s| s.unwrap_or_else(UniformState::all_tainted))
         .collect()
 }
 
-fn is_uniform_branch(ins: &Insn, state: &UniformState) -> bool {
-    if ins.enc != Enc::Sopp {
+fn is_uniform_branch(ins: &Insn, state: &UniformState, non_uniform_ctl: bool) -> bool {
+    if non_uniform_ctl || ins.enc != Enc::Sopp {
         return false;
     }
     match ins.op {
         2 => true,
         4 | 5 => state.scc,
         _ => false,
+    }
+}
+
+fn is_loop_uniform(
+    insns: &[Insn],
+    cfg: &CfgInfo,
+    l: usize,
+    b: usize,
+    states: &[UniformState],
+    non_uniform_ctl: &[bool],
+) -> bool {
+    if !is_uniform_branch(&insns[b], &states[b], non_uniform_ctl[b]) {
+        return false;
+    }
+    let bad_body = insns[l..=b].iter().enumerate().any(|(off, op)| {
+        let j = l + off;
+        op.mnemonic == "s_endpgm"
+            || cfg.target.get(&j).is_some_and(|&t| {
+                (t == b || t > b) && !is_uniform_branch(op, &states[j], non_uniform_ctl[j])
+            })
+    });
+    if bad_body {
+        return false;
+    }
+    // Reject any non-uniform forward branch entering the loop body OR skipping the whole loop.
+    !cfg.target.iter().any(|(&from, &to)| {
+        from < l && to > l && !is_uniform_branch(&insns[from], &states[from], non_uniform_ctl[from])
+    })
+}
+
+/// Coupled dataflow + control-dependence fixpoint for workgroup uniformity.
+/// Every SGPR/SCC written inside the span of a non-uniform branch or loop is tainted.
+fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> (Vec<UniformState>, Vec<bool>) {
+    let n = insns.len();
+    let mut non_uniform_ctl = vec![false; n];
+    loop {
+        let states = analyze_uniformity_pass(insns, cfg, &non_uniform_ctl);
+        let mut next_ctl = non_uniform_ctl.clone();
+        for (&from, &to) in &cfg.target {
+            if !is_uniform_branch(&insns[from], &states[from], non_uniform_ctl[from]) {
+                let end = to.min(n);
+                for slot in next_ctl.iter_mut().take(end).skip(from + 1) {
+                    *slot = true;
+                }
+            }
+        }
+        for &(l, b) in &cfg.loops {
+            if !is_loop_uniform(insns, cfg, l, b, &states, &non_uniform_ctl) {
+                for slot in &mut next_ctl[l..=b] {
+                    *slot = true;
+                }
+            }
+        }
+        if next_ctl == non_uniform_ctl {
+            return (states, non_uniform_ctl);
+        }
+        non_uniform_ctl = next_ctl;
     }
 }
 
@@ -472,6 +641,13 @@ fn analyze_exec_full(insns: &[Insn], cfg: &CfgInfo) -> Vec<bool> {
     states.into_iter().map(|s| s.is_some_and(|e| e.full)).collect()
 }
 
+fn touches_exec(op: &Insn) -> bool {
+    op.dst
+        .iter()
+        .chain(&op.src)
+        .any(|o| matches!(o, Opnd::ExecLo | Opnd::ExecHi))
+}
+
 fn has_wave32_markers(insns: &[Insn], required_wave_size: Option<u32>, fspx_wave32: bool) -> bool {
     if required_wave_size == Some(32) || fspx_wave32 {
         return true;
@@ -480,10 +656,9 @@ fn has_wave32_markers(insns: &[Insn], required_wave_size: Option<u32>, fspx_wave
         let m = op.mnemonic.as_str();
         m.ends_with("saveexec_b32")
             || m.ends_with("wrexec_b32")
-            || (m == "s_mov_b32"
-                && (op.dst.contains(&Opnd::ExecLo) || op.src.contains(&Opnd::ExecLo)))
-            || (matches!(m, "s_ff1_i32_b32" | "s_bcnt1_i32_b32")
-                && op.src.contains(&Opnd::ExecLo))
+            || (matches!(op.enc, Enc::Sop1 | Enc::Sop2 | Enc::Sopc)
+                && (m.ends_with("_b32") || m.ends_with("_u32") || m.ends_with("_i32"))
+                && touches_exec(op))
             || (op.enc == Enc::Vop3
                 && m.starts_with("v_cmp_")
                 && matches!(op.dst.as_slice(), [Opnd::Sgpr(n)] if n & 1 != 0))
@@ -508,10 +683,9 @@ fn has_wave64_markers(
         let m = op.mnemonic.as_str();
         m.ends_with("saveexec_b64")
             || m.ends_with("wrexec_b64")
-            || (m == "s_mov_b64"
-                && (op.dst.contains(&Opnd::ExecLo) || op.src.contains(&Opnd::ExecLo)))
-            || (matches!(m, "s_ff1_i32_b64" | "s_bcnt1_i32_b64")
-                && op.src.contains(&Opnd::ExecLo))
+            || (matches!(op.enc, Enc::Sop1 | Enc::Sop2 | Enc::Sopc)
+                && (m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64"))
+                && touches_exec(op))
             || m == "v_mbcnt_hi_u32_b32"
     })
 }
@@ -559,34 +733,32 @@ pub(super) fn lower_constant_reads(
             "v_readlane_b32 at {first_off:#x}: compute group size {count} outside 1..=1024"
         ));
     }
+    let wave32 = has_wave32_markers(insns, required_wave_size, fspx_wave32);
+    let wave64 = has_wave64_markers(insns, &read_sites, required_wave_size);
+    if wave32 && wave64 {
+        return Err(format!(
+            "v_readlane_b32 at {first_off:#x}: conflicting wave32 and wave64 instructions"
+        ));
+    }
     let (guest_width, max_lane) = if count <= 32 {
         if !allow_small_group {
             return Ok(ConstantReadPlan::default());
         }
-        (32u32, count)
-    } else {
-        let wave32 = has_wave32_markers(insns, required_wave_size, fspx_wave32);
-        let wave64 = has_wave64_markers(insns, &read_sites, required_wave_size);
-        if wave32 && wave64 {
+        (if wave64 { 64u32 } else { 32u32 }, count)
+    } else if wave32 {
+        if count % 32 != 0 {
             return Err(format!(
-                "v_readlane_b32 at {first_off:#x}: conflicting wave32 and wave64 instructions"
+                "v_readlane_b32 at {first_off:#x}: wave32 compute group ({count} threads) must be a multiple of 32"
             ));
         }
-        if wave32 {
-            if count % 32 != 0 {
-                return Err(format!(
-                    "v_readlane_b32 at {first_off:#x}: wave32 compute group ({count} threads) must be a multiple of 32"
-                ));
-            }
-            (32u32, 32u32)
-        } else {
-            if count % 64 != 0 {
-                return Err(format!(
-                    "v_readlane_b32 at {first_off:#x}: wave64 compute group ({count} threads) must be a multiple of 64"
-                ));
-            }
-            (64u32, 64u32)
+        (32u32, 32u32)
+    } else {
+        if count % 64 != 0 {
+            return Err(format!(
+                "v_readlane_b32 at {first_off:#x}: wave64 compute group ({count} threads) must be a multiple of 64"
+            ));
         }
+        (64u32, 64u32)
     };
 
     let needs_sgpr_proof = read_sites
@@ -615,9 +787,14 @@ pub(super) fn lower_constant_reads(
                 ));
             }
         };
-        if op.aux.sdwa.is_some() || (op.raw.len() == 2 && op.aux.mask != 0) {
+        if !op.is_complete()
+            || op.aux.sdwa.is_some()
+            || op.aux.imm != 0
+            || op.aux.imm2 != 0
+            || (op.raw.len() == 2 && op.aux.mask != 0)
+        {
             return Err(format!(
-                "v_readlane_b32 at {:#x}: unsupported VOP3 modifiers",
+                "v_readlane_b32 at {:#x}: unsupported VOP3 modifiers or truncated encoding",
                 op.offset
             ));
         }
@@ -666,29 +843,28 @@ pub(super) fn lower_constant_reads(
             insns[last_read].offset, early.offset
         ));
     }
-    let uniformity = analyze_uniformity(insns, &cfg);
-    // Check that any loop enclosing a readlane is proven workgroup-uniform.
+    let (uniformity, non_uniform_ctl) = analyze_uniformity(insns, &cfg);
+    // Check that every enclosing loop (and any earlier loop that shares `tb_guard`)
+    // is proven workgroup-uniform.
     for &idx in &read_sites {
         for &(l, b) in &cfg.loops {
             if !(l <= idx && idx <= b) {
                 continue;
             }
-            let uniform_back = is_uniform_branch(&insns[b], &uniformity[b]);
-            let bad_exit = insns[l..=b].iter().enumerate().any(|(off, op)| {
-                let j = l + off;
-                op.mnemonic == "s_endpgm"
-                    || cfg
-                        .target
-                        .get(&j)
-                        .is_some_and(|&t| (t == b || t > b) && !is_uniform_branch(op, &uniformity[j]))
-            });
-            let bad_entry = cfg.target.iter().any(|(&from, &to)| {
-                from < l && to > l && to <= b && !is_uniform_branch(&insns[from], &uniformity[from])
-            });
-            if !uniform_back || bad_exit || bad_entry {
+            if !is_loop_uniform(insns, &cfg, l, b, &uniformity, &non_uniform_ctl) {
                 return Err(format!(
                     "v_readlane_b32 at {:#x}: inside non-uniform loop ({:#x}..={:#x}); barrier/wave read cannot be proven convergent",
                     insns[idx].offset, insns[l].offset, insns[b].offset
+                ));
+            }
+            // A preceding non-uniform loop would desynchronize the function-wide
+            // `tb_guard` counter across lanes before entering this barrier loop.
+            if let Some(&(pl, pb)) = cfg.loops.iter().find(|&&(pl, pb)| {
+                pb < l && !is_loop_uniform(insns, &cfg, pl, pb, &uniformity, &non_uniform_ctl)
+            }) {
+                return Err(format!(
+                    "v_readlane_b32 at {:#x}: loop ({:#x}..={:#x}) follows non-uniform loop ({:#x}..={:#x})",
+                    insns[idx].offset, insns[l].offset, insns[b].offset, insns[pl].offset, insns[pb].offset
                 ));
             }
         }
@@ -699,16 +875,15 @@ pub(super) fn lower_constant_reads(
     let mut plan = ConstantReadPlan::default();
     let mut modes = Vec::with_capacity(read_sites.len());
     for &idx in &read_sites {
-        // Check if any non-uniform forward branch skips over this readlane.
-        let non_uniform_guard = cfg.target.iter().any(|(&from, &to)| {
-            from < idx && to > idx && !is_uniform_branch(&insns[from], &uniformity[from])
-        });
         let uniform_selector = match insns[idx].src.get(1) {
             Some(Opnd::ConstInt(_)) => true,
             Some(Opnd::Sgpr(reg @ 0..=105)) => uniformity[idx].sgpr[*reg as usize],
             _ => false,
         };
-        let native_wave32 = can_wave32_group && exec_full[idx] && !non_uniform_guard && uniform_selector;
+        let native_wave32 = can_wave32_group
+            && exec_full[idx]
+            && !non_uniform_ctl[idx]
+            && uniform_selector;
         modes.push(native_wave32);
     }
 

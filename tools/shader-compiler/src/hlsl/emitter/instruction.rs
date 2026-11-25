@@ -59,7 +59,7 @@ impl<'a> Emitter<'a> {
             }
             "tb_first_exec_lane" => return self.ws(&d.ok_or("missing election result")?, &format!("election{idx}")),
             "tb_indexed_readlane" => {
-                if self.hoisted_swizzle != Some(idx) { self.emit_indexed_read(idx, ins)?; }
+                if self.hoisted_swizzle != Some(idx) { self.emit_indexed_read(idx, ins, &[])?; }
                 self.ws(&d.ok_or("missing lane-read destination")?, &format!("readlane{idx}"))?;
                 return Ok(());
             }

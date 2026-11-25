@@ -21,40 +21,61 @@ pub(super) fn register(o: &Opnd) -> Option<u8> {
 
 pub(super) fn name(register: u8) -> String { format!("tb_bal{register}") }
 
-/// First scalar register written and how many.
-fn written(ins: &Insn, wide: bool) -> Option<(u8, u8)> {
+/// The scalar registers written: the first of each group and how many.
+fn written(ins: &Insn, wide: bool) -> Vec<(u8, u8)> {
     let m = ins.mnemonic.as_str();
-    let d = ins.dst.first()?;
+    let mask = if wide { 2 } else { 1 };
+    let Some(d) = ins.dst.first() else { return Vec::new() };
+    let one = |count: u8| register(d).map(|n| (n, count)).into_iter().collect::<Vec<_>>();
     if m.starts_with("s_load_") || m.starts_with("s_buffer_load_") {
-        let width = ["x16", "x8", "x4", "x2"].iter().zip([16, 8, 4, 2]).find(|(s, _)| m.ends_with(*s)).map_or(1, |(_, w)| w);
-        return Some((register(d)?, width));
+        return one(["x16", "x8", "x4", "x2"].iter().zip([16, 8, 4, 2]).find(|(s, _)| m.ends_with(*s)).map_or(1, |(_, w)| w));
     }
     if m.starts_with("s_") {
-        if m.starts_with("s_cmp") || m.starts_with("s_bitcmp") { return None; }
+        if m.starts_with("s_cmp") || m.starts_with("s_bitcmp") { return Vec::new(); }
         let single = ["s_bcnt", "s_ff", "s_flbit"].iter().any(|p| m.starts_with(p));
-        return Some((register(d)?, if m.ends_with("64") && !single { 2 } else { 1 }));
+        let pair = m.ends_with("64") || matches!(m, "s_bitreplicate_b64_b32" | "s_memtime" | "s_memrealtime");
+        return one(if pair && !single { 2 } else { 1 });
     }
-    if m == "v_readlane_b32" {
-        return match *d { Opnd::Vgpr(n) | Opnd::Sgpr(n) => Some((n, 1)), _ => register(d).map(|n| (n, 1)) };
+    if matches!(m, "v_readlane_b32" | "v_readfirstlane_b32") {
+        // The VOP3 encoding keeps the scalar destination in the vector field.
+        return match *d { Opnd::Vgpr(n) => vec![(n, 1)], _ => one(1) };
     }
-    if m.starts_with("v_cmpx") { return None; }
-    if m.starts_with("v_") && m != "v_readfirstlane_b32" {
-        let mask = ins.dst.iter().find_map(register)?;
-        return Some((mask, if wide { 2 } else { 1 }));
+    if m.starts_with("v_cmpx") { return Vec::new(); }
+    if m.starts_with("v_cmp") { return one(mask); }
+    if m.starts_with("v_") {
+        let carry = m.contains("_co_");
+        return match ins.enc {
+            Enc::Vop3 if carry || matches!(m, "v_mad_u64_u32" | "v_mad_i64_i32") || m.starts_with("v_div_scale") =>
+                vec![(((ins.raw[0] >> 8) & 127) as u8, mask)],
+            Enc::Vop2 if carry => vec![(VCC, mask)],
+            _ => ins.dst.iter().filter_map(register).map(|n| (n, mask)).collect(),
+        };
     }
-    Some((register(d)?, if m.starts_with("tb_") && m.ends_with("64") { 2 } else { 1 }))
+    one(if m.starts_with("tb_") && m.ends_with("64") { 2 } else { 1 })
 }
+
+/// Whether the lanes of an instruction's mask are all running it. Other masks can also
+/// hold lanes that went another way.
+fn running(ins: &Insn) -> bool {
+    let m = ins.mnemonic.as_str();
+    !BITWISE.iter().any(|p| m.starts_with(p)) || m.contains("saveexec")
+        || ins.src.iter().enumerate().any(|(k, o)| *o == Opnd::ExecLo
+            && (m.starts_with("s_mov_b") || m.starts_with("s_and_b") || (m.starts_with("s_andn2_b") && k == 0)))
+}
+
+const BITWISE: [&str; 11] = ["s_mov_b", "s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b",
+    "s_xnor_b", "s_not_b", "s_cselect_b"];
 
 enum Kind { Mask, Of(Vec<u8>), AllLanes, Number }
 
 /// What an instruction's scalar result is made of.
-fn kind(ins: &Insn) -> Kind {
+fn kind(ins: &Insn, wide: bool) -> Kind {
     let m = ins.mnemonic.as_str();
     if m.starts_with("v_cmp") || m.contains("_co_") || m.starts_with("v_div_scale") { return Kind::Mask; }
-    if m.contains("saveexec") { return Kind::Mask; }
-    let combines = ["s_mov_b", "s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b",
-        "s_xnor_b", "s_not_b", "s_wqm_b", "s_cselect_b"];
-    if !combines.iter().any(|p| m.strip_prefix(p).is_some_and(|rest| matches!(rest, "32" | "64"))) { return Kind::Number; }
+    let size = if wide { "64" } else { "32" };
+    if m.contains("saveexec") { return if m.ends_with(size) { Kind::Mask } else { Kind::Number }; }
+    // A mask is moved and combined as a whole.
+    if !BITWISE.iter().any(|p| m.strip_prefix(p) == Some(size)) { return Kind::Number; }
     let (mut exec, mut from) = (false, Vec::new());
     for o in &ins.src {
         match o {
@@ -84,7 +105,67 @@ fn predecessors(insns: &[Insn]) -> Vec<Vec<usize>> {
     from
 }
 
-struct Reach<'a> { insns: &'a [Insn], from: Vec<Vec<usize>>, wide: bool }
+/// Which lanes of a wave run an instruction together.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Together { All, Running, Some }
+
+/// Branches of the console take the whole wave, those of the translation one lane. Lanes
+/// part in what a branch on a mask jumps over or repeats and after an early exit. A branch on
+/// EXEC keeps the running ones together.
+fn together(insns: &[Insn]) -> Vec<Together> {
+    let branches = || insns.iter().enumerate().filter(|(_, x)| x.enc == Enc::Sopp && Emitter::branch_cond(x.op).is_some());
+    let target = |x: &Insn| x.offset as i64 + 4 + 4 * x.aux.imm;
+    let targets: BTreeSet<i64> = branches().map(|(_, x)| target(x)).collect();
+    let end = |x: &Insn| x.enc == Enc::Sopp && x.op == 1;
+    let exits = insns.iter().position(end).is_some_and(|first| insns[first..].iter().any(|x| !end(x) && x.enc != Enc::Sopp));
+    let mut found = vec![Together::All; insns.len()];
+    for (i, branch) in branches() {
+        let (from, to) = (branch.offset as i64, target(branch));
+        let lanes = match branch.op {
+            2 => continue,
+            4 | 5 if uniform_condition(insns, i, &targets) => continue,
+            8 if to > from => Together::Running,
+            9 if to <= from => Together::Running,
+            _ => Together::Some,
+        };
+        for (k, x) in insns.iter().enumerate() {
+            if (from.min(to)..from.max(to)).contains(&(x.offset as i64)) || exits && k > i { found[k] = found[k].max(lanes); }
+        }
+    }
+    found
+}
+
+/// Whether the condition code a branch tests is that of numbers every lane agrees on.
+fn uniform_condition(insns: &[Insn], branch: usize, targets: &BTreeSet<i64>) -> bool {
+    // A lane mask, or something that could be one.
+    let mask = |x: &Insn| {
+        let m = x.mnemonic.as_str();
+        let number = |o: &Opnd| matches!(o, Opnd::Literal(_)) || matches!(o, Opnd::ConstInt(n) if !matches!(n, 0 | -1));
+        m.starts_with("v_") && !m.contains("lane") || m.contains("saveexec") || m.starts_with("s_bcnt") || m.starts_with("s_ff")
+            || BITWISE.iter().any(|p| m.starts_with(p)) && !x.src.iter().any(number)
+                && x.src.iter().any(|o| register(o).is_some() || matches!(o, Opnd::ExecLo | Opnd::ExecHi))
+    };
+    let number = |o: &Opnd| match register(o) {
+        Some(n) => !insns.iter().any(|x| mask(x) && written(x, true).iter().any(|&(first, count)| (first..first + count).contains(&n))),
+        None => matches!(o, Opnd::ConstInt(_) | Opnd::ConstF32(_) | Opnd::Literal(_)),
+    };
+    let mut at = branch;
+    while at > 0 && !targets.contains(&(insns[at].offset as i64)) {
+        at -= 1;
+        let x = &insns[at];
+        let m = x.mnemonic.as_str();
+        if m.starts_with("s_cmp") || m.starts_with("s_bitcmp") {
+            let compared = x.dst.iter().filter(|_| x.enc == Enc::Sopk);
+            return x.src.iter().chain(compared).all(number);
+        }
+        // These leave the condition code alone.
+        let leaves = ["s_mov", "s_cselect", "s_cmov", "s_ff1", "s_mul", "s_load", "s_buffer_load", "s_nop", "s_waitcnt", "s_inst_prefetch"];
+        if m.starts_with("s_") && !leaves.iter().any(|p| m.starts_with(p)) { return false; }
+    }
+    false
+}
+
+struct Reach<'a> { insns: &'a [Insn], from: Vec<Vec<usize>>, together: Vec<Together>, wide: bool }
 
 impl Reach<'_> {
     /// The writes of `register` that reach `at`. None when its entry value does.
@@ -95,31 +176,50 @@ impl Reach<'_> {
             // Padding after an unconditional branch is never entered.
             for &p in &self.from[i] {
                 if !seen.insert(p) { continue; }
-                match written(&self.insns[p], self.wide) {
-                    Some((first, count)) if (first..first.saturating_add(count)).contains(&register) => { found.insert(p); }
-                    _ => todo.push(p),
-                }
+                if self.writes(p, register).is_some() { found.insert(p); } else { todo.push(p); }
             }
         }
         Some(found)
     }
 
-    /// The definitions of a mask read at `at`, if every value that reaches it is one.
-    fn mask(&self, at: usize, register: u8) -> Option<BTreeSet<usize>> {
+    /// The group of registers instruction `at` writes that `register` is part of.
+    fn writes(&self, at: usize, register: u8) -> Option<(u8, u8)> {
+        written(&self.insns[at], self.wide).into_iter().find(|&(first, count)| (first..first.saturating_add(count)).contains(&register))
+    }
+
+    /// The definitions of a mask read at `at` and its first register, if every value that
+    /// reaches any of its words is a whole mask.
+    fn mask(&self, at: usize, register: u8) -> Option<(u8, BTreeSet<usize>)> {
         let direct = self.defs(at, register)?;
+        let words = if self.wide { 2 } else { 1 };
+        let mut first = None;
+        for &d in &direct {
+            let (n, count) = self.writes(d, register)?;
+            if count != words || first.is_some_and(|f| f != n) { return None; }
+            first = Some(n);
+        }
+        let first = first?;
+        // The words of a pair are read and written together.
+        if (first..first + words).any(|n| self.defs(at, n).as_ref() != Some(&direct)) { return None; }
         let (mut seen, mut todo, mut rooted) = (BTreeSet::new(), direct.iter().copied().collect::<Vec<_>>(), false);
         while let Some(d) = todo.pop() {
             if !seen.insert(d) { continue; }
-            match kind(&self.insns[d]) {
+            let captured = direct.contains(&d);
+            // Lanes that went another way would be missing from its ballot.
+            let whole = match self.together[d] { Together::All => true, Together::Running => running(&self.insns[d]), Together::Some => false };
+            if captured && !whole { return None; }
+            match kind(&self.insns[d], self.wide) {
                 Kind::Number => return None,
                 // Counted itself, it holds lanes that are not running.
-                Kind::AllLanes if direct.contains(&d) => return None,
+                Kind::AllLanes if captured => return None,
                 Kind::AllLanes => (),
                 Kind::Mask => rooted = true,
-                Kind::Of(regs) => for n in regs { todo.extend(self.defs(d, n)?); },
+                Kind::Of(regs) => for n in regs {
+                    for word in n..n + words { todo.extend(self.defs(d, word)?); }
+                },
             }
         }
-        rooted.then_some(direct)
+        rooted.then_some((first, direct))
     }
 }
 
@@ -150,8 +250,14 @@ pub(super) fn find(insns: &[Insn]) -> Option<Ballots> {
         || i.mnemonic.starts_with("s_movrel")) { return None; }
     let masks = |bits: &str| insns.iter().any(|i| i.mnemonic.starts_with("s_") && i.mnemonic.ends_with(bits)
         && (i.mnemonic.contains("saveexec") || i.src.contains(&Opnd::ExecLo) || i.dst.contains(&Opnd::ExecLo)));
-    let wide = match (masks("_b32"), masks("_b64")) { (true, false) => false, (false, true) => true, _ => return None };
-    let reach = Reach { insns, from: predecessors(insns), wide };
+    // Only a wave of 64 lanes has a second word.
+    let second = insns.iter().any(|i| i.mnemonic == "v_mbcnt_hi_u32_b32" || i.src.iter().chain(&i.dst).any(|o| *o == Opnd::ExecHi));
+    let wide = match (masks("_b32"), masks("_b64")) {
+        (true, false) if !second => false,
+        (_, true) if !masks("_b32") || second => true,
+        _ => return None,
+    };
+    let reach = Reach { insns, from: predecessors(insns), together: together(insns), wide };
     let mut found = Ballots { defs: BTreeMap::new(), uses: BTreeSet::new(), width: if wide { 64 } else { 32 } };
     for (i, ins) in insns.iter().enumerate().filter(|(_, i)| counted(i)) {
         let Some(source) = ins.src.first() else { continue };
@@ -161,13 +267,10 @@ pub(super) fn find(insns: &[Insn]) -> Option<Ballots> {
             continue;
         }
         let Some(register) = register(source) else { continue };
-        let Some(defs) = reach.mask(i, register) else {
-            continue
-        };
-        for d in defs {
-            let (first, count) = written(&insns[d], wide).expect("a definition writes");
-            found.defs.entry(d).or_default().insert(if count == 2 { first } else { register });
-        }
+        let Some((first, defs)) = reach.mask(i, register) else { continue };
+        // A 64-bit count starts at the mask's first word, and narrow waves have no second.
+        if ins.mnemonic.ends_with("_b64") && (!wide || register != first) { continue; }
+        for d in defs { found.defs.entry(d).or_default().insert(first); }
         found.uses.insert(i);
     }
     (!found.uses.is_empty()).then_some(found)

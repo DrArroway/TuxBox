@@ -234,8 +234,9 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         em.vote_uses.insert(count, def);
         em.regs.insert(format!("tb_votes{def}"));
     }
+    // Ray tracing resolve keeps whole masks already.
     if ex.stage == Stage::Compute && !lone_lane::on() && !wave_cull && !page_waves && !indexed_lane
-        && em.fspx_wave.is_none() && !hair_multisample {
+        && em.fspx_wave.is_none() && !hair_multisample && !resolve_wave32 {
         em.mask_ballots = mask_ballots::find(&em.insns);
     }
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
@@ -311,6 +312,16 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         (election == Some(ElectionLowering::Native32) && (!em.exec_snapshots.sites.is_empty() || em.insns.iter().any(|i|
             i.mnemonic == "tb_first_active_lane" || i.mnemonic == "s_ff1_i32_b64"))).then_some(32)
     });
+    // A ballot holds the guest's own lanes, so it needs whole waves of the guest's width.
+    let reductions_wave_size = required_wave_size;
+    let required_wave_size = match em.mask_ballots.as_ref().map(|b| b.width) {
+        Some(width) if reductions_wave_size.is_none_or(|w| w == width)
+            && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul).is_some_and(|n| n > 0 && n % width == 0) => Some(width),
+        _ => {
+            em.mask_ballots = None;
+            reductions_wave_size
+        }
+    };
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
@@ -366,7 +377,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
     }
-    em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
+    em.portable_wave64 = (straight_exchange || (reductions_wave_size == Some(64)
         && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul) == Some(64)))
         && em.lockstep.is_none()
         && ex.stage == Stage::Compute
@@ -378,18 +389,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
-    // One mask word holds 32 lanes. Two hold any wave the host can have, so a wave64
-    // program still runs on adapters without one.
-    let required_wave_size = match em.mask_ballots.as_ref().map(|b| b.width) {
-        Some(32) if required_wave_size == Some(64) => {
-            em.mask_ballots = None;
-            required_wave_size
-        }
-        Some(32) => Some(32),
-        _ => required_wave_size,
-    };
     if em.portable_wave64 { em.mask_ballots = None; }
-    em.required_wave_size = required_wave_size;
     em.regs.extend(em.mask_ballots.iter().flat_map(mask_ballots::Ballots::names).collect::<Vec<_>>());
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());

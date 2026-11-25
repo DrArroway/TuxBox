@@ -3,10 +3,9 @@
 
 Each synthetic program counts a mask's lanes, finds its first one or counts
 those before each lane, some of them after EXEC was narrowed to one elected
-lane. The reference models the console. A wave64 program is modelled on the
-host's own wave, which can be 32 lanes: every part of the wave is a wave of its
-own there. Only the translator's input and output are instrumented. No game
-data is needed.
+lane. The reference models the console. Each program runs in waves of its own
+width. Only the translator's input and output are instrumented. No game data is
+needed.
 """
 import argparse
 import json
@@ -104,8 +103,8 @@ def instrument(hlsl, width):
     start = "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;"
     load = ("    uint input = output[gtid.x];\n    exec_lo = input >> 31;\n"
             "    v0 = input & 0x7fffffffu; v1 = gtid.y; v2 = gtid.z;")
-    if hlsl.count(start) != 1 or "WaveActiveBallot" not in hlsl or ("[WaveSize(32)]" in hlsl) != (width == 32):
-        raise ValueError("fixture must take a ballot, in 32-lane waves only if its masks have one word")
+    if hlsl.count(start) != 1 or "WaveActiveBallot" not in hlsl or f"[WaveSize({width})]" not in hlsl:
+        raise ValueError("fixture must take a ballot in waves of its own width")
     stores = (f"    output[{width}u + gtid.x] = v10 | (v11 << 8u) | (WaveGetLaneCount() << 16u);\n"
               f"    output[{2 * width}u + gtid.x] = v12;\n")
     hlsl = hlsl.replace(start, load)
@@ -134,7 +133,7 @@ def difference(name, seed, mask, values, data):
         return "no readback"
     actual, expected, width = struct.unpack("<384I", data), list(seed), len(values)
     host = actual[96 + width] >> 16
-    if host not in (8, 16, 32, 64) or host > width or width == 32 and host != 32:
+    if host != width:
         return f"host wave of {host}"
     rows = model(name, [bool((mask >> lane) & 1) for lane in range(width)], values, host)
     for lane, (count, rank, last) in enumerate(rows):

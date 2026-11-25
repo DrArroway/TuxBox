@@ -18,8 +18,8 @@ fn main() {
     assert!(matches!(shader.stage, Stage::Compute));
     match hlsl::translate(&shader) {
         Ok(result) => {
-            // A mask of two words is read on any host wave.
-            assert_eq!(result.required_wave_size, (width == 32).then_some(32));
+            // A ballot holds the lanes of one guest wave.
+            assert_eq!(result.required_wave_size, Some(width));
             print!("{}", result.hlsl);
         }
         Err(reason) => {

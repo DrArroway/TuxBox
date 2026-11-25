@@ -6,12 +6,107 @@
 //! prefix of values that are zero in inactive lanes. `WaveActiveSum` and
 //! `WavePrefixSum` compute exactly that on every host wave width.
 use super::{Emitter, Enc, Insn, Opnd, Stage, wave_sum};
+use std::collections::BTreeSet;
 
 pub(super) const TOTAL: &str = "tb_wave_total_u32";
 pub(super) const PREFIX: &str = "tb_wave_exclusive_prefix_u32";
 // Opcode for the rewritten instructions, so passes matching READLANE or VOP2
 // opcodes ignore them.
 pub(super) const PSEUDO_OP: u32 = 0x7ff3;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Reg { V(u8), S(u8) }
+
+fn memory_width(m: &str) -> Option<u16> {
+    let wide = |m: &str| if m.contains("x16") { 16 } else if m.contains("x8") { 8 } else if m.contains("x4") || m.contains("xyzw") { 4 }
+        else if m.contains("x3") || m.contains("xyz") { 3 } else if m.contains("x2") || m.contains("xy") { 2 } else { 1 };
+    ["buffer_", "tbuffer_", "image_", "global_", "ds_", "exp", "s_load", "s_buffer_load"].iter()
+        .any(|p| m.starts_with(p)).then(|| wide(m).max(4))
+}
+
+fn covers(o: &Opnd, r: Reg, width: u16) -> bool {
+    let (k, n) = match (*o, r) {
+        (Opnd::Vgpr(k), Reg::V(n)) | (Opnd::Sgpr(k), Reg::S(n)) => (k, n),
+        _ => return false,
+    };
+    u16::from(k) <= u16::from(n) && u16::from(n) < u16::from(k) + width
+}
+
+fn reads(ins: &Insn, r: Reg) -> bool {
+    let m = ins.mnemonic.as_str();
+    if let Some(width) = memory_width(m) {
+        // Store and atomic data are decoded as destinations. MUBUF VADDR is
+        // ignored when neither OFFEN nor IDXEN is set.
+        let unused_vaddr = ins.enc == Enc::Mubuf && ins.aux.mask & 3 == 0;
+        let data = !m.starts_with("s_") && !m.contains("_load");
+        return ins.src.iter().enumerate().any(|(i, o)| !(unused_vaddr && i == 0) && covers(o, r, width))
+            || (data || m.contains("atomic")) && ins.dst.iter().any(|o| covers(o, r, width));
+    }
+    match r {
+        Reg::S(n) => super::reads_sgpr(ins, n),
+        Reg::V(_) => {
+            let width = if m.contains("64") && m.starts_with("v_") { 2 } else { 1 };
+            ins.src.iter().any(|o| covers(o, r, width))
+        }
+    }
+}
+
+/// A write that defines `r` in every lane that can later read it.
+fn kills(ins: &Insn, r: Reg, whole_wave: bool) -> bool {
+    let m = ins.mnemonic.as_str();
+    match r {
+        Reg::S(n) => {
+            if matches!(m, "v_readlane_b32" | "v_readfirstlane_b32") {
+                return matches!(ins.dst.first(), Some(Opnd::Vgpr(k) | Opnd::Sgpr(k)) if *k == n);
+            }
+            let width = if m.starts_with("s_load") || m.starts_with("s_buffer_load") { memory_width(m).unwrap_or(1) }
+                else if m.starts_with("s_") && m.ends_with("64") { 2 } else { 1 };
+            (m.starts_with("s_") || m.starts_with("v_cmp")) && ins.dst.iter().any(|o| covers(o, r, width))
+        }
+        // Inactive lanes keep the old value; only whole-wave vector writes kill.
+        Reg::V(_) => whole_wave && m.starts_with("v_") && !m.starts_with("v_cmp") && memory_width(m).is_none()
+            && !matches!(m, "v_readlane_b32" | "v_readfirstlane_b32") && ins.dst == [match r { Reg::V(n) => Opnd::Vgpr(n), Reg::S(n) => Opnd::Sgpr(n) }],
+    }
+}
+
+/// Every path from `start` overwrites `r` before reading it.
+fn dead_from(insns: &[Insn], start: usize, r: Reg) -> bool {
+    let index_of = |offset: i64| insns.iter().position(|i| i.offset as i64 == offset);
+    let mut stack = vec![(start, false)];
+    let mut seen = BTreeSet::new();
+    while let Some((mut at, mut whole)) = stack.pop() {
+        loop {
+            if !seen.insert((at, whole)) { break; }
+            let Some(ins) = insns.get(at) else { break };
+            if reads(ins, r) {
+                if std::env::var_os("TB_DFDEBUG").is_some() { eprintln!("wave_alloc: live at {:#x} {}", ins.offset, ins.mnemonic); }
+                return false;
+            }
+            if kills(ins, r, whole) { break; }
+            let m = ins.mnemonic.as_str();
+            if ins.dst.contains(&Opnd::ExecLo) || ins.dst.contains(&Opnd::ExecHi) || m.contains("saveexec") || m.starts_with("v_cmpx") {
+                whole = m == "s_or_saveexec_b64" && ins.src == [Opnd::ConstInt(-1)]
+                    || m == "s_mov_b64" && ins.dst == [Opnd::ExecLo] && ins.src == [Opnd::ConstInt(-1)];
+            }
+            if matches!(m, "s_setpc_b64" | "s_swappc_b64") { return false; }
+            if m == "s_endpgm" { break; }
+            if ins.enc == Enc::Sopp {
+                let target = ins.offset as i64 + 4 + 4 * ins.aux.imm;
+                if ins.op == 2 {
+                    let Some(t) = index_of(target) else { return false };
+                    at = t;
+                    continue;
+                }
+                if Emitter::branch_cond(ins.op).is_some() {
+                    let Some(t) = index_of(target) else { return false };
+                    stack.push((t, whole));
+                }
+            }
+            at += 1;
+        }
+    }
+    true
+}
 
 fn dpp(ins: &Insn, acc: u8, selector: u16, ctrl: u32) -> bool {
     ins.mnemonic == "v_add_nc_u32" && ins.dst == [Opnd::Vgpr(acc)]
@@ -96,8 +191,14 @@ fn total(insns: &mut [Insn], a: usize) -> Option<()> {
         return None;
     }
     // The permlanex temporary, the cross-half readlane result and the accumulator
-    // are scratch: the compiler's liveness analysis only reads them after they have
-    // been rewritten, so nopping the pattern's writes to them is safe.
+    // are scratch: nopping the pattern's writes to them is only safe when every
+    // later instruction overwrites them before reading them, so prove they are
+    // dead before the rewrite.
+    let end = c + 11;
+    if !(dead_from(insns, end, Reg::V(acc)) && dead_from(insns, end, Reg::V(tmp))
+        && (high == sum || dead_from(insns, end, Reg::S(high)))) {
+        return None;
+    }
     insns[c + 1..c + 9].iter_mut().for_each(nop);
     let r = &mut insns[c + 9];
     r.mnemonic = TOTAL.into();
@@ -137,9 +238,14 @@ fn total32(insns: &mut [Insn], a: usize) -> Option<()> {
     if !is(&insns[c + 8], "s_mov_b32", &[Opnd::ExecLo], &[s]) {
         return None;
     }
-    // The permlanex temporary and the accumulator are scratch: the compiler's liveness
-    // analysis only reads them after they have been rewritten, so nopping the pattern's
-    // writes to them is safe.
+    // The permlanex temporary and the accumulator are scratch: nopping the
+    // pattern's writes to them is only safe when every later instruction
+    // overwrites them before reading them, so prove they are dead before the
+    // rewrite.
+    let end = c + 9;
+    if !(dead_from(insns, end, Reg::V(acc)) && dead_from(insns, end, Reg::V(tmp))) {
+        return None;
+    }
     insns[c + 1..c + 7].iter_mut().for_each(nop);
     let r = &mut insns[c + 7];
     r.mnemonic = TOTAL.into();
@@ -183,9 +289,15 @@ fn prefix(insns: &mut [Insn], a: usize) -> Option<()> {
     if !is(&insns[c + 13], "v_add_nc_u32", &[v], &[Opnd::Sgpr(half), v]) {
         return None;
     }
-    // The permlanex temporary, the cross-half readlane result and the accumulator
-    // are scratch: the compiler's liveness analysis only reads them after they have
-    // been rewritten, so nopping the pattern's writes to them is safe.
+    // The permlanex temporary and the cross-half readlane result are scratch:
+    // nopping the pattern's writes to them is only safe when every later
+    // instruction overwrites them before reading them, so prove they are dead
+    // before the rewrite. The accumulator holds the prefix in both the original
+    // and the lowered form, so it needs no liveness check.
+    let end = c + 18;
+    if !(dead_from(insns, end, Reg::V(tmp)) && dead_from(insns, end, Reg::S(half))) {
+        return None;
+    }
     insns[c + 1..c + 16].iter_mut().for_each(nop);
     let r = &mut insns[c + 16];
     r.mnemonic = PREFIX.into();
@@ -240,8 +352,13 @@ fn prefix32(insns: &mut [Insn], a: usize) -> Option<()> {
     }
     // The accumulator holds the exclusive prefix; the final move copies it to the
     // original data register. Replace the sub with the pseudo-op and nop the body.
-    // The permlanex temporary is scratch: the compiler's liveness analysis only reads
-    // it after it has been rewritten, so nopping the pattern's write to it is safe.
+    // The permlanex temporary is scratch: nopping the pattern's write to it is only
+    // safe when every later instruction overwrites it before reading it, so prove it
+    // is dead before the rewrite.
+    let end = c + 13;
+    if !dead_from(insns, end, Reg::V(tmp)) {
+        return None;
+    }
     insns[c + 1..c + 10].iter_mut().for_each(nop);
     let r = &mut insns[c + 10];
     r.mnemonic = PREFIX.into();
@@ -277,6 +394,33 @@ fn total_to_wave_active_sum(insns: &mut [Insn], start: usize, end: usize, width:
         return None;
     }
     let Opnd::Sgpr(sum) = read.dst[0] else { return None };
+    // The permlanex temporary and, for the 64-lane form, the cross-half readlane
+    // result are scratch: nopping the body is only safe when every later
+    // instruction overwrites them before reading them, so prove they are dead
+    // before the rewrite. The accumulator keeps the per-lane values selected by
+    // the cndmask, which is exactly what WaveActiveSum consumes.
+    let tmp = match insns.get(c + 5) {
+        Some(ins) if ins.mnemonic == "v_permlanex16_b32" => {
+            let Opnd::Vgpr(t) = ins.dst[0] else { return None };
+            t
+        }
+        _ => return None,
+    };
+    let high = if width == 64 {
+        let ins = insns.get(c + 7)?;
+        if ins.op != wave_sum::READ_LANE || ins.mnemonic != "v_readlane_b32" {
+            return None;
+        }
+        let Opnd::Sgpr(h) = ins.dst[0] else { return None };
+        Some(h)
+    } else {
+        None
+    };
+    let after = end + 1;
+    if !dead_from(insns, after, Reg::V(acc)) || !dead_from(insns, after, Reg::V(tmp))
+        || (high.is_some() && high.unwrap() != sum && !dead_from(insns, after, Reg::S(high.unwrap()))) {
+        return None;
+    }
     // Nop the body (c+1 .. end-1) so the accumulator keeps the per-lane values
     // selected by the cndmask, and replace the lane-0 read with the total.
     insns[c + 1..end - 1].iter_mut().for_each(nop);

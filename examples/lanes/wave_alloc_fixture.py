@@ -3,7 +3,9 @@ wave-alloc self-test.
 
 It is a small hand-written console program: a constant input, a wave32 masked
 DPP exclusive-prefix (the pattern the translator lowers to `WavePrefixSum`),
-and an `s_endpgm`. Not taken from any game.
+and an `s_endpgm`. The prefix result is stored to a UAV so the self-test can
+read it back and check the shader's arithmetic, not just that it dispatched.
+Not taken from any game.
 """
 import hashlib
 from pathlib import Path
@@ -36,24 +38,25 @@ CODE = (
     0x4c040302,  # v_sub_nc_u32 v2, v2, v1
     0xbefe0300,  # s_mov_b32 ExecLo, s0
     0x7e080302,  # v_mov_b32 v4, v2
+    0x7e100280,  # v_mov_b32 v8, 0 (address of the result in the UAV)
+    0xf4080402,  # s_load_dwordx4 s[16:19], s[4:5], 0
+    0xfa000000,
+    0xbf8cc07f,  # s_waitcnt lgkmcnt(0)
+    0xe0701000,  # buffer_store_dword v4, v8, s[16:19], 0 (offset 0)
+    0x80040408,
     0xbf810000,  # s_endpgm
 )
-# Root signature 1.0 with no parameters, samplers or flags.
-EMPTY_ROOT = pack([1, 0, 24, 0, 24, 0])
+# Root signature 1.0 with a single UAV table for the result buffer.
+UAV_ROOT = pack([1, 1, 24, 0, 0, 0, 0, 0, 36, 1, 44, 1, 1, 0, 0, 0])
 
 
 def shader():
-    base = container(list(CODE), width=32)
-    count = struct.unpack_from("<I", base, 28)[0]
-    offsets = struct.unpack_from(f"<{count}I", base, 32)
-    chunks = [base[start:start + 8 + struct.unpack_from("<I", base, start + 4)[0]] for start in offsets]
-    chunks.append(b"RTS0" + pack([len(EMPTY_ROOT)]) + EMPTY_ROOT)
-    start = 32 + 4 * len(chunks)
-    table = []
-    for chunk in chunks:
-        table.append(start)
-        start += len(chunk)
-    return b"DXBC" + bytes(16) + pack([1, start, len(chunks), *table]) + b"".join(chunks)
+    base = container(list(CODE), width=32, resources=[(7, 0, 0, 0)])
+    root = b"RTS0" + pack([64]) + UAV_ROOT
+    first, second = struct.unpack_from("<II", base, 32)
+    root_at = len(base) + 4
+    directory = pack([root_at + len(root), 3, first + 4, second + 4, root_at])
+    return base[:24] + directory + base[first:] + root
 
 
 def header(data):

@@ -34,6 +34,10 @@ constexpr std::array<UINT, 18> scarlett_profile{
 // scenario that needs that release must already count as failed.
 constexpr DWORD deadline_ms = 2000;
 
+// Sentinel written to the wave-alloc UAV so a shader that never stores is
+// distinguishable from one that stored the expected value (0).
+constexpr UINT kWaveAllocSentinel = 0xdeadbeefu;
+
 // Xbox command-list and queue slots (GDK gen9/d3d12_xs.h).
 constexpr size_t slot_copy_memory = 62, slot_write32 = 71, slot_write64 = 72, slot_wait64 = 74,
                  slot_dispatch_flagged = 80, slot_copy_texture = 83, slot_build = 119,
@@ -635,14 +639,22 @@ void raster_tables(ID3D12Device* device) {
 // A console shader whose wave32 masked DPP exclusive prefix the translator must
 // lower to `WavePrefixSum`. The old translator rejects it with "unrecognized
 // masked DPP prologue", so this scenario fails without the wave-alloc lowering.
+// The shader stores the exclusive-prefix result (0 for the single active lane)
+// to a UAV; the scenario reads it back and requires it to be the expected
+// value, so a numerical miscompile of the lowering is caught here.
 void wave_alloc_scenario(ID3D12Device* device) {
-    ComPtr<ID3D12RootSignature> root;
+    D3D12_ROOT_PARAMETER params[1]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[0].Descriptor = {0, 0};
     D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 1;
+    signature.pParameters = params;
     ComPtr<ID3DBlob> serialized;
     check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
-          "serialize empty root signature");
+          "serialize wave-alloc root signature");
+    ComPtr<ID3D12RootSignature> root;
     check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
-                                      IID_PPV_ARGS(&root)), "create empty root signature");
+                                      IID_PPV_ARGS(&root)), "create wave-alloc root signature");
     D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
     shader.pRootSignature = root.Get();
     shader.CS = {wave_alloc_shader, sizeof(wave_alloc_shader)};
@@ -650,15 +662,33 @@ void wave_alloc_scenario(ID3D12Device* device) {
     check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
                                                                        IID_PPV_ARGS(&pipeline)),
           "create pipeline from the wave-alloc console shader");
-    Memory memory(65536);
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, sizeof(UINT), D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // Seed the UAV with a sentinel so a missing store is distinguishable from the
+    // expected value (0) in the readback.
+    auto sentinel = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(UINT), D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(sentinel.Get(), &kWaveAllocSentinel, sizeof(kWaveAllocSentinel));
+    auto proof = buffer(device, D3D12_HEAP_TYPE_READBACK, sizeof(UINT), D3D12_RESOURCE_STATE_COPY_DEST);
     Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
-    method<SetRoot>(compute.list.Get(), slot_compute_root)(compute.list.Get(), root.Get());
-    compute.list->SetPipelineState(pipeline.Get());
-    compute.list->Dispatch(1, 1, 1);
-    compute.write64(memory.address(0), 3);
+    auto* list = compute.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, sentinel.Get(), 0, sizeof(UINT));
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    list->SetPipelineState(pipeline.Get());
+    method<SetUav>(list, slot_root_uav)(list, 0, output->GetGPUVirtualAddress());
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(proof.Get(), 0, output.Get(), 0, sizeof(UINT));
     compute.submit();
     compute.finish("dispatch of the wave-alloc console shader");
-    expect_value(memory, 0, 3, "write after the dispatch");
+    D3D12_RANGE range{0, sizeof(UINT)}, empty{};
+    void* mapped{};
+    check(proof->Map(0, &range, &mapped), "map wave-alloc proof");
+    const UINT row = *static_cast<const UINT*>(mapped);
+    proof->Unmap(0, &empty);
+    if (row != 0u) throw std::runtime_error("wave-alloc shader stored the wrong prefix result (or stored nothing)");
 }
 
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,

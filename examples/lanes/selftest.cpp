@@ -15,6 +15,7 @@
 #include "xbox_shader.h"
 #include "raster_shader.h"
 #include "reclaim_shader.h"
+#include "wave_alloc_shader.h"
 #include <algorithm>
 #include <memory>
 
@@ -628,6 +629,36 @@ void raster_tables(ID3D12Device* device) {
             throw std::runtime_error(message);
         }
     }
+}
+
+
+// A console shader whose wave32 masked DPP exclusive prefix the translator must
+// lower to `WavePrefixSum`. The old translator rejects it with "unrecognized
+// masked DPP prologue", so this scenario fails without the wave-alloc lowering.
+void wave_alloc_scenario(ID3D12Device* device) {
+    ComPtr<ID3D12RootSignature> root;
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize empty root signature");
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create empty root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {wave_alloc_shader, sizeof(wave_alloc_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline from the wave-alloc console shader");
+    Memory memory(65536);
+    Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    method<SetRoot>(compute.list.Get(), slot_compute_root)(compute.list.Get(), root.Get());
+    compute.list->SetPipelineState(pipeline.Get());
+    compute.list->Dispatch(1, 1, 1);
+    compute.write64(memory.address(0), 3);
+    compute.submit();
+    compute.finish("dispatch of the wave-alloc console shader");
+    expect_value(memory, 0, 3, "write after the dispatch");
 }
 
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,
@@ -1660,6 +1691,7 @@ constexpr Scenario scenarios[] = {
     {L"xbox-shader", xbox_shader_scenario},
     {L"wave64-shader", wave64_shader_scenario},
     {L"raster-tables", raster_tables},
+    {L"wave-alloc", wave_alloc_scenario},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -1711,8 +1743,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"indirect-dispatch", L"gpu-indirect-dispatch",
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
-                                             L"xbox-shader", L"wave64-shader",
-                                             L"raster-tables"};
+                                             L"xbox-shader", L"wave64-shader", L"raster-tables", L"wave-alloc"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

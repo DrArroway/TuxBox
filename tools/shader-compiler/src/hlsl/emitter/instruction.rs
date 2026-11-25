@@ -63,6 +63,18 @@ impl<'a> Emitter<'a> {
                 self.ws(&d.ok_or("missing lane-read destination")?, &format!("readlane{idx}"))?;
                 return Ok(());
             }
+            indexed_lane::WAVE32_READ_LANE => {
+                if self.dispatched {
+                    return Err("wave32 lane read in a block-dispatched program".into());
+                }
+                let value = r(&s[0])?;
+                let lane = match s[1] {
+                    Opnd::ConstInt(k @ 0..=31) => format!("{k}u"),
+                    _ => format!("({} & 31u)", r(&s[1])?),
+                };
+                self.ws(&d.ok_or("missing lane-read destination")?, &format!("WaveReadLaneAt({value}, {lane})"))?;
+                return Ok(());
+            }
             "tb_view_occluded" => {
                 self.line("hidden = (exec_lo & 1u) != 0u; hidden_id = v0; hidden_view = cull_view;");
                 return Ok(());

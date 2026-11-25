@@ -1,7 +1,29 @@
-//! Full-wave elections in branch-free compute programs. Each participant reads
-//! the requested guest wave64 lane by its linear workgroup index, independently
-//! of physical subgroup width or the driver's assignment of invocations.
+//! Cross-lane `v_readlane_b32` broadcasts and full-wave elections in compute shaders.
+//!
+//! RDNA2 `v_readlane_b32 sDst, vSrc, lane_sel` reads `vSrc` from lane `lane_sel`
+//! regardless of `EXEC`. On Wave32 compute groups where every lane is proven active
+//! in `EXEC` and control flow is uniform, `WaveReadLaneAt` is exact with zero
+//! groupshared overhead. Otherwise (when `EXEC` may have disabled the target lane,
+//! on 2D/3D or partial groups, or for portable Wave64 running on Wave32 hosts),
+//! values are staged through `groupshared` `tb_swizzle` with explicit barrier
+//! uniformity checks. Unproven dynamic SGPR selectors, out-of-range lanes, and
+//! non-uniform loops are refused with explicit diagnostics.
 use super::{writes_scalar, Emitter, Enc, Insn, Opnd};
+use crate::rdna2::clobbers_scalar;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+
+/// Synthetic opcode/mnemonic for native Wave32 `WaveReadLaneAt` lowering.
+pub(super) const WAVE32_READ_LANE: &str = "tb_wave32_readlane";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ConstantReadPlan {
+    /// At least one `v_readlane_b32` was lowered to groupshared `tb_indexed_readlane`.
+    pub(super) uses_shared: bool,
+    /// At least one `v_readlane_b32` was lowered to native `tb_wave32_readlane`.
+    pub(super) uses_native_wave32: bool,
+    /// Logical wave width (`32` or `64`) for groupshared `tb_indexed_readlane` sites.
+    pub(super) shared_wave_width: Option<u32>,
+}
 
 /// A launched compute wave enters with an active low lane. The compiler emits an
 /// out-of-line lane-number fallback behind a guard that always bypasses it.
@@ -58,45 +80,663 @@ pub(super) fn skip_empty_wave_fallback(insns: &mut Vec<Insn>) -> bool {
     true
 }
 
-/// A constant read in a converged group observes another invocation's VGPR,
-/// including lane 32 on hosts with 32-lane subgroups. Keep SGPR spills separate.
-pub(super) fn constant_reads(group: [u32; 3], insns: &mut [Insn], allow_small_group: bool) -> bool {
-    let count = group.into_iter().fold(1u32, u32::saturating_mul);
-    // Up to 32 threads fit in one guest wave of either width. Only read a
-    // lane that actually launched, even when its selector comes from an SGPR.
-    let small = allow_small_group && (1..=32).contains(&count);
-    if count == 0 || count > 1024 || (!small && count % 64 != 0) { return false; }
-    let Some(last) = insns.iter().rposition(|op| op.mnemonic == "v_readlane_b32") else { return false };
-    let end = insns[last].offset as i64;
-    let selectors = if small {
-        super::scalar_values::at_reads(insns, super::scalar_values::Proof::UpperBound, |op| match (op.mnemonic.as_str(), op.src.get(1)) {
-            ("v_readlane_b32", Some(Opnd::Sgpr(reg))) => Some(*reg),
+struct CfgInfo {
+    target: HashMap<usize, usize>,
+    back: HashMap<usize, usize>,
+    loops: Vec<(usize, usize)>,
+}
+
+fn build_cfg(insns: &[Insn], first_read_offset: usize) -> Result<CfgInfo, String> {
+    if let Some(bad) = insns.iter().find(|op| {
+        matches!(
+            op.mnemonic.as_str(),
+            "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap"
+        ) || (op.mnemonic.contains("branch")
+            && !(op.enc == Enc::Sopp && Emitter::branch_cond(op.op).is_some()))
+    }) {
+        return Err(format!(
+            "v_readlane_b32 at {first_read_offset:#x}: cannot prove convergence across {} at {:#x}",
+            bad.mnemonic, bad.offset
+        ));
+    }
+    let mut off2idx: HashMap<usize, usize> =
+        insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+    if let Some(last) = insns.last() {
+        off2idx.insert(last.offset + last.dwords * 4, insns.len());
+    }
+    let prog_end = insns.last().map_or(0, |l| l.offset + l.dwords * 4);
+    let mut target: HashMap<usize, usize> = HashMap::new();
+    let mut back: HashMap<usize, usize> = HashMap::new();
+    for (i, ins) in insns.iter().enumerate() {
+        if ins.enc == Enc::Sopp && Emitter::branch_cond(ins.op).is_some() {
+            let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
+            let ti = if t >= 0 && t as usize >= prog_end {
+                insns.len()
+            } else {
+                *off2idx.get(&(t as usize)).ok_or_else(|| {
+                    format!(
+                        "v_readlane_b32 at {first_read_offset:#x}: branch at {:#x} targets mid-instruction {t:#x}",
+                        ins.offset
+                    )
+                })?
+            };
+            if ti <= i {
+                back.insert(i, ti);
+            } else {
+                target.insert(i, ti);
+            }
+        }
+    }
+    let mut heads: HashMap<usize, usize> = HashMap::new();
+    for (&b, &l) in &back {
+        let e = heads.entry(l).or_insert(b);
+        *e = (*e).max(b);
+    }
+    let continues: Vec<(usize, usize)> = back
+        .iter()
+        .filter(|(&b, &l)| heads[&l] != b)
+        .map(|(&b, &l)| (b, heads[&l]))
+        .collect();
+    for (b, closing) in continues {
+        back.remove(&b);
+        target.insert(b, closing);
+    }
+    let mut loops: Vec<(usize, usize)> = heads.into_iter().collect();
+    loops.sort_unstable();
+    for &(l1, b1) in &loops {
+        for &(l2, b2) in &loops {
+            let disjoint = b1 < l2 || b2 < l1;
+            let nested = (l1 <= l2 && b2 <= b1) || (l2 <= l1 && b1 <= b2);
+            if !(disjoint || nested) {
+                return Err(format!(
+                    "v_readlane_b32 at {first_read_offset:#x}: cannot lower across interleaved loops"
+                ));
+            }
+        }
+    }
+    Ok(CfgInfo { target, back, loops })
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct UniformState {
+    sgpr: [bool; 106],
+    scc: bool,
+}
+
+impl UniformState {
+    fn entry() -> Self {
+        Self { sgpr: [true; 106], scc: false }
+    }
+
+    fn opnd(&self, op: &Opnd, wide: bool) -> bool {
+        match *op {
+            Opnd::ConstInt(_) | Opnd::ConstF32(_) | Opnd::Literal(_) => true,
+            Opnd::Scc => self.scc,
+            Opnd::Sgpr(r @ 0..=105) => {
+                self.sgpr[r as usize]
+                    && (!wide || (r < 105 && self.sgpr[r as usize + 1]))
+            }
+            _ => false,
+        }
+    }
+
+    fn join(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        for (a, &b) in self.sgpr.iter_mut().zip(&other.sgpr) {
+            if *a && !b {
+                *a = false;
+                changed = true;
+            }
+        }
+        if self.scc && !other.scc {
+            self.scc = false;
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn scalar_preserves_scc(name: &str) -> bool {
+    matches!(
+        name,
+        "s_mov_b32"
+            | "s_mov_b64"
+            | "s_movk_i32"
+            | "s_cselect_b32"
+            | "s_cselect_b64"
+            | "s_cmov_b32"
+            | "s_cmov_b64"
+            | "s_cmovk_i32"
+            | "s_getpc_b64"
+            | "s_brev_b32"
+            | "s_bitset0_b32"
+            | "s_bitset1_b32"
+            | "s_bfm_b32"
+            | "s_bfm_b64"
+            | "s_mul_i32"
+            | "s_mul_hi_u32"
+            | "s_mul_hi_i32"
+            | "s_pack_ll_b32_b16"
+            | "s_pack_lh_b32_b16"
+            | "s_pack_hh_b32_b16"
+    )
+}
+
+fn analyze_uniformity(insns: &[Insn], cfg: &CfgInfo) -> Vec<UniformState> {
+    let n = insns.len();
+    let mut states: Vec<Option<UniformState>> = vec![None; n];
+    if n == 0 {
+        return Vec::new();
+    }
+    states[0] = Some(UniformState::entry());
+    let mut work = VecDeque::from([0usize]);
+    let mut iters = 0usize;
+    while let Some(i) = work.pop_front() {
+        iters += 1;
+        if iters > n.saturating_mul(64) {
+            return vec![UniformState { sgpr: [false; 106], scc: false }; n];
+        }
+        let ins = &insns[i];
+        let mut out = states[i].clone().expect("reachable");
+        let m = ins.mnemonic.as_str();
+        if m != "v_nop" {
+            match ins.enc {
+                Enc::Smem => {
+                    let base_wide = m.starts_with("s_buffer");
+                    let base_ok = ins.src.iter().all(|o| match *o {
+                        Opnd::Sgpr(r @ 0..=105) => {
+                            let width = if base_wide { 4 } else { 2 };
+                            (0..width).all(|k| (r as usize + k) < 106 && out.sgpr[r as usize + k])
+                        }
+                        _ => out.opnd(o, false),
+                    });
+                    let off_ok = ins.raw.get(1).is_none_or(|w| {
+                        let off = (w >> 25) as usize;
+                        off >= 106 || out.sgpr[off]
+                    });
+                    let uniform = base_ok && off_ok;
+                    for r in 0..106u8 {
+                        if clobbers_scalar(ins, r) {
+                            out.sgpr[r as usize] = uniform;
+                        }
+                    }
+                }
+                Enc::Sop1 | Enc::Sop2 | Enc::Sopk | Enc::Sopc => {
+                    let wide = m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64");
+                    let reads_scc = matches!(
+                        m,
+                        "s_cselect_b32"
+                            | "s_cselect_b64"
+                            | "s_cmov_b32"
+                            | "s_cmov_b64"
+                            | "s_cmovk_i32"
+                            | "s_addc_u32"
+                            | "s_subb_u32"
+                    );
+                    let uniform = if m == "s_getpc_b64" {
+                        true
+                    } else if m.contains("exec")
+                        || m.starts_with("s_wqm")
+                        || m.starts_with("s_movrel")
+                        || m.starts_with("s_getreg")
+                    {
+                        false
+                    } else {
+                        let src_ok = ins.src.iter().all(|o| out.opnd(o, wide));
+                        let dst_in_ok = ins.enc != Enc::Sopk
+                            || m.starts_with("s_movk")
+                            || ins.dst.iter().all(|o| out.opnd(o, false));
+                        src_ok && dst_in_ok && (!reads_scc || out.scc)
+                    };
+                    for r in 0..106u8 {
+                        if clobbers_scalar(ins, r) {
+                            out.sgpr[r as usize] = uniform;
+                        }
+                    }
+                    if ins.enc == Enc::Sopc || !scalar_preserves_scc(m) {
+                        out.scc = uniform;
+                    }
+                }
+                Enc::Sopp => {}
+                _ => {
+                    for r in 0..106u8 {
+                        if clobbers_scalar(ins, r) {
+                            out.sgpr[r as usize] = false;
+                        }
+                    }
+                    if m == "v_readlane_b32" {
+                        if let Some(Opnd::Vgpr(d @ 0..=105) | Opnd::Sgpr(d @ 0..=105)) =
+                            ins.dst.first()
+                        {
+                            out.sgpr[*d as usize] = false;
+                        }
+                    }
+                }
+            }
+        }
+        let mut push = |next: usize| {
+            if next >= n {
+                return;
+            }
+            let changed = match &mut states[next] {
+                Some(existing) => existing.join(&out),
+                slot => {
+                    *slot = Some(out.clone());
+                    true
+                }
+            };
+            if changed {
+                work.push_back(next);
+            }
+        };
+        if let Some(&t) = cfg.target.get(&i).or_else(|| cfg.back.get(&i)) {
+            push(t);
+            if ins.enc == Enc::Sopp && ins.op == 2 {
+                continue;
+            }
+        }
+        if ins.mnemonic != "s_endpgm" {
+            push(i + 1);
+        }
+    }
+    states
+        .into_iter()
+        .map(|s| s.unwrap_or(UniformState { sgpr: [false; 106], scc: false }))
+        .collect()
+}
+
+fn is_uniform_branch(ins: &Insn, state: &UniformState) -> bool {
+    if ins.enc != Enc::Sopp {
+        return false;
+    }
+    match ins.op {
+        2 => true,
+        4 | 5 => state.scc,
+        _ => false,
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ExecState {
+    full: bool,
+    /// `(base_sgpr, is_64bit_pair)` snapshots taken when `full` was true.
+    saved_full: BTreeSet<(u8, bool)>,
+}
+
+impl ExecState {
+    fn entry() -> Self {
+        Self { full: true, saved_full: BTreeSet::new() }
+    }
+
+    fn join(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        if self.full && !other.full {
+            self.full = false;
+            changed = true;
+        }
+        let before = self.saved_full.len();
+        self.saved_full.retain(|entry| other.saved_full.contains(entry));
+        if self.saved_full.len() != before {
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn analyze_exec_full(insns: &[Insn], cfg: &CfgInfo) -> Vec<bool> {
+    let n = insns.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut states: Vec<Option<ExecState>> = vec![None; n];
+    states[0] = Some(ExecState::entry());
+    let mut work = VecDeque::from([0usize]);
+    let mut iters = 0usize;
+    while let Some(i) = work.pop_front() {
+        iters += 1;
+        if iters > n.saturating_mul(64) {
+            return vec![false; n];
+        }
+        let ins = &insns[i];
+        let incoming = states[i].as_ref().expect("reachable");
+        let mut out = incoming.clone();
+        let m = ins.mnemonic.as_str();
+        out.saved_full.retain(|&(r, pair)| {
+            !clobbers_scalar(ins, r) && (!pair || !clobbers_scalar(ins, r.saturating_add(1)))
+        });
+        // Track SGPRs that capture a full EXEC mask before EXEC itself changes.
+        let is_pair = m.ends_with("_b64");
+        let saves_exec = (matches!(m, "s_mov_b32" | "s_mov_b64")
+            && ins.src.first() == Some(&Opnd::ExecLo))
+            || m.contains("saveexec");
+        if saves_exec && incoming.full {
+            if let [Opnd::Sgpr(dst @ 0..=105)] = ins.dst.as_slice() {
+                if !is_pair || *dst < 105 {
+                    out.saved_full.insert((*dst, is_pair));
+                }
+            }
+        } else if matches!(m, "s_mov_b32" | "s_mov_b64") {
+            if let ([Opnd::Sgpr(dst @ 0..=105)], [Opnd::Sgpr(src)]) =
+                (ins.dst.as_slice(), ins.src.as_slice())
+            {
+                if incoming.saved_full.contains(&(*src, is_pair)) && (!is_pair || *dst < 105) {
+                    out.saved_full.insert((*dst, is_pair));
+                }
+            }
+        }
+        // Update whether every lane in the wave is active in EXEC.
+        let sets_all = (matches!(m, "s_mov_b32" | "s_mov_b64")
+            && ins.dst.first() == Some(&Opnd::ExecLo)
+            && matches!(ins.src.first(), Some(Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX))))
+            || (matches!(m, "s_or_saveexec_b32" | "s_or_saveexec_b64")
+                && matches!(ins.src.first(), Some(Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX))))
+            || (matches!(m, "s_nand_saveexec_b32" | "s_nand_saveexec_b64")
+                && ins.src.first() == Some(&Opnd::ConstInt(0)));
+        let restores_full = matches!(m, "s_mov_b32" | "s_mov_b64")
+            && ins.dst.first() == Some(&Opnd::ExecLo)
+            && matches!(ins.src.first(), Some(Opnd::Sgpr(s)) if incoming.saved_full.contains(&(*s, is_pair)));
+        let writes_exec = ins.dst.iter().any(|o| matches!(o, Opnd::ExecLo | Opnd::ExecHi))
+            || m.contains("saveexec")
+            || m.contains("wrexec")
+            || m.starts_with("v_cmpx_");
+        if sets_all || restores_full {
+            out.full = true;
+        } else if writes_exec {
+            out.full = false;
+        }
+        let mut push = |next: usize| {
+            if next >= n {
+                return;
+            }
+            let changed = match &mut states[next] {
+                Some(existing) => existing.join(&out),
+                slot => {
+                    *slot = Some(out.clone());
+                    true
+                }
+            };
+            if changed {
+                work.push_back(next);
+            }
+        };
+        if let Some(&t) = cfg.target.get(&i).or_else(|| cfg.back.get(&i)) {
+            push(t);
+            if ins.enc == Enc::Sopp && ins.op == 2 {
+                continue;
+            }
+        }
+        if m != "s_endpgm" {
+            push(i + 1);
+        }
+    }
+    states.into_iter().map(|s| s.is_some_and(|e| e.full)).collect()
+}
+
+fn has_wave32_markers(insns: &[Insn], required_wave_size: Option<u32>, fspx_wave32: bool) -> bool {
+    if required_wave_size == Some(32) || fspx_wave32 {
+        return true;
+    }
+    insns.iter().any(|op| {
+        let m = op.mnemonic.as_str();
+        m.ends_with("saveexec_b32")
+            || m.ends_with("wrexec_b32")
+            || (m == "s_mov_b32"
+                && (op.dst.contains(&Opnd::ExecLo) || op.src.contains(&Opnd::ExecLo)))
+            || (matches!(m, "s_ff1_i32_b32" | "s_bcnt1_i32_b32")
+                && op.src.contains(&Opnd::ExecLo))
+            || (op.enc == Enc::Vop3
+                && m.starts_with("v_cmp_")
+                && matches!(op.dst.as_slice(), [Opnd::Sgpr(n)] if n & 1 != 0))
+    })
+}
+
+fn has_wave64_markers(
+    insns: &[Insn],
+    read_sites: &[usize],
+    required_wave_size: Option<u32>,
+) -> bool {
+    if required_wave_size == Some(64) {
+        return true;
+    }
+    if read_sites
+        .iter()
+        .any(|&i| matches!(insns[i].src.get(1), Some(Opnd::ConstInt(32..=63))))
+    {
+        return true;
+    }
+    insns.iter().any(|op| {
+        let m = op.mnemonic.as_str();
+        m.ends_with("saveexec_b64")
+            || m.ends_with("wrexec_b64")
+            || (m == "s_mov_b64"
+                && (op.dst.contains(&Opnd::ExecLo) || op.src.contains(&Opnd::ExecLo)))
+            || (matches!(m, "s_ff1_i32_b64" | "s_bcnt1_i32_b64")
+                && op.src.contains(&Opnd::ExecLo))
+            || m == "v_mbcnt_hi_u32_b32"
+    })
+}
+
+/// Lower constant-lane and upper-bound-proven SGPR `v_readlane_b32` instructions
+/// (excluding SGPR spill VGPRs written by `v_writelane_b32`).
+///
+/// Validates every non-spill `v_readlane_b32` transactionally before mutating
+/// `insns`, refusing out-of-range lanes, unproven dynamic SGPR lanes, and
+/// non-uniform loop/barrier placements with explicit error reasons.
+pub(super) fn lower_constant_reads(
+    group: [u32; 3],
+    insns: &mut [Insn],
+    required_wave_size: Option<u32>,
+    fspx_wave32: bool,
+    allow_small_group: bool,
+    allow_unproven_swizzle_fallback: bool,
+) -> Result<ConstantReadPlan, String> {
+    let spill_vregs: BTreeSet<u8> = insns
+        .iter()
+        .filter(|op| op.enc == Enc::Vop3 && op.op == 0x361)
+        .filter_map(|op| match op.dst.first() {
+            Some(Opnd::Vgpr(v)) => Some(*v),
             _ => None,
         })
-    } else { Default::default() };
-    let upper_lane = |op: &Insn| match op.src.get(1)? {
-        Opnd::ConstInt(n @ 0..=63) => Some(*n as u32),
-        Opnd::Sgpr(reg) => selectors.get(&(op.offset, *reg)).copied(),
-        _ => None,
+        .collect();
+    let read_sites: Vec<usize> = insns
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            op.enc == Enc::Vop3
+                && op.op == 0x360
+                && op.mnemonic == "v_readlane_b32"
+                && matches!(op.src.first(), Some(Opnd::Vgpr(v)) if !spill_vregs.contains(v))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if read_sites.is_empty() {
+        return Ok(ConstantReadPlan::default());
+    }
+    let first_off = insns[read_sites[0]].offset;
+    let count = group.into_iter().fold(1u32, u32::saturating_mul);
+    if count == 0 || count > 1024 {
+        return Err(format!(
+            "v_readlane_b32 at {first_off:#x}: compute group size {count} outside 1..=1024"
+        ));
+    }
+    let (guest_width, max_lane) = if count <= 32 {
+        if !allow_small_group {
+            return Ok(ConstantReadPlan::default());
+        }
+        (32u32, count)
+    } else {
+        let wave32 = has_wave32_markers(insns, required_wave_size, fspx_wave32);
+        let wave64 = has_wave64_markers(insns, &read_sites, required_wave_size);
+        if wave32 && wave64 {
+            return Err(format!(
+                "v_readlane_b32 at {first_off:#x}: conflicting wave32 and wave64 instructions"
+            ));
+        }
+        if wave32 {
+            if count % 32 != 0 {
+                return Err(format!(
+                    "v_readlane_b32 at {first_off:#x}: wave32 compute group ({count} threads) must be a multiple of 32"
+                ));
+            }
+            (32u32, 32u32)
+        } else {
+            if count % 64 != 0 {
+                return Err(format!(
+                    "v_readlane_b32 at {first_off:#x}: wave64 compute group ({count} threads) must be a multiple of 64"
+                ));
+            }
+            (64u32, 64u32)
+        }
     };
-    if insns.iter().any(|op| {
-        let name = op.mnemonic.as_str();
-        let branch = op.enc == Enc::Sopp && Emitter::branch_cond(op.op).is_some();
-        name == "v_writelane_b32" || matches!(name, "s_setpc_b64" | "s_swappc_b64" | "s_call_b64")
-            || (op.offset as i64 <= end && name == "s_endpgm")
-            || (name.contains("branch") && (!branch || op.aux.imm < 0))
-            || (name == "v_readlane_b32" && (!matches!((&op.dst[..], op.src.first()),
-                ([Opnd::Vgpr(_)], Some(Opnd::Vgpr(_))))
-                || !upper_lane(op).is_some_and(|n| n < count.min(64))))
-    }) { return false; }
-    for op in insns.iter_mut().filter(|op| op.mnemonic == "v_readlane_b32") {
-        let Opnd::Vgpr(dst) = op.dst[0] else { unreachable!() };
+
+    let needs_sgpr_proof = read_sites
+        .iter()
+        .any(|&i| matches!(insns[i].src.get(1), Some(Opnd::Sgpr(_))));
+    let selectors = if needs_sgpr_proof {
+        super::scalar_values::at_reads(insns, super::scalar_values::Proof::UpperBound, |op| {
+            match (op.mnemonic.as_str(), op.src.get(1)) {
+                ("v_readlane_b32", Some(Opnd::Sgpr(reg))) => Some(*reg),
+                _ => None,
+            }
+        })
+    } else {
+        Default::default()
+    };
+
+    let mut dst_regs = Vec::with_capacity(read_sites.len());
+    for &idx in &read_sites {
+        let op = &insns[idx];
+        let dst = match op.dst.as_slice() {
+            [Opnd::Vgpr(d @ 0..=105) | Opnd::Sgpr(d @ 0..=105)] => *d,
+            other => {
+                return Err(format!(
+                    "v_readlane_b32 at {:#x}: invalid scalar destination {other:?}",
+                    op.offset
+                ));
+            }
+        };
+        if op.aux.sdwa.is_some() || (op.raw.len() == 2 && op.aux.mask != 0) {
+            return Err(format!(
+                "v_readlane_b32 at {:#x}: unsupported VOP3 modifiers",
+                op.offset
+            ));
+        }
+        match op.src.get(1) {
+            Some(Opnd::ConstInt(k)) => {
+                if !(0..i64::from(max_lane)).contains(k) {
+                    return Err(format!(
+                        "v_readlane_b32 at {:#x}: constant lane {k} out of range 0..{max_lane} for wave{guest_width} group",
+                        op.offset
+                    ));
+                }
+            }
+            Some(Opnd::Sgpr(reg)) => match selectors.get(&(op.offset, *reg)).copied() {
+                Some(upper) if upper < max_lane => {}
+                Some(upper) => {
+                    return Err(format!(
+                        "v_readlane_b32 at {:#x}: SGPR lane s{reg} upper bound {upper} exceeds limit {max_lane}",
+                        op.offset
+                    ));
+                }
+                None if allow_unproven_swizzle_fallback => {
+                    return Ok(ConstantReadPlan::default());
+                }
+                None => {
+                    return Err(format!(
+                        "v_readlane_b32 at {:#x}: dynamic SGPR lane s{reg} lacks an upper-bound proof (< {max_lane})",
+                        op.offset
+                    ));
+                }
+            },
+            other => {
+                return Err(format!(
+                    "v_readlane_b32 at {:#x}: unsupported lane selector {other:?}",
+                    op.offset
+                ));
+            }
+        }
+        dst_regs.push(dst);
+    }
+
+    let cfg = build_cfg(insns, first_off)?;
+    let last_read = *read_sites.last().expect("non-empty");
+    if let Some(early) = insns[..last_read].iter().find(|op| op.mnemonic == "s_endpgm") {
+        return Err(format!(
+            "v_readlane_b32 at {:#x}: follows early s_endpgm at {:#x}",
+            insns[last_read].offset, early.offset
+        ));
+    }
+    let uniformity = analyze_uniformity(insns, &cfg);
+    // Check that any loop enclosing a readlane is proven workgroup-uniform.
+    for &idx in &read_sites {
+        for &(l, b) in &cfg.loops {
+            if !(l <= idx && idx <= b) {
+                continue;
+            }
+            let uniform_back = is_uniform_branch(&insns[b], &uniformity[b]);
+            let bad_exit = insns[l..=b].iter().enumerate().any(|(off, op)| {
+                let j = l + off;
+                op.mnemonic == "s_endpgm"
+                    || cfg
+                        .target
+                        .get(&j)
+                        .is_some_and(|&t| (t == b || t > b) && !is_uniform_branch(op, &uniformity[j]))
+            });
+            let bad_entry = cfg.target.iter().any(|(&from, &to)| {
+                from < l && to > l && to <= b && !is_uniform_branch(&insns[from], &uniformity[from])
+            });
+            if !uniform_back || bad_exit || bad_entry {
+                return Err(format!(
+                    "v_readlane_b32 at {:#x}: inside non-uniform loop ({:#x}..={:#x}); barrier/wave read cannot be proven convergent",
+                    insns[idx].offset, insns[l].offset, insns[b].offset
+                ));
+            }
+        }
+    }
+
+    let exec_full = analyze_exec_full(insns, &cfg);
+    let can_wave32_group = guest_width == 32 && count % 32 == 0 && group[1] == 1 && group[2] == 1;
+    let mut plan = ConstantReadPlan::default();
+    let mut modes = Vec::with_capacity(read_sites.len());
+    for &idx in &read_sites {
+        // Check if any non-uniform forward branch skips over this readlane.
+        let non_uniform_guard = cfg.target.iter().any(|(&from, &to)| {
+            from < idx && to > idx && !is_uniform_branch(&insns[from], &uniformity[from])
+        });
+        let uniform_selector = match insns[idx].src.get(1) {
+            Some(Opnd::ConstInt(_)) => true,
+            Some(Opnd::Sgpr(reg @ 0..=105)) => uniformity[idx].sgpr[*reg as usize],
+            _ => false,
+        };
+        let native_wave32 = can_wave32_group && exec_full[idx] && !non_uniform_guard && uniform_selector;
+        modes.push(native_wave32);
+    }
+
+    for ((&idx, dst), native_wave32) in read_sites.iter().zip(dst_regs).zip(modes) {
+        let op = &mut insns[idx];
         op.enc = Enc::Sop1;
-        op.mnemonic = "tb_indexed_readlane".into();
         op.dst[0] = Opnd::Sgpr(dst);
         op.src.truncate(2);
+        if native_wave32 {
+            op.mnemonic = WAVE32_READ_LANE.into();
+            plan.uses_native_wave32 = true;
+        } else {
+            op.mnemonic = "tb_indexed_readlane".into();
+            op.aux.imm = i64::from(guest_width - 1);
+            plan.uses_shared = true;
+            plan.shared_wave_width = Some(guest_width);
+        }
     }
-    true
+    Ok(plan)
+}
+
+/// Backward-compatible helper for direct unit tests of constant/bounded reads.
+#[cfg(test)]
+pub(super) fn constant_reads(group: [u32; 3], insns: &mut [Insn], allow_small_group: bool) -> bool {
+    matches!(
+        lower_constant_reads(group, insns, None, false, allow_small_group, false),
+        Ok(plan) if plan.uses_shared || plan.uses_native_wave32
+    )
 }
 
 pub(super) fn prepare(group: [u32; 3], insns: &mut [Insn]) -> bool {

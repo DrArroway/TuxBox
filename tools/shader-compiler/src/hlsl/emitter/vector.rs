@@ -622,7 +622,13 @@ impl<'a> Emitter<'a> {
                     return self.wv(&d, &format!("({b} + tb_lane)"));
                 }
                 if self.indexed_lane {
-                    let lane = if m == "v_mbcnt_lo_u32_b32" { "tb_lane & 63u" } else { "max(tb_lane & 63u, 32u) - 32u" };
+                    let lane = if self.indexed_lane_wave32 {
+                        if m == "v_mbcnt_lo_u32_b32" { "tb_lane & 31u" } else { "0u" }
+                    } else if m == "v_mbcnt_lo_u32_b32" {
+                        "tb_lane & 63u"
+                    } else {
+                        "max(tb_lane & 63u, 32u) - 32u"
+                    };
                     return self.wv(&d, &format!("({b} + countbits({a} & {}))", low_mask(lane)));
                 }
                 if self.ex.stage == Stage::Mesh {

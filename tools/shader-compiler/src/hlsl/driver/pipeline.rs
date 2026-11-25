@@ -177,24 +177,43 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     let scan = if wave_cull { None } else { wave_scan::prepare(ex, &mut insns)? };
     let scan_width = scan.as_ref().map(|s| s.width);
     let ordinary_wave = !wave_cull && !page_waves && !lone_lane::on();
-    let indexed_lane = !resolve_wave32 && (election == Some(ElectionLowering::Shared64) || group_extrema || ex.stage == Stage::Compute
-        && (indexed_lane::constant_reads(compute_group(ex), &mut insns, ordinary_wave)
-            || indexed_lane::prepare(compute_group(ex), &mut insns)));
     // A waterfall loop is one per-lane read of a lane; exchange it once.
     let waterfall_gathers = ex.stage == Stage::Compute && !resolve_wave32 && lower_waterfall_gathers(&mut insns) > 0;
-    // A uniform Sgpr lane operand is only expressible through the whole-wave
-    // group read, which needs shared-memory exchange like a swizzle does.
-    let has_dynamic_lane_read = insns.iter().any(|i| i.enc == Enc::Vop3
-        && i.op == 0x360
-        && matches!(i.src.get(1), Some(Opnd::Sgpr(_))));
+    let swizzle_group_reads = insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32")
+        && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64");
+    let prepared_election_lane = !resolve_wave32 && ex.stage == Stage::Compute
+        && indexed_lane::prepare(compute_group(ex), &mut insns);
+    let fspx_wave32 = ex.fspx_config.is_some_and(|cfg| cfg[4] == 0x100001);
+    let read_plan = if !resolve_wave32 && ordinary_wave && ex.stage == Stage::Compute {
+        indexed_lane::lower_constant_reads(
+            compute_group(ex),
+            &mut insns,
+            required_wave_size.or(scan_width),
+            fspx_wave32,
+            ordinary_wave,
+            swizzle_group_reads,
+        )?
+    } else {
+        indexed_lane::ConstantReadPlan::default()
+    };
+    let indexed_lane = !resolve_wave32
+        && (election == Some(ElectionLowering::Shared64)
+            || group_extrema
+            || prepared_election_lane
+            || read_plan.uses_shared);
+    let indexed_lane_wave32 = read_plan.uses_shared
+        && read_plan.shared_wave_width == Some(32)
+        && election != Some(ElectionLowering::Shared64)
+        && !group_extrema
+        && !prepared_election_lane;
+    let wave32_readlane = read_plan.uses_native_wave32;
+    let has_dynamic_lane_read = swizzle_group_reads
+        && insns.iter().any(|i| i.enc == Enc::Vop3
+            && i.op == 0x360
+            && matches!(i.src.get(1), Some(Opnd::Sgpr(_))));
     if !wave_cull && !page_waves { {
         // Swizzles already exchange values through group memory; so can a lane read.
         let [x, y, z] = compute_group(ex);
-        // Swizzle shaders already handle EXEC; a fully uniform shader (no EXEC
-        // instructions) is the simplest case for the group read. Both cases share
-        // the swizzle validation below.
-        let swizzle_group_reads = insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32")
-            && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64");
         let group_reads = ex.stage == Stage::Compute && !resolve_wave32 && !lone_lane::on() && x * y * z % 32 == 0
             && (swizzle_group_reads || has_dynamic_lane_read)
             && !insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32" && i.mnemonic.starts_with("ds_ordered"));
@@ -218,6 +237,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             (2356, 0xe4995b0e2291e61e), (2884, 0x1c9821104747da89),
         ].into_iter().any(|(size, hash)| packed_root::matches_program(&ex.isa, size, hash))));
     em.indexed_lane = indexed_lane;
+    em.indexed_lane_wave32 = indexed_lane_wave32;
     em.single_wave32 = single_wave32;
     em.resolve_wave32 = resolve_wave32;
     em.wave32_compare_masks |= reflection && matches!(ex.isa.len(), 1024 | 1028);
@@ -299,7 +319,10 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     {
         return Err("asymmetric DPP16 row mask requires a known guest wave width".into());
     }
-    let required_wave_size = required_wave_size.or((uses_quad_add && em.straight_pixel_quad.is_none() && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema).then_some(32));
+    if wave32_readlane && required_wave_size == Some(64) {
+        return Err("conflicting wave widths for Wave32 lane read".into());
+    }
+    let required_wave_size = required_wave_size.or((uses_quad_add && em.straight_pixel_quad.is_none() && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema || wave32_readlane).then_some(32));
     // A ballot or minimum over active invocations also works in the final
     // partial subgroup. Keep the full-wave requirement for every other user.
     let partial_election = required_wave_size.is_none() && election == Some(ElectionLowering::Native32);

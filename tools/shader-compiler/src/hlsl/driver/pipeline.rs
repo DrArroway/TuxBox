@@ -234,6 +234,10 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         em.vote_uses.insert(count, def);
         em.regs.insert(format!("tb_votes{def}"));
     }
+    if ex.stage == Stage::Compute && !lone_lane::on() && !wave_cull && !page_waves && !indexed_lane
+        && em.fspx_wave.is_none() && !hair_multisample {
+        em.mask_ballots = mask_ballots::find(&em.insns);
+    }
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
     for ins in &em.insns {
         for o in ins.dst.iter().chain(ins.src.iter()) {
@@ -374,6 +378,19 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
+    // One mask word holds 32 lanes. Two hold any wave the host can have, so a wave64
+    // program still runs on adapters without one.
+    let required_wave_size = match em.mask_ballots.as_ref().map(|b| b.width) {
+        Some(32) if required_wave_size == Some(64) => {
+            em.mask_ballots = None;
+            required_wave_size
+        }
+        Some(32) => Some(32),
+        _ => required_wave_size,
+    };
+    if em.portable_wave64 { em.mask_ballots = None; }
+    em.required_wave_size = required_wave_size;
+    em.regs.extend(em.mask_ballots.iter().flat_map(mask_ballots::Ballots::names).collect::<Vec<_>>());
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
     }
@@ -518,7 +535,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         "cs_6_6"
     } else if em.uses_heap_sampler || em.resource_heap_base.is_some() || em.pixel_heap || em.straight_pixel_quad.is_some() {
         "ps_6_6"
-    } else if probe_trace {
+    } else if probe_trace || em.mask_ballots.is_some() {
         "cs_6_5"
     } else if is_ps && !em.uav.is_empty() {
         "ps_5_1"

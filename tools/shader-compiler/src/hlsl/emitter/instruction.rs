@@ -7,6 +7,9 @@ impl<'a> Emitter<'a> {
             return paired_wave64::emit(self, idx, ins, is_ps, br);
         }
         self.emit_insn_body(idx, ins, is_ps, br)?;
+        for line in mask_ballots::capture(self, idx) {
+            self.line(&line);
+        }
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
             let not = if vote.none { "!" } else { "" };

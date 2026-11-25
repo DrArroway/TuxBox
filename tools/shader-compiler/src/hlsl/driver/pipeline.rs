@@ -151,7 +151,11 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     let generic_waves = !lone_lane::on() && !wave_cull && !page_waves;
     let election = if generic_waves && !resolve_wave32 { straight_election(ex, &insns) } else { None };
     let allocation_wave64 = generic_waves && mark_wave_allocations(&mut insns, resolve_wave32, election)?;
-    if ex.stage == Stage::Pixel { wave_alloc::prepare(&mut insns); }
+    let wave_alloc_width = if ex.stage == Stage::Pixel || ex.stage == Stage::Compute {
+        wave_alloc::prepare(&mut insns, ex.stage)?
+    } else {
+        None
+    };
     let reflection = reflection_compact::prepare(ex, &mut insns);
     group_extrema::prepare_exchanges(ex, &mut insns)?;
     let group_extrema = group_extrema::prepare(ex, &mut insns);
@@ -163,6 +167,18 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         fspx_wave.filter(|&width| width == 32)
     } else if straight_exchange { None }
       else { lower_wave_reductions(&mut insns)? };
+    // A masked DPP prefix/total scan is a whole-wave collective: the host wave must
+    // match the guest wave width (32 or 64 lanes). Only compute shaders need this
+    // constraint — a pixel is a wave of its own.
+    let required_wave_size = if ex.stage == Stage::Compute {
+        match (required_wave_size, wave_alloc_width) {
+            (None, w) => w,
+            (Some(a), Some(b)) if a != b => return Err("conflicting wave widths for wave allocation and reduction".into()),
+            (a, _) => a,
+        }
+    } else {
+        required_wave_size
+    };
     let required_wave_size = if resolve_wave32 {
         if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
@@ -354,7 +370,23 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             Err(reason) => {
                 let ordinary = ex.stage == Stage::Compute && !em.wave_cull && !em.page_waves
                     && !em.resolve_wave32 && !lone_lane::on();
-                em.lockstep = Some(ordinary.then(|| lockstep::prove(&em.insns, width)).flatten().ok_or(reason)?);
+                if !ordinary {
+                    return Err(reason);
+                }
+                match lockstep::prove(&em.insns, width) {
+                    Some(votes) => em.lockstep = Some(votes),
+                    None => {
+                        // Lockstep cannot prove this program; lower the totals that
+                        // wave_sum rejects on control flow to WaveActiveSum, a
+                        // whole-wave op that is safe in divergent control flow, and
+                        // re-validate the reductions that remain.
+                        wave_alloc::lower_problematic_totals(&mut em.insns, width)?;
+                        match wave_sum::check_control_flow(&em.insns, width) {
+                            Ok(guards) => em.reduction_execz_guards = guards,
+                            Err(reason) => return Err(reason),
+                        }
+                    }
+                }
             }
         }
         let [x, y, z] = compute_group(ex);

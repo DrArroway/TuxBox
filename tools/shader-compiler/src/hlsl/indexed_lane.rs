@@ -857,13 +857,15 @@ pub(super) fn lower_constant_reads(
                     insns[idx].offset, insns[l].offset, insns[b].offset
                 ));
             }
-            // A preceding non-uniform loop would desynchronize the function-wide
-            // `tb_guard` counter across lanes before entering this barrier loop.
+            // A preceding or nested non-uniform loop would desynchronize the
+            // function-wide `tb_guard` counter across lanes in this barrier loop.
             if let Some(&(pl, pb)) = cfg.loops.iter().find(|&&(pl, pb)| {
-                pb < l && !is_loop_uniform(insns, &cfg, pl, pb, &uniformity, &non_uniform_ctl)
+                (pl, pb) != (l, b)
+                    && pb <= b
+                    && !is_loop_uniform(insns, &cfg, pl, pb, &uniformity, &non_uniform_ctl)
             }) {
                 return Err(format!(
-                    "v_readlane_b32 at {:#x}: loop ({:#x}..={:#x}) follows non-uniform loop ({:#x}..={:#x})",
+                    "v_readlane_b32 at {:#x}: loop ({:#x}..={:#x}) follows or contains non-uniform loop ({:#x}..={:#x})",
                     insns[idx].offset, insns[l].offset, insns[b].offset, insns[pl].offset, insns[pb].offset
                 ));
             }

@@ -448,7 +448,24 @@ fn f1_refuses_non_uniform_branch_skipping_entire_readlane_loop_and_prior_non_uni
     let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &prior_non_uniform, None))
         .err()
         .expect("barrier loop after non-uniform loop must be refused");
-    assert!(err.contains("follows non-uniform loop"), "{err}");
+    assert!(err.contains("follows or contains non-uniform loop"), "{err}");
+
+    // F1b-nested: Uniform outer barrier loop containing a non-uniform inner loop
+    // would also desync function-wide `tb_guard` across lanes.
+    let nested_non_uniform = [
+        0xbe8a_0384, // 0x00: s_mov_b32 s10, 4
+        r0, r1,      // 0x04: L_outer: v_readlane_b32 s7, v1, 31
+        0x7e02_0300, // 0x0c: L_inner: v_mov_b32 v1, v0
+        0xbf87_fffe, // 0x10: s_cbranch_vccnz L_inner (non-uniform inner loop!)
+        0x818a_810a, // 0x14: s_sub_i32 s10, s10, 1
+        0xbf07_800a, // 0x18: s_cmp_lg_u32 s10, 0
+        0xbf85_fff9, // 0x1c: s_cbranch_scc1 L_outer (-7 dwords -> 0x04)
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &nested_non_uniform, None))
+        .err()
+        .expect("barrier loop containing non-uniform inner loop must be refused");
+    assert!(err.contains("follows or contains non-uniform loop"), "{err}");
 }
 
 #[test]

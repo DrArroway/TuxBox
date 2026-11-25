@@ -349,26 +349,13 @@ fn analyze_uniformity_pass(
         if m != "v_nop" {
             match ins.enc {
                 Enc::Smem => {
-                    let is_load = m.starts_with("s_load_") || m.starts_with("s_buffer_load_");
-                    let base_wide = m.starts_with("s_buffer");
-                    let base_ok = ins.src.iter().all(|o| match *o {
-                        Opnd::Sgpr(r @ 0..=105) => {
-                            let width = if base_wide { 4 } else { 2 };
-                            (0..width)
-                                .all(|k| (r as usize + k) < 106 && incoming.sgpr[r as usize + k])
-                        }
-                        _ => incoming.opnd(o, false),
-                    });
-                    // 7-bit SMEM soffset: 0..=105 are SGPRs, 125 is NULL (no scalar offset);
-                    // 106..=124 and 126..=127 (VCC/M0/EXEC) are non-uniform.
-                    let off_ok = ins.raw.get(1).is_some_and(|w| {
-                        let off = ((w >> 25) & 0x7f) as usize;
-                        off == 125 || (off < 106 && incoming.sgpr[off])
-                    });
-                    let uniform = ctl_ok && is_load && base_ok && off_ok;
+                    // Conservatively treat scalar memory loads (s_load_*, s_buffer_load_*)
+                    // as non-uniform unless proven read-only immutable: mutable/UAV/coherent
+                    // scalar loads can vary across waves in the same workgroup and deadlock
+                    // barriers.
                     for r in 0..106u8 {
                         if clobbers_scalar(ins, r) {
-                            out.sgpr[r as usize] = uniform;
+                            out.sgpr[r as usize] = false;
                         }
                     }
                 }
@@ -656,9 +643,6 @@ fn has_wave32_markers(insns: &[Insn], required_wave_size: Option<u32>, fspx_wave
         let m = op.mnemonic.as_str();
         m.ends_with("saveexec_b32")
             || m.ends_with("wrexec_b32")
-            || (matches!(op.enc, Enc::Sop1 | Enc::Sop2 | Enc::Sopc)
-                && (m.ends_with("_b32") || m.ends_with("_u32") || m.ends_with("_i32"))
-                && touches_exec(op))
             || (op.enc == Enc::Vop3
                 && m.starts_with("v_cmp_")
                 && matches!(op.dst.as_slice(), [Opnd::Sgpr(n)] if n & 1 != 0))
@@ -681,13 +665,51 @@ fn has_wave64_markers(
     }
     insns.iter().any(|op| {
         let m = op.mnemonic.as_str();
-        m.ends_with("saveexec_b64")
+        op.dst.iter().chain(&op.src).any(|o| matches!(o, Opnd::ExecHi))
+            || m.ends_with("saveexec_b64")
             || m.ends_with("wrexec_b64")
             || (matches!(op.enc, Enc::Sop1 | Enc::Sop2 | Enc::Sopc)
                 && (m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64"))
                 && touches_exec(op))
             || m == "v_mbcnt_hi_u32_b32"
     })
+}
+
+fn has_ambiguous_exec_lo_b32(insns: &[Insn]) -> bool {
+    insns.iter().any(|op| {
+        let m = op.mnemonic.as_str();
+        let is_64 = m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64");
+        matches!(op.enc, Enc::Sop1 | Enc::Sop2 | Enc::Sopc | Enc::Sopk)
+            && !is_64
+            && op.dst.iter().chain(&op.src).any(|o| matches!(o, Opnd::ExecLo))
+    })
+}
+
+fn non_spill_read_sites(insns: &[Insn]) -> Vec<usize> {
+    let spill_vregs: BTreeSet<u8> = insns
+        .iter()
+        .filter(|op| op.enc == Enc::Vop3 && op.op == 0x361)
+        .filter_map(|op| match op.dst.first() {
+            Some(Opnd::Vgpr(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    insns
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            op.enc == Enc::Vop3
+                && op.op == 0x360
+                && op.mnemonic == "v_readlane_b32"
+                && matches!(op.src.first(), Some(Opnd::Vgpr(v)) if !spill_vregs.contains(v))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether `insns` contains any non-spill cross-lane `v_readlane_b32`.
+pub(super) fn has_non_spill_readlane(insns: &[Insn]) -> bool {
+    !non_spill_read_sites(insns).is_empty()
 }
 
 /// Lower constant-lane and upper-bound-proven SGPR `v_readlane_b32` instructions
@@ -704,25 +726,7 @@ pub(super) fn lower_constant_reads(
     allow_small_group: bool,
     allow_unproven_swizzle_fallback: bool,
 ) -> Result<ConstantReadPlan, String> {
-    let spill_vregs: BTreeSet<u8> = insns
-        .iter()
-        .filter(|op| op.enc == Enc::Vop3 && op.op == 0x361)
-        .filter_map(|op| match op.dst.first() {
-            Some(Opnd::Vgpr(v)) => Some(*v),
-            _ => None,
-        })
-        .collect();
-    let read_sites: Vec<usize> = insns
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| {
-            op.enc == Enc::Vop3
-                && op.op == 0x360
-                && op.mnemonic == "v_readlane_b32"
-                && matches!(op.src.first(), Some(Opnd::Vgpr(v)) if !spill_vregs.contains(v))
-        })
-        .map(|(i, _)| i)
-        .collect();
+    let read_sites = non_spill_read_sites(insns);
     if read_sites.is_empty() {
         return Ok(ConstantReadPlan::default());
     }
@@ -738,6 +742,11 @@ pub(super) fn lower_constant_reads(
     if wave32 && wave64 {
         return Err(format!(
             "v_readlane_b32 at {first_off:#x}: conflicting wave32 and wave64 instructions"
+        ));
+    }
+    if !wave32 && !wave64 && has_ambiguous_exec_lo_b32(insns) {
+        return Err(format!(
+            "v_readlane_b32 at {first_off:#x}: ambiguous wave width (32-bit exec_lo operation without conclusive wave32 or wave64 marker)"
         ));
     }
     let (guest_width, max_lane) = if count <= 32 {
@@ -775,6 +784,9 @@ pub(super) fn lower_constant_reads(
         Default::default()
     };
 
+    let can_swizzle_fallback =
+        allow_unproven_swizzle_fallback && guest_width == 64 && count % 64 == 0;
+    let mut has_unproven_swizzle_read = false;
     let mut dst_regs = Vec::with_capacity(read_sites.len());
     for &idx in &read_sites {
         let op = &insns[idx];
@@ -815,8 +827,8 @@ pub(super) fn lower_constant_reads(
                         op.offset
                     ));
                 }
-                None if allow_unproven_swizzle_fallback => {
-                    return Ok(ConstantReadPlan::default());
+                None if can_swizzle_fallback => {
+                    has_unproven_swizzle_read = true;
                 }
                 None => {
                     return Err(format!(
@@ -842,6 +854,9 @@ pub(super) fn lower_constant_reads(
             "v_readlane_b32 at {:#x}: follows early s_endpgm at {:#x}",
             insns[last_read].offset, early.offset
         ));
+    }
+    if has_unproven_swizzle_read {
+        return Ok(ConstantReadPlan::default());
     }
     let (uniformity, non_uniform_ctl) = analyze_uniformity(insns, &cfg);
     // Check that every enclosing loop (and any earlier loop that shares `tb_guard`)

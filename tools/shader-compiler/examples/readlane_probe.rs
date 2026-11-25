@@ -222,7 +222,7 @@ fn main() {
             )
         }
         "wave32_64t_and_exec_31" => {
-            // F4 live-GPU repro: [64, 1, 1] Wave32 using s_and_b32/s_or_b32 on exec_lo.
+            // Wave32 [64, 1, 1] proved by VOP3 odd-SGPR v_cmp_lt_u32 s5, using s_and_b32/s_or_b32 on exec_lo.
             // Wave 0 (0..31) reads thread 31; Wave 1 (32..63) reads thread 63.
             let [r0, r1] = readlane(7, 1, 31);
             (
@@ -230,8 +230,8 @@ fn main() {
                 vec![
                     0x3604_009f,             // v_and_b32 v2, 31, v0
                     0x7e06_029f,             // v_mov_b32 v3, 31
-                    0x7d82_0702,             // v_cmp_lt_u32 vcc, v2, v3
-                    0x877e_6a7e,             // s_and_b32 exec_lo, exec_lo, vcc_lo
+                    0xd4c1_0005, 0x0002_0702, // v_cmp_lt_u32 s5, v2, v3 (odd SGPR -> Wave32)
+                    0x877e_057e,             // s_and_b32 exec_lo, exec_lo, s5
                     0x7e02_02ff, 0xbad00000, // v_mov_b32 v1, 0xbad00000
                     r0, r1,                  // v_readlane_b32 s7, v1, 31
                     0x887e_c17e,             // s_or_b32 exec_lo, exec_lo, -1

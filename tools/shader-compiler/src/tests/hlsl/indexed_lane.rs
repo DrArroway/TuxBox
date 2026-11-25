@@ -585,16 +585,30 @@ fn f3_uniformity_tracks_sop1_rmw_scc_preserving_ops_and_smem_soffset() {
 #[test]
 fn f4_detects_all_exec_width_ops_and_checks_conflicts_on_small_groups() {
     let [r0, r1] = readlane_const(7, 1, 31);
-    // F4a: [64, 1, 1] using `s_and_b32 exec_lo, exec_lo, vcc_lo` + `s_or_b32 exec_lo, exec_lo, -1`
-    // MUST be classified as Wave32 (stride 31u, NOT 63u).
-    let wave32_logic_exec = [
+    // F4a: [64, 1, 1] using ONLY `s_and_b32 exec_lo` + `s_or_b32 exec_lo` without a
+    // conclusive Wave32 or Wave64 marker has ambiguous wave width and MUST be refused.
+    let ambiguous_logic_exec = [
         0x877e_6a7e, // s_and_b32 exec_lo, exec_lo, vcc_lo
         r0, r1,      // v_readlane_b32 s7, v1, 31
         0x887e_c17e, // s_or_b32 exec_lo, exec_lo, -1
         0xbf81_0000,
     ];
-    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave32_logic_exec, None))
-        .expect("wave32 s_and_b32 exec_lo readlane");
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &ambiguous_logic_exec, None))
+        .err()
+        .expect("ambiguous 32-bit exec_lo ops without conclusive marker must be refused");
+    assert!(err.contains("ambiguous wave width"), "{err}");
+
+    // With a conclusive Wave32 marker (odd SGPR VOP3 v_cmp_lt_u32 s5), [64, 1, 1]
+    // classifies as Wave32 (stride 31u, NOT 63u).
+    let conclusive_wave32 = [
+        0xd4c1_0005, 0x0002_0702, // v_cmp_lt_u32 s5, v2, v3 (odd SGPR -> Wave32)
+        0x877e_057e,              // s_and_b32 exec_lo, exec_lo, s5
+        r0, r1,                   // v_readlane_b32 s7, v1, 31
+        0x887e_c17e,              // s_or_b32 exec_lo, exec_lo, -1
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &conclusive_wave32, None))
+        .expect("conclusive wave32 readlane");
     assert!(
         tr.hlsl.contains("tb_swizzle[(tb_lane & ~31u) | (0x1fu & 31u)]"),
         "{}",
@@ -683,4 +697,234 @@ fn minor_refuses_flagged_vop3_readlane_encoding() {
     .err()
     .expect("CLAMP-flagged v_readlane_b32 must be refused");
     assert!(err.contains("modifiers"), "{err}");
+}
+
+#[test]
+fn wave64_exec_lo_b32_inspect_keeps_wave64_and_ambiguous_b32_exec_refuses() {
+    let [r31_0, r31_1] = readlane_const(7, 1, 31);
+    // 1. Wave64 shader (ExecHi referenced via s_mov_b32 s5, exec_hi) that also inspects
+    // exec_lo via s_mov_b32 MUST stay Wave64 (64-lane stride ~63u, never Wave32).
+    let wave64_inspect_exec_lo = [
+        0xbe84_037e, // s_mov_b32 s4, exec_lo
+        0xbe85_037f, // s_mov_b32 s5, exec_hi
+        r31_0, r31_1,
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave64_inspect_exec_lo, None))
+        .expect("wave64 reading exec_lo and exec_hi via s_mov_b32 must keep wave64");
+    assert_eq!(tr.required_wave_size, None);
+    assert!(
+        tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x1fu & 63u)]"),
+        "{}",
+        tr.hlsl
+    );
+    assert!(!tr.hlsl.contains("~31u"), "{}", tr.hlsl);
+
+    // 2. Wave64 shader (s_mov_b64 exec, -1) inspecting exec_lo with s_and_b32 MUST keep Wave64.
+    let wave64_and_exec_lo = [
+        0xbefe_04c1, // s_mov_b64 exec, -1
+        0x8704_057e, // s_and_b32 s4, exec_lo, s5
+        r31_0, r31_1,
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave64_and_exec_lo, None))
+        .expect("wave64 s_and_b32 reading exec_lo must keep wave64");
+    assert_eq!(tr.required_wave_size, None);
+    assert!(
+        tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x1fu & 63u)]"),
+        "{}",
+        tr.hlsl
+    );
+
+    // 3. Ambiguous s_mov_b32 exec_lo, s0 without conclusive wave32/wave64 markers MUST refuse.
+    let ambiguous_mov_exec_lo = [
+        0xbefe_0300, // s_mov_b32 exec_lo, s0
+        r31_0, r31_1,
+        0xbf81_0000,
+    ];
+    for group in [[64, 1, 1], [32, 1, 1]] {
+        let err = crate::hlsl::translate(&compute_shader(group, &ambiguous_mov_exec_lo, None))
+            .err()
+            .expect("ambiguous s_mov_b32 exec_lo must be refused");
+        assert!(err.contains("ambiguous wave width"), "{err}");
+    }
+}
+
+#[test]
+fn unproven_swizzle_fallback_refuses_partial_groups_and_preserves_skipped_lanes() {
+    let [dyn0, dyn1] = readlane_sgpr(7, 1, 5);
+    // 1. Partial/non-64-multiple groups with ds_swizzle_b32 + s_mov_b64 + unproven dynamic
+    // v_readlane_b32 MUST refuse instead of emitting unbounded tb_swizzle[(tb_lane & ~63u) | s5].
+    let swizzle_unproven = [
+        0xbefe_04c1,             // s_mov_b64 exec, -1
+        0xd8d4_041f, 0x0000_0001, // ds_swizzle_b32 v0, v1 offset:0x041f
+        dyn0, dyn1,              // v_readlane_b32 s7, v1, s5 (unproven!)
+        0xbf81_0000,
+    ];
+    for group in [[32, 1, 1], [7, 3, 1], [96, 1, 1]] {
+        let err = crate::hlsl::translate(&compute_shader(group, &swizzle_unproven, None))
+            .err()
+            .expect("unproven swizzle fallback must be refused when count % 64 != 0");
+        assert!(
+            err.contains("upper-bound proof") || err.contains("multiple of 64"),
+            "{group:?}: {err}"
+        );
+    }
+
+    // 2. Wave32 [64, 1, 1] shader with ds_swizzle_b32 + non-exec s_mov_b64 + unproven selector
+    // MUST refuse instead of falling back to 64-lane GROUP_READ.
+    let wave32_swizzle_unproven = [
+        0xbe84_3c6a,             // s_and_saveexec_b32 s4, vcc_lo (Wave32)
+        0xbe8a_040c,             // s_mov_b64 s[10:11], s[12:13]
+        0xd8d4_041f, 0x0000_0001, // ds_swizzle_b32 v0, v1 offset:0x041f
+        dyn0, dyn1,              // v_readlane_b32 s7, v1, s5
+        0xbefe_0304,             // s_mov_b32 exec_lo, s4
+        0xbf81_0000,
+    ];
+    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave32_swizzle_unproven, None))
+        .err()
+        .expect("wave32 swizzle shader must not fall back to 64-lane GROUP_READ");
+    assert!(err.contains("upper-bound proof"), "{err}");
+
+    // 3. Valid [64, 1, 1] Wave64 ds_swizzle_b32 + GROUP_READ inside a conditional skip branch
+    // MUST publish each lane's actual VGPR unconditionally (preserving skipped lanes' values),
+    // guard ONLY the load on the skip flag, and mask the selector with `& 63u`.
+    let swizzle_branch_read = [
+        0x7e02_0300,             // v_mov_b32 v1, v0
+        0x7e04_02bf,             // v_mov_b32 v2, 63
+        0x7d82_0500,             // v_cmp_lt_u32 vcc, v0, v2
+        0xbe84_246a,             // s_and_saveexec_b64 s[4:5], vcc (lane 63 EXEC = 0)
+        0xd8d4_041f, 0x0000_0001, // ds_swizzle_b32 v0, v1 offset:0x041f
+        0xbf88_0002,             // s_cbranch_execz +2 (lane 63 skips readlane)
+        dyn0, dyn1,              // v_readlane_b32 s7, v1, s5 (lowered via GROUP_READ)
+        0xbefe_0404,             // s_mov_b64 exec, s[4:5]
+        0xbf81_0000,
+    ];
+    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &swizzle_branch_read, None))
+        .expect("wave64 64-lane swizzle GROUP_READ inside forward branch");
+    assert!(tr.hlsl.contains("groupshared uint tb_swizzle[64];"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("tb_swizzle[tb_lane] = v1;"), "{}", tr.hlsl);
+    assert!(
+        tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (s5 & 63u)] : 0u;"),
+        "{}",
+        tr.hlsl
+    );
+    assert!(
+        !tr.hlsl.contains("tb_swizzle[tb_lane] = (!j"),
+        "GROUP_READ must not zero branch-skipped lanes:\n{}",
+        tr.hlsl
+    );
+}
+
+#[test]
+fn refused_readlane_is_not_swallowed_by_lone_lane_retry() {
+    // Election + LDS atomic prefix that `lone_lane::prepare` accepts and translates cleanly
+    // (rewriting `v_readlane_b32` to `v_readfirstlane_b32`), while on the primary path it
+    // reaches `lower_constant_reads` so every cross-lane refusal must propagate as `Err`.
+    const ELECT_ATOMIC: [u32; 4] = [
+        0xbe88_137e,             // s_ff1_i32_b32 s8, exec_lo
+        0x7da4_0008,             // v_cmpx_eq_u32 exec, s8, v0
+        0xd800_0000, 0x0000_0403, // ds_add_u32 v3, v4
+    ];
+    let prefix_ops = crate::rdna2::disassemble(
+        &ELECT_ATOMIC.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
+    );
+    assert_eq!(prefix_ops[0].mnemonic, "s_ff1_i32_b32");
+    assert_eq!(prefix_ops[1].mnemonic, "v_cmpx_eq_u32");
+    assert_eq!(prefix_ops[2].mnemonic, "ds_add_u32");
+
+    let assert_refused_despite_lone_lane = |group: [u32; 3], words: &[u32], expected: &str| {
+        let ex = compute_shader(group, words, None);
+        // Prove the shader really would have been swallowed by `lone_lane::retry`.
+        let retry_ok = crate::hlsl::lone_lane::retry(|| {
+            crate::hlsl::translate_outputs_once(&ex, None, &[], None)
+        })
+        .and_then(|t| crate::hlsl::lone_lane::check(&t.hlsl));
+        assert!(
+            retry_ok.is_ok(),
+            "test fixture must be accepted by lone_lane::retry (got {retry_ok:?})"
+        );
+        let err = crate::hlsl::translate(&ex)
+            .err()
+            .unwrap_or_else(|| panic!("expected refusal containing {expected:?}, got Ok"));
+        assert!(err.contains(expected), "expected {expected:?}, got: {err}");
+    };
+
+    // 1. Out-of-range lane 63 on [32, 1, 1] (`lone_lane::prepare` accepts `ConstInt(63)`).
+    let [o63_0, o63_1] = readlane_const(7, 1, 63);
+    assert_refused_despite_lone_lane(
+        [32, 1, 1],
+        &[
+            ELECT_ATOMIC[0], ELECT_ATOMIC[1], ELECT_ATOMIC[2], ELECT_ATOMIC[3],
+            0xbefe_04c1, // s_mov_b64 exec, -1
+            o63_0, o63_1,
+            0xbf81_0000,
+        ],
+        "out of range",
+    );
+
+    // 2. Unproven dynamic SGPR selector on [64, 1, 1] (`lone_lane::prepare` accepts `Sgpr(_)`).
+    let [dyn0, dyn1] = readlane_sgpr(7, 1, 5);
+    assert_refused_despite_lone_lane(
+        [64, 1, 1],
+        &[
+            ELECT_ATOMIC[0], ELECT_ATOMIC[1], ELECT_ATOMIC[2], ELECT_ATOMIC[3],
+            0xbefe_04c1, // s_mov_b64 exec, -1
+            dyn0, dyn1,
+            0xbf81_0000,
+        ],
+        "upper-bound proof",
+    );
+
+    // 3. Non-uniform loop enclosing v_readlane_b32 lane 31 on [64, 1, 1].
+    let [r31_0, r31_1] = readlane_const(7, 1, 31);
+    assert_refused_despite_lone_lane(
+        [64, 1, 1],
+        &[
+            ELECT_ATOMIC[0], ELECT_ATOMIC[1], ELECT_ATOMIC[2], ELECT_ATOMIC[3],
+            0xbefe_04c1, // s_mov_b64 exec, -1
+            0x7e02_0300, // L_loop: v_mov_b32 v1, v0
+            r31_0, r31_1,
+            0xbf87_fffc, // s_cbranch_vccnz L_loop
+            0xbf81_0000,
+        ],
+        "non-uniform loop",
+    );
+
+    // 4. Ambiguous 32-bit exec_lo op with v_readlane_b32 on [64, 1, 1].
+    assert_refused_despite_lone_lane(
+        [64, 1, 1],
+        &[
+            ELECT_ATOMIC[0], ELECT_ATOMIC[1], ELECT_ATOMIC[2], ELECT_ATOMIC[3],
+            0xbefe_0300, // s_mov_b32 exec_lo, s0
+            r31_0, r31_1,
+            0xbf81_0000,
+        ],
+        "ambiguous wave width",
+    );
+}
+
+#[test]
+fn smem_loads_are_not_treated_as_workgroup_uniform_for_readlane_loops() {
+    let [r0, r1] = readlane_const(7, 1, 31);
+    for (label, load_words, expected_mnemonic) in [
+        ("s_load_dword", [0xf400_0180u32, 0xfa00_0000], "s_load_dword"),
+        ("s_buffer_load_dword", [0xf420_0180u32, 0xfa00_0000], "s_buffer_load_dword"),
+    ] {
+        let isa: Vec<u8> = load_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let ops = crate::rdna2::disassemble(&isa);
+        assert_eq!(ops[0].mnemonic, expected_mnemonic, "{label}");
+
+        let program = [
+            load_words[0], load_words[1], // s_[buffer_]load_dword s6, s[0:1/3], 0 (NULL soffset)
+            r0, r1,                       // L_loop: v_readlane_b32 s7, v1, 31
+            0xbf07_8006,                  // s_cmp_lg_u32 s6, 0
+            0xbf85_fffc,                  // s_cbranch_scc1 L_loop
+            0xbf81_0000,
+        ];
+        let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &program, None))
+            .err()
+            .unwrap_or_else(|| panic!("{label}-conditioned loop must be refused as non-uniform"));
+        assert!(err.contains("non-uniform loop"), "{label}: {err}");
+    }
 }

@@ -56,6 +56,12 @@ pub(in crate::hlsl) fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&I
     // Once this exact exchange subset is recognized, a later binding or
     // emitter error must not silently replace its collectives with copies.
     let mut original = disassemble(&ex.isa);
+    if indexed_lane::has_non_spill_readlane(&original) {
+        // Cross-lane v_readlane_b32 refusals (out-of-range lane, unproven dynamic
+        // selector, non-uniform loop, ambiguous wave width) must propagate cleanly
+        // instead of being swallowed by the per-lane lone_lane fallback.
+        return first;
+    }
     if original.iter().any(is_binary_quad_perm) || group_extrema::prepare_exchanges(ex, &mut original).unwrap_or(true) {
         // This standalone exchange observes its source lane even if the exact
         // translation failed elsewhere. A per-lane retry would drop that operand.
@@ -179,14 +185,22 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     let ordinary_wave = !wave_cull && !page_waves && !lone_lane::on();
     // A waterfall loop is one per-lane read of a lane; exchange it once.
     let waterfall_gathers = ex.stage == Stage::Compute && !resolve_wave32 && lower_waterfall_gathers(&mut insns) > 0;
-    let swizzle_group_reads = insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32")
-        && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64");
+    let group = compute_group(ex);
+    let group_count = group.into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
+    let swizzle_group_reads = ex.stage == Stage::Compute
+        && scan_width.is_none()
+        && insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32")
+        && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64")
+        && group_count > 0
+        && group_count <= 1024
+        && group_count % 64 == 0
+        && !insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32" && i.mnemonic.starts_with("ds_ordered"));
     let prepared_election_lane = !resolve_wave32 && ex.stage == Stage::Compute
-        && indexed_lane::prepare(compute_group(ex), &mut insns);
+        && indexed_lane::prepare(group, &mut insns);
     let fspx_wave32 = ex.fspx_config.is_some_and(|cfg| cfg[4] == 0x100001);
     let read_plan = if !resolve_wave32 && ordinary_wave && ex.stage == Stage::Compute {
         indexed_lane::lower_constant_reads(
-            compute_group(ex),
+            group,
             &mut insns,
             required_wave_size.or(scan_width),
             fspx_wave32,
@@ -212,11 +226,11 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             && i.op == 0x360
             && matches!(i.src.get(1), Some(Opnd::Sgpr(_))));
     if !wave_cull && !page_waves { {
-        // Swizzles already exchange values through group memory; so can a lane read.
-        let [x, y, z] = compute_group(ex);
-        let group_reads = ex.stage == Stage::Compute && !resolve_wave32 && !lone_lane::on() && x * y * z % 32 == 0
-            && (swizzle_group_reads || has_dynamic_lane_read)
-            && !insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32" && i.mnemonic.starts_with("ds_ordered"));
+        // Swizzles already exchange values through group memory; so can a lane read
+        // when the group consists of complete 64-lane waves.
+        let group_reads = ex.stage == Stage::Compute && !resolve_wave32 && !lone_lane::on()
+            && group_count > 0 && group_count <= 1024 && group_count % 64 == 0
+            && (swizzle_group_reads || has_dynamic_lane_read);
         if ex.stage == Stage::Pixel && pixel_heap_base(ex, 5).is_some() { lower_first_lane_reads(&mut insns); }
         lower_lane_spills(&mut insns, resolve_wave32, group_reads)?;
     } }

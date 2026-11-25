@@ -36,13 +36,28 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         if ins.mnemonic == GROUP_READ {
-            // A lane read ignores EXEC.
-            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
-            let value = r(&ins.src[0])?;
-            let value = if guard.is_empty() { value } else { format!("({}) ? {value} : 0u", guard.join(" && ")) };
-            self.line(&format!("tb_swizzle[tb_lane] = {value};"));
+            if self.dispatched || !self.compute_swizzle {
+                return Err("group lane read requires structured compute swizzle lowering".into());
+            }
+            let count = compute_group(self.ex)
+                .into_iter()
+                .try_fold(1u32, u32::checked_mul)
+                .unwrap_or(0);
+            if count == 0 || count > 1024 || count % 64 != 0 {
+                return Err("group lane read requires complete blocks of 64 lanes".into());
+            }
+            // READLANE ignores EXEC. Publish each lane's actual VGPR even when
+            // that lane skipped the guest branch, then guard only the load on
+            // active skip flags and mask the selector to 0..63.
+            self.line(&format!("tb_swizzle[tb_lane] = {};", r(&ins.src[0])?));
             self.line("GroupMemoryBarrierWithGroupSync();");
-            self.line(&format!("uint swizzle{idx} = tb_swizzle_read((tb_lane & ~63u) | {});", r(&ins.src[1])?));
+            let load = format!("tb_swizzle_read((tb_lane & ~63u) | ({} & 63u))", r(&ins.src[1])?);
+            if active.is_empty() {
+                self.line(&format!("uint swizzle{idx} = {load};"));
+            } else {
+                let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+                self.line(&format!("uint swizzle{idx} = ({}) ? {load} : 0u;", guard.join(" && ")));
+            }
             self.line("GroupMemoryBarrierWithGroupSync();");
             return Ok(());
         }

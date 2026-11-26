@@ -289,7 +289,7 @@ impl<'a> Emitter<'a> {
         if let Some(result) = int16::expression(ins)? {
             return self.wv(&d, &result);
         }
-        if self.lower_f64(ins)? {
+        if self.lower_f64(ins)? || self.lower_quad_sad(ins)? {
             return Ok(());
         }
         if int32::handles(ins) && self.ex.stage != Stage::Compute {

@@ -48,6 +48,7 @@ impl<'a> Emitter<'a> {
             "image_atomic_umin" => Some("InterlockedMin"),
             "image_atomic_umax" => Some("InterlockedMax"),
             "image_atomic_or" => Some("InterlockedOr"),
+            "image_atomic_cmpswap" => Some("InterlockedCompareExchange"),
             _ => None,
         };
         let heap_load = match rs.first().copied() {
@@ -180,6 +181,39 @@ impl<'a> Emitter<'a> {
             if let Some(func) = atomic {
                 // Image atomics → Interlocked* on a RWTexture<uint> texel; vdata carries the
                 // operand in and the previous value out.
+                if ins.mnemonic == "image_atomic_cmpswap" {
+                    // 32-bit CMPSWAP (RDNA2 ISA, image atomics): DMASK 0x3 selects DATA[0], the
+                    // value stored, and DATA[1], the value compared. GLC returns the texel's
+                    // previous value in DATA[0]. DMASK 0xf is the 64-bit form. A
+                    // multisampled texel would also need its sample index.
+                    if !is_uav {
+                        return Err("image atomic on a non-UAV table".into());
+                    }
+                    if !as_uint {
+                        return Err("image_atomic_cmpswap on a UAV not typed uint".into());
+                    }
+                    if ins.aux.mask == 0xf {
+                        return Err("64-bit image_atomic_cmpswap (DMASK 0xf) unsupported".into());
+                    }
+                    if ins.aux.mask != 3 {
+                        return Err(format!("image_atomic_cmpswap DMASK {:#x} unsupported", ins.aux.mask));
+                    }
+                    if dim == 6 {
+                        return Err("image_atomic_cmpswap on a multisampled image unsupported".into());
+                    }
+                    let src = Opnd::Vgpr(vd);
+                    let cmp = Opnd::Vgpr(vd.checked_add(1).ok_or("atomic register pair overflow")?);
+                    self.touch(&src);
+                    self.touch(&cmp);
+                    let t = self.tmp;
+                    self.tmp += 1;
+                    self.line(&format!("uint t{t} = 0u;"));
+                    self.line(&format!("if (exec_lo & 1u) {func}(uav{slot}[uint{ncoord}({})], {}, {}, t{t});", c.join(", "), r(&cmp)?, r(&src)?));
+                    if ins.raw[0] & (1 << 13) != 0 {
+                        self.wv(&src, &format!("t{t}"))?;
+                    }
+                    return Ok(());
+                }
                 if ins.aux.mask == 3 && as_uint && dim == 1 {
                     let visibility = matches!(self.ex.stage, Stage::Pixel | Stage::Compute)
                         && wide_atomic_coordinates(ins).is_ok()

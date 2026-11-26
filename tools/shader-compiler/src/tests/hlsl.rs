@@ -725,6 +725,73 @@ fn spill_writelane(v: u8, lane: i64, value: u8) -> Insn {
               vec![Opnd::Sgpr(value), Opnd::ConstInt(lane), Opnd::Sgpr(0)])
 }
 
+// An f16 raster interpolator: the position operand (src[0]) is never emitted.
+fn f16_interp(mnemonic: &str, dst: u8, position: u8, factor: u8) -> Insn {
+    Insn {
+        offset: 0x200,
+        dwords: 1,
+        enc: Enc::Vop3,
+        op: 0x342,
+        raw: vec![3611426830, 131456],
+        mnemonic: mnemonic.to_string(),
+        dst: vec![Opnd::Vgpr(dst)],
+        src: vec![Opnd::Vgpr(position), Opnd::Vgpr(factor), Opnd::Sgpr(0)],
+        aux: Default::default(),
+    }
+}
+
+/// A spill register read only as the position operand of an f16 interpolator is
+/// not a real dual use, so the translation is accepted.
+#[test]
+fn spill_position_read_is_not_refused() {
+    for mnemonic in ["v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_interp_p2_f16"] {
+        let mut insns = vec![
+            spill_writelane(4, 0, 2),
+            f16_interp(mnemonic, 14, 4, 0),
+        ];
+        lower_lane_spills(&mut insns, false, false).expect("dead position read accepted");
+    }
+}
+
+/// A spill register used as a live vector (a destination or in any operand but
+/// the dead f16 position) is still refused.
+#[test]
+fn spill_live_vector_use_is_refused() {
+    // Plain arithmetic: v4 in the source.
+    let mut insns = vec![
+        spill_writelane(4, 0, 2),
+        lane_insn("v_add_f32", 0x000, vec![Opnd::Vgpr(9)], vec![Opnd::Vgpr(4), Opnd::Vgpr(3)]),
+    ];
+    let err = lower_lane_spills(&mut insns, false, false).expect_err("refused");
+    assert!(err.contains("used both as a lane spill area"), "{err}");
+
+    // A destination write.
+    let mut insns = vec![
+        spill_writelane(4, 0, 2),
+        lane_insn("v_add_f32", 0x000, vec![Opnd::Vgpr(4)], vec![Opnd::Vgpr(3), Opnd::Vgpr(2)]),
+    ];
+    let err = lower_lane_spills(&mut insns, false, false).expect_err("refused");
+    assert!(err.contains("used both as a lane spill area"), "{err}");
+
+    // The dead position skip must not leak into another operand of an interpolator.
+    let mut insns = vec![
+        spill_writelane(4, 0, 2),
+        Insn {
+            offset: 0x200,
+            dwords: 1,
+            enc: Enc::Vop3,
+            op: 0x342,
+            raw: vec![3611426830, 131456],
+            mnemonic: "v_interp_p1ll_f16".to_string(),
+            dst: vec![Opnd::Vgpr(14)],
+            src: vec![Opnd::Vgpr(5), Opnd::Vgpr(4), Opnd::Sgpr(0)],
+            aux: Default::default(),
+        },
+    ];
+    let err = lower_lane_spills(&mut insns, false, false).expect_err("refused");
+    assert!(err.contains("used both as a lane spill area"), "{err}");
+}
+
 #[test]
 fn sgpr_lane_readlane_becomes_group_read_when_group_reads() {
     let mut insns = vec![sgpr_lane_readlane(4, 2, 7)];

@@ -327,13 +327,29 @@ pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group
         ins.op = 0x03;
         ins.mnemonic = "s_mov_b32".into();
     }
+    // An f16 raster interpolator reads only its interp factor (src[1]) and signature
+    // attribute; its position operand (src[0]) is never emitted, so a spill register
+    // read as that operand is not a real dual use. Any other way the register is used
+    // as a vector — as a destination or in any other operand — is refused.
+    const DEAD_POSITION_USE: [&str; 3] = ["v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_interp_p2_f16"];
     for ins in insns.iter() {
         if ins.mnemonic == "v_nop" {
             continue; // the two header words at the start of every program decode as v_nop
         }
-        for o in ins.dst.iter().chain(ins.src.iter()) {
+        for o in ins.dst.iter() {
             if let Opnd::Vgpr(v) = o {
                 if spill_vregs.contains(v) {
+                    return Err(format!("v{v} is used both as a lane spill area and as a vector at {:#x}", ins.offset));
+                }
+            }
+        }
+        for (index, o) in ins.src.iter().enumerate() {
+            if let Opnd::Vgpr(v) = o {
+                if spill_vregs.contains(v) {
+                    let dead = index == 0 && DEAD_POSITION_USE.contains(&ins.mnemonic.as_str());
+                    if dead {
+                        continue;
+                    }
                     return Err(format!("v{v} is used both as a lane spill area and as a vector at {:#x}", ins.offset));
                 }
             }

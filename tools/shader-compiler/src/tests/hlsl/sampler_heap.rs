@@ -374,3 +374,28 @@ fn sampling_a_root_uav_slot_names_the_mismatched_root() {
     let reason = refusal(&sampled_table_slot(1));
     assert!(reason.contains("image_sample_lz reads table UAV u7"), "{reason}");
 }
+
+#[test]
+fn a_literal_sampler_takes_the_private_static_the_runtime_appends() {
+    // Texture from the resource heap; linear clamped sampler words built from literals.
+    let mut words = SAMPLE[..4].to_vec();
+    words.extend([0xb0140092, 0xbe9503ff, 0x00c00000, 0xbe9603ff, 0x18500000, 0xbe970380]);
+    words.extend(&SAMPLE[6..]);
+    let mut ex = pixel(&words);
+    // Two declared samplers, so neither is the program's only one.
+    ex.resources.push(PsvResource { res_type: 1, space: 1, lower: 5, upper: 5 });
+    ex.resources.push(PsvResource { res_type: 1, space: 1, lower: 20, upper: 20 });
+    // The title's root names another state at s20 (point clamped).
+    let point = [0, 3, 3, 3, 0, 1, 1, 0, 0, 12.0_f32.to_bits(), 20, 1, 0];
+    let root = |statics: Vec<[u32; 13]>| crate::meta::RootSig {
+        version: 2, flags: 0x400, params: vec![], num_static_samplers: statics.len() as u32, static_samplers: statics,
+    };
+    ex.root_sig = Some(root(vec![point]));
+    assert!(refusal(&ex).contains("not a sampler descriptor"));
+    // inline_sampler::unmatched adds the literal state after the root's registers.
+    let mut linear = point;
+    (linear[0], linear[10], linear[11], linear[12]) = (0x15, 21, 32765, 5);
+    ex.root_sig = Some(root(vec![point, linear]));
+    let out = super::super::translate(&ex).unwrap();
+    assert!(out.hlsl.contains("SamplerState samp21 : register(s21, space32765);"), "{}", out.hlsl);
+}

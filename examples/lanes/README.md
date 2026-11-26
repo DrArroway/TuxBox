@@ -55,6 +55,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
+| `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 
 ```sh
 python tuxbox.py verify --only lanes-selftest --output build/lanes-selftest.json
@@ -115,13 +116,15 @@ These checks run on the Proton backend. They remove only these shaders' cache en
 
 The `raster-tables` scenario draws a fullscreen triangle with two hand-written console programs (`raster_fixture.py`; not taken from any game). The pixel program reads one dword through slot 2 of the root's second descriptor table and writes it to a uint target. Its FSSM records and PSV binding name that descriptor `t3, space2`, while the root declares `t0` to `t3` in space 1 there. The provider has to build the root the program was compiled against, with the register at that slot, and translate both programs for it. Under the title's root the pipeline becomes a stand-in and the target keeps its clear value. A wrong table or slot reads a decoy that names its view.
 
-That root is made while the game runs, so nothing can be prepared before launch. `verify` runs the scenario with the host worker, requires the provider to report the reflected root and pipeline, and fails if either program was translated without a root.
+The `raster-samplers` scenario draws with the same vertex program and a third hand-written pixel program. It samples a 2x1 texture of 1.0 and 3.0, at table 1 slot 0, with a linear clamped sampler it builds from literal words, as the console compiles a static sampler into a program. It declares that sampler as `s0`, where the title's root has a point-filtered static sampler. The provider has to give the literal state a static sampler of its own in the reflected root, so every texel reads 1.5. Bound to the root's `s0`, the texels read the point-filtered 1.0.
+
+That root is made while the game runs, so nothing can be prepared before launch. `verify` runs both scenarios with the host worker, requires the provider to report the reflected root and pipeline, and fails if either program was translated without a root.
 
 ```sh
 python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-tables.json
 ```
 
-It runs on the Proton backend and removes only these programs' cache entries from the prefix.
+The suite runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
 ## Deterministic replay
 

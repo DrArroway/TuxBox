@@ -11,6 +11,7 @@ import zlib
 
 from examples.lanes import raster_fixture
 from project_tuxbox.shader_prep import SOURCE_CACHE
+from project_tuxbox import verify as verify_module
 from project_tuxbox.verify import BASE_SUITES, LANES_SCENARIOS, lanes_raster_tables
 
 
@@ -61,14 +62,39 @@ class RasterFixtureTests(unittest.TestCase):
             values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
             self.assertEqual(bytes(int(value) for value in values.split(",")), data)
         self.assertIn("raster_expected = 0x7ab1e001, raster_decoy = 0xd0000000;", text)
+        values = re.search(r"raster_sampler_pixel\[\] = \{([0-9,]+)\};", text).group(1)
+        self.assertEqual(bytes(int(value) for value in values.split(",")), raster_fixture.sampler_pixel())
+        self.assertIn("raster_sampler_texels[] = {1.0f, 3.0f};", text)
+        self.assertIn("raster_sampler_linear = 1.5f, raster_sampler_point = 1.0f;", text)
+
+    def test_sampler_program_declares_the_roots_register_and_builds_a_literal_state(self):
+        data = raster_fixture.sampler_pixel()
+        found = parts(data)
+        self.assertNotIn(b"RTS0", found)
+        self.assertEqual(struct.unpack_from("<I", found[b"DXIL"], 0)[0] >> 16, 0)
+        program = fssm(found[b"DXIL"])
+        self.assertEqual(rows(program, 0xe8, 0xf8), [[3, 0, 1, 0, 0x109]])
+        self.assertEqual(rows(program, 0xf0, 0xfc), [[0x300, 0, 0, 0, 0x1_0908], [0x401, 0, 0, 0, 0]])
+        psv = found[b"PSV0"]
+        table = psv[4 + struct.unpack_from("<I", psv, 0)[0]:]
+        self.assertEqual(struct.unpack_from("<10I", table), (2, 16, 3, 1, 0, 0, 1, 0, 0, 0))
+        # Linear filtering between the texel centres; point filtering takes the first texel.
+        left, right = raster_fixture.SAMPLER_TEXELS
+        self.assertEqual(raster_fixture.SAMPLER_LINEAR, left + (right - left) * (0.375 * 2 - 0.5))
+        self.assertEqual(raster_fixture.SAMPLER_POINT, left)
+
+
+def trace(slots):
+    return ('multi-table raster roots after 1 pipelines: {"reflected": 1}\n'
+            f"created raster pipeline with {slots} reflected FSSM descriptor slots\n")
 
 
 class RasterGateTests(unittest.TestCase):
-    TRACE = ('multi-table raster roots after 1 pipelines: {"reflected": 1}\n'
-             "created raster pipeline with 3 reflected FSSM descriptor slots\n")
+    TRACE = trace(3)
 
-    def run_gate(self, output, compiled):
-        rootless = [hashlib.sha256(data).hexdigest() for data in (raster_fixture.vertex(), raster_fixture.pixel())]
+    def run_gate(self, output, compiled, scenario="raster-tables"):
+        rootless = [hashlib.sha256(data).hexdigest()
+                    for data in (raster_fixture.vertex(), raster_fixture.pixel(), raster_fixture.sampler_pixel())]
         with TemporaryDirectory() as prefix:
             sources = Path(prefix) / SOURCE_CACHE
             runtime = sources.parent / "runtime/fingerprint"
@@ -90,14 +116,17 @@ class RasterGateTests(unittest.TestCase):
                     (runtime / f"{key}.cso").write_bytes(b"")
                     report(f"Compiled Xbox shader {key}")
 
+            calls = {}
+
             def check(name, binary, arguments, match, log_check=None, **_):
-                seen["name"], seen["arguments"] = name, arguments
-                seen["stale"] = [path.exists() for path in stale]
-                seen["problem"] = log_check
+                calls[name] = {"arguments": arguments, "stale": [path.exists() for path in stale],
+                               "problem": log_check}
                 return {}
 
             with mock.patch("project_tuxbox.runtime_shaders.shader_session", session):
                 lanes_raster_tables(SimpleNamespace(env=env), check, ["--adapter", "10de:2c02"], "10de:2c02", ())
+            seen["calls"] = list(calls)
+            seen.update(calls[f"lanes-{scenario}"])
             seen["left"] = sorted(path.name for path in sources.parent.rglob("*") if path.is_file())
             seen["env_after"] = env
             # The log is read after the worker reported its compiles.
@@ -106,7 +135,7 @@ class RasterGateTests(unittest.TestCase):
 
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
-        self.assertEqual(seen["name"], "lanes-raster-tables")
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
@@ -129,8 +158,17 @@ class RasterGateTests(unittest.TestCase):
         rootless = self.run_gate(self.TRACE, [])[1]
         self.assertIn("without its root", self.run_gate(self.TRACE, rootless)[0]["problem"])
 
+    def test_sampler_draw_runs_after_and_names_its_slots(self):
+        seen, _ = self.run_gate(trace(verify_module.RASTER_SAMPLER_SLOTS), [], "raster-samplers")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-samplers"])
+        self.assertEqual(seen["stale"], [False, False])
+        self.assertIsNone(seen["problem"])
+        # The two-table trace names another pipeline.
+        self.assertIn("did not create", self.run_gate(self.TRACE, [], "raster-samplers")[0]["problem"])
+
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)
+        self.assertNotIn("raster-samplers", LANES_SCENARIOS)
         self.assertIn("lanes-raster-tables", BASE_SUITES)
 
 

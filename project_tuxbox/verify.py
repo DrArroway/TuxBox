@@ -419,20 +419,28 @@ def missing_provider_imports(modules, provider, expected):
     return sorted(set(expected) - found)
 
 
+# Table slots the reflected `raster-samplers` root holds (see `lanes_raster_tables`).
+RASTER_SAMPLER_SLOTS = 1
+
+
 def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     """Draw with the Lanes console raster programs under a root with two tables.
 
-    The pixel program reads a register the title's root does not declare, so it
-    draws only under the root the provider reflects from both programs. That
-    root is serialized while the game runs, so nothing is prepared before
-    launch: the host worker translates both programs against it.
+    `raster-tables`: the pixel program reads a register the title's root does
+    not declare, so it draws only under the root the provider reflects from both
+    programs. `raster-samplers`: the pixel program builds a linear sampler from
+    literal words that the root's static sampler at its register does not have,
+    so it samples correctly only with the private static sampler the provider
+    adds to the reflected root. That root is serialized while the game runs, so
+    nothing is prepared before launch: the host worker translates both programs
+    against it.
     """
-    from examples.lanes.raster_fixture import pixel, vertex
+    from examples.lanes.raster_fixture import pixel, sampler_pixel, vertex
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
-    rootless = {hashlib.sha256(data).hexdigest() for data in (vertex(), pixel())}
+    rootless = {hashlib.sha256(data).hexdigest() for data in (vertex(), pixel(), sampler_pixel())}
     messages = []
 
     def compiled():
@@ -445,17 +453,19 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
             for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
                 path.unlink()
 
-    def expect_reflected(output):
-        if "substituted null " in output:
-            return "the provider substituted a stand-in pipeline"
-        # +debugstr escapes the quotes of the logged map.
-        if not re.search(r'multi-table raster roots after 1 pipelines: \{\\?"reflected\\?": 1\}', output):
-            return "the provider did not reflect the two-table root"
-        if "created raster pipeline with 3 reflected FSSM descriptor slots" not in output:
-            return "the provider did not create the pipeline under the reflected root"
-        if compiled() & rootless:
-            return f"the worker translated a program without its root: {messages}"
-        return None
+    def expect_reflected(slots):
+        def problem(output):
+            if "substituted null " in output:
+                return "the provider substituted a stand-in pipeline"
+            # +debugstr escapes the quotes of the logged map.
+            if not re.search(r'multi-table raster roots after 1 pipelines: \{\\?"reflected\\?": 1\}', output):
+                return "the provider did not reflect the two-table root"
+            if f"created raster pipeline with {slots} reflected FSSM descriptor slots" not in output:
+                return "the provider did not create the pipeline under the reflected root"
+            if compiled() & rootless:
+                return f"the worker translated a program without its root: {messages}"
+            return None
+        return problem
 
     names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK")
     saved = {name: host.env.get(name) for name in names}
@@ -464,13 +474,16 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     for name in ("TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK"):
         host.env.pop(name, None)
     try:
-        forget(rootless)
-        with shader_session(sources.parent, host.env, messages.append):
-            check("lanes-raster-tables", "lanes/lanes.exe", ["--selftest", "raster-tables", *gpu_args, "--report"],
-                  rf"lanes-selftest PASS pci={pci} scenario=raster-tables passed=1",
-                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
-                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
-                  config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_reflected)
+        for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS)):
+            forget(rootless)
+            messages.clear()
+            with shader_session(sources.parent, host.env, messages.append):
+                check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
+                      rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
+                      providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                 "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                      config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_reflected(slots))
+            forget(compiled())
     finally:
         forget(rootless | compiled())
         for name, value in saved.items():
@@ -932,6 +945,7 @@ GATE_LABELS = {
     "lanes-wave-shader-host": "A 64-lane console shader with the translation this graphics card needs",
     "lanes-raster-tables": "Console raster programs drawn under the root reflected from their two descriptor tables",
     "lanes-shader-cache-wave-alloc": "A wave32 masked DPP exclusive prefix lowered to WavePrefixSum and loaded by the provider",
+    "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

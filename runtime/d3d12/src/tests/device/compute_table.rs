@@ -32,6 +32,11 @@ fn bindless_compute_roots_have_no_tables_and_index_the_heap() {
     assert!(bindless_compute_root(&root(0x400, &[])));
     // Without the flag the program cannot reach the heap by index.
     assert!(!bindless_compute_root(&root(0, &[CONSTANTS])));
+    // The appended index map needs two of the root's 64 DWORDs: 15 constant
+    // parameters of four and a root SRV leave exactly that.
+    let full = |extra: &[u32]| root(0x400, &[&[CONSTANTS; 15][..], extra].concat());
+    assert!(bindless_compute_root(&full(&[ROOT_SRV])));
+    assert!(!bindless_compute_root(&full(&[CONSTANTS])));
     // A table keeps the existing reflected paths.
     assert!(!bindless_compute_root(&root(0x400, &[TABLE, CONSTANTS])));
 }

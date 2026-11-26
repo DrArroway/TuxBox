@@ -524,16 +524,22 @@ fn reflected_root(
     }
 }
 
+/// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no descriptor tables: only root
+/// constants and root descriptors, every resource picked by heap index. The
+/// root also needs room for the index map's root SRV, two of its 64 DWORDs; a
+/// fuller root stays the guest's rather than failing to serialize.
+fn bindless_compute_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
+    let cost = signature.params.iter().try_fold(0u32, |cost, p| match p.kind {
+        RootParamKind::Constants { num32, .. } => Some(cost.saturating_add(num32)),
+        RootParamKind::Descriptor { .. } => Some(cost.saturating_add(2)),
+        _ => None,
+    });
+    signature.flags & 0x400 != 0 && cost.is_some_and(|cost| cost <= 62)
+}
+
 /// Keep every embedded range and append FSSM slots the root left out.
 /// Shaders that already translate keep their parameter indexes. The game's
 /// descriptor-table handle still addresses the slot FSSM recorded.
-/// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no descriptor tables: only root
-/// constants and root descriptors, every resource picked by heap index.
-fn bindless_compute_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
-    signature.flags & 0x400 != 0
-        && signature.params.iter().all(|p| matches!(p.kind, RootParamKind::Constants { .. } | RootParamKind::Descriptor { .. }))
-}
-
 fn append_corroborated_ranges(
     device: &ID3D12Device,
     original: &RootSource,

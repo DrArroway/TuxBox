@@ -21,12 +21,12 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-benchmark",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-bindless-compute", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
 OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.dll"}
-SUITES = (*BASE_SUITES, "d3d12-mesh", "lanes-bindless-compute", *OPTIONAL_PROVIDERS)
+SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
                    "indirect-dispatch", "gpu-indirect-dispatch",
@@ -482,17 +482,25 @@ def lanes_compute_root(host, check, gpu_args, pci, memory_symbols):
 
 
 def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
-    from examples.lanes.shader_fixture import bindless_compute_shader
+    """Dispatch the Lanes direct-indexed compute programs with a paged resource heap.
+
+    One stores through a heap UAV; the other also samples a heap texture with a
+    literal sampler. Each runs with a roomy and a constrained resident limit.
+    """
+    from examples.lanes.shader_fixture import bindless_compute_shader, bindless_sampler_shader
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
-    original = hashlib.sha256(bindless_compute_shader()).hexdigest()
     names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION",
              "TUXBOX_DESCRIPTOR_HEAP_LIMIT", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
     try:
-        for kind, limit in (("wide", "1000000"), ("constrained", "64")):
+        trials = [(scenario, hashlib.sha256(build()).hexdigest(), kind, limit)
+                  for scenario, build in (("bindless-compute", bindless_compute_shader),
+                                          ("bindless-sampler", bindless_sampler_shader))
+                  for kind, limit in (("wide", "1000000"), ("constrained", "64"))]
+        for scenario, original, kind, limit in trials:
             messages = []
             host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr",
                             TUXBOX_DESCRIPTOR_HEAP_LIMIT=limit, TUXBOX_NULL_PIPELINES="0")
@@ -518,9 +526,9 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
             try:
                 clean({original})
                 with shader_session(sources.parent, host.env, messages.append):
-                    check(f"lanes-bindless-compute-{kind}", "lanes/lanes.exe",
-                          ["--selftest", "bindless-compute", *gpu_args, "--report"],
-                          rf"lanes-selftest PASS pci={pci} scenario=bindless-compute passed=1",
+                    check(f"lanes-{scenario}-{kind}", "lanes/lanes.exe",
+                          ["--selftest", scenario, *gpu_args, "--report"],
+                          rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
                           providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                                      "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                           config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=receipt)
@@ -1143,6 +1151,10 @@ GATE_LABELS = {
     "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",
     "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
     "lanes-compute-root-recovery": "Partially reflected compute root with an appended descriptor range and paging",
+    "lanes-bindless-compute-wide": "A direct-indexed compute program's heap UAV through the paged index map",
+    "lanes-bindless-compute-constrained": "The same with fewer resident descriptors than the index it uses",
+    "lanes-bindless-sampler-wide": "A direct-indexed compute program's literal sampler, added to its paged root",
+    "lanes-bindless-sampler-constrained": "The same with fewer resident descriptors than the indices it uses",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

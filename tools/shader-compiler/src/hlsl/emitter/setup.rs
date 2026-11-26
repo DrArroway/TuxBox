@@ -115,6 +115,7 @@ impl<'a> Emitter<'a> {
             compute_swizzle: false,
             vote_defs: BTreeSet::new(),
             vote_uses: BTreeMap::new(),
+            mask_ballots: None,
             exec_snapshots: Default::default(),
             reflected_lds_words: None,
             hoisted_swizzle: None,

@@ -101,9 +101,12 @@ mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
 mod lockstep;
+mod mask_ballots;
 mod wave_loops;
 mod paired_wave64;
 pub use paired_wave64::translate_paired_wave64;
+/// Generated HLSL above this size would need more than about 9 GB of DXC memory.
+pub const MAX_HLSL_BYTES: usize = 8 << 20;
 mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
@@ -335,6 +338,8 @@ struct Emitter<'a> {
     compute_swizzle: bool,
     vote_defs: BTreeSet<usize>,
     vote_uses: BTreeMap<usize, usize>,
+    /// Lane masks read as numbers.
+    mask_ballots: Option<mask_ballots::Ballots>,
     exec_snapshots: exec_snapshot::Snapshots,
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,

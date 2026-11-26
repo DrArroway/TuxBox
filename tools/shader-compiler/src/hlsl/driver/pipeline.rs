@@ -18,7 +18,18 @@ pub fn translate_for_wave32_host(ex: &ShaderExtract) -> Result<Translated, Strin
     if ex.stage != Stage::Compute || ordinary.required_wave_size != Some(64) {
         return Ok(ordinary);
     }
-    translate_paired_wave64(ex)
+    let paired = translate_paired_wave64(ex).and_then(|paired| match paired.hlsl.len() {
+        size if size > MAX_HLSL_BYTES => Err(format!("paired wave64: {} MiB of HLSL", size >> 20)),
+        _ => Ok(paired),
+    });
+    paired.or_else(|error| {
+        // Whole lane masks need the guest's wave width. Where the paired form cannot run
+        // the program, a narrow host keeps the translation it had without them.
+        match mask_ballots::without(|| translate(ex)) {
+            Ok(narrow) if narrow.required_wave_size != Some(64) => Ok(narrow),
+            _ => Err(error),
+        }
+    })
 }
 
 /// [`translate`] for the last stage before the rasteriser (VS or GS), given the
@@ -234,6 +245,11 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         em.vote_uses.insert(count, def);
         em.regs.insert(format!("tb_votes{def}"));
     }
+    // Ray tracing resolve keeps whole masks already.
+    if ex.stage == Stage::Compute && !lone_lane::on() && !wave_cull && !page_waves && !indexed_lane
+        && em.fspx_wave.is_none() && !hair_multisample && !resolve_wave32 && !mask_ballots::off() {
+        em.mask_ballots = mask_ballots::find(&em.insns);
+    }
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
     for ins in &em.insns {
         for o in ins.dst.iter().chain(ins.src.iter()) {
@@ -307,6 +323,16 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         (election == Some(ElectionLowering::Native32) && (!em.exec_snapshots.sites.is_empty() || em.insns.iter().any(|i|
             i.mnemonic == "tb_first_active_lane" || i.mnemonic == "s_ff1_i32_b64"))).then_some(32)
     });
+    // A ballot holds the guest's own lanes, so it needs whole waves of the guest's width.
+    let reductions_wave_size = required_wave_size;
+    let required_wave_size = match em.mask_ballots.as_ref().map(|b| b.width) {
+        Some(width) if reductions_wave_size.is_none_or(|w| w == width)
+            && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul).is_some_and(|n| n > 0 && n % width == 0) => Some(width),
+        _ => {
+            em.mask_ballots = None;
+            reductions_wave_size
+        }
+    };
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
@@ -362,7 +388,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
     }
-    em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
+    em.portable_wave64 = (straight_exchange || (reductions_wave_size == Some(64)
         && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul) == Some(64)))
         && em.lockstep.is_none()
         && ex.stage == Stage::Compute
@@ -374,6 +400,8 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
+    if em.portable_wave64 { em.mask_ballots = None; }
+    em.regs.extend(em.mask_ballots.iter().flat_map(mask_ballots::Ballots::names).collect::<Vec<_>>());
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
     }
@@ -518,7 +546,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         "cs_6_6"
     } else if em.uses_heap_sampler || em.resource_heap_base.is_some() || em.pixel_heap || em.straight_pixel_quad.is_some() {
         "ps_6_6"
-    } else if probe_trace {
+    } else if probe_trace || em.mask_ballots.is_some() {
         "cs_6_5"
     } else if is_ps && !em.uav.is_empty() {
         "ps_5_1"

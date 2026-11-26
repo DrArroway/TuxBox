@@ -2,6 +2,7 @@
 mod descriptors;
 mod publication;
 mod upload;
+mod waits;
 mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
 pub(crate) use publication::QueueAccess;
@@ -673,6 +674,7 @@ pub(crate) unsafe fn submit(
     refresh
         .try_reserve(textures.len())
         .map_err(|_| E_OUTOFMEMORY)?;
+    let mut publication_waits = Vec::new();
     for texture in textures.iter() {
         let mut pending = false;
         for write in submission
@@ -695,8 +697,7 @@ pub(crate) unsafe fn submit(
             // CPU bytes still contain the old version. The native image contains
             // the ordered GPU write and can be read directly by the next batch.
             if !held::blocked(&write.reader, write.tick) {
-                unsafe { queue.Wait(&write.published, write.tick)? };
-                crate::commands::queue_trace::waited(queue, "wait for an earlier texture publication", &write.published, write.tick);
+                waits::include(&mut publication_waits, &write.published, write.tick);
             }
             pending = true;
         }
@@ -705,6 +706,10 @@ pub(crate) unsafe fn submit(
         }
     }
 
+    for (fence, value) in publication_waits {
+        unsafe { queue.Wait(&fence, value)? };
+        crate::commands::queue_trace::waited(queue, "wait for an earlier texture publication", &fence, value);
+    }
     let transfer = &mut submission.transfer;
     transfer.refresh(&device.native, &refresh)?;
     let required = textures
@@ -716,16 +721,20 @@ pub(crate) unsafe fn submit(
         unsafe { queue.Wait(&transfer.fence, required)? };
         crate::commands::queue_trace::waited(queue, "wait for texture uploads", &transfer.fence, required);
     }
+    let mut reader_waits = Vec::new();
     for texture in writes.iter() {
         for (fence, value) in &lock(&texture.contents).readers {
             if fence != reader
                 && unsafe { fence.GetCompletedValue() } < *value
                 && !held::blocked(fence, *value)
             {
-                unsafe { queue.Wait(fence, *value)? };
-                crate::commands::queue_trace::waited(queue, "wait for another queue's texture reads", fence, *value);
+                waits::include(&mut reader_waits, fence, *value);
             }
         }
+    }
+    for (fence, value) in reader_waits {
+        unsafe { queue.Wait(&fence, value)? };
+        crate::commands::queue_trace::waited(queue, "wait for another queue's texture reads", &fence, value);
     }
     let tick = transfer.tick()?;
     let publication = if writes.is_empty() {

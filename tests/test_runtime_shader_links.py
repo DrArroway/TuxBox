@@ -364,7 +364,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         source.write_bytes(program)
         dxil = portable_program(0, b"pixel")
         store = Mock()
-        store.key.return_value = "c" * 64
+        store.key_file.return_value = "c" * 64
         store.root = self.cache / "content"
         store.root.mkdir()
         store.fetch.return_value = False

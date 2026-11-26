@@ -75,9 +75,24 @@ class DxilStore:
         return cls(root)
 
     @staticmethod
-    def key(hlsl, target):
+    def _key_hasher(target):
         tag = f"{target} {VARIANTS[target]}" if target in VARIANTS else target
-        return hashlib.sha256(f"{tag}\n".encode("ascii") + hlsl).hexdigest()
+        return hashlib.sha256(f"{tag}\n".encode("ascii"))
+
+    @staticmethod
+    def key(hlsl, target):
+        digest = DxilStore._key_hasher(target)
+        digest.update(hlsl)
+        return digest.hexdigest()
+
+    @staticmethod
+    def key_file(hlsl, target):
+        """Hash private generated HLSL with bounded memory and unchanged keys."""
+        digest = DxilStore._key_hasher(target)
+        with hlsl.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def fetch(self, key, output):
         """Copy the stored DXIL to `output` if its bytes still match their stamp."""

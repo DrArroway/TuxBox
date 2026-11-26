@@ -393,7 +393,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             # validated equivalent output, including the candidate and -O0 paths;
             # compiler policy changes deliberately leave warm cache entries valid.
             store = DxilStore.for_cache(cache)
-            content = store.key(hlsl.read_bytes(), target) if store else None
+            content = store.key_file(hlsl, target) if store else None
             def reuse_content():
                 data = bounded_shader(output) if store and store.fetch(content, output) else None
                 if data is not None and portable_stage(data) == target_stage:

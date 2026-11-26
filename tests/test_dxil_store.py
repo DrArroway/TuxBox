@@ -68,6 +68,15 @@ class DxilReuse(unittest.TestCase):
         # Other targets keep their key, so their cached output stays usable.
         self.assertEqual(DxilStore.key(b"shader", "ps_6_0"), hashlib.sha256(b"ps_6_0\nshader").hexdigest())
 
+    def test_streamed_content_key_matches_existing_cache_keys(self):
+        path = self.root / "large.hlsl"
+        data = bytes(range(256)) * 12289
+        path.write_bytes(data)
+        for target in ("ps_6_0", "cs_6_6", "ms_6_5"):
+            self.assertEqual(DxilStore.key_file(path, target), DxilStore.key(data, target))
+        path.write_bytes(b"")
+        self.assertEqual(DxilStore.key_file(path, "ps_6_0"), DxilStore.key(b"", "ps_6_0"))
+
     def test_new_translator_with_same_hlsl_skips_dxc(self):
         first = self.compile(self.cache("a"))
         second = self.compile(self.cache("b"))

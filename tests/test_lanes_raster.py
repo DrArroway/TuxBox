@@ -134,7 +134,7 @@ class RasterGateTests(unittest.TestCase):
             kept = sources / "title.cso"
             for path in (*stale, kept):
                 path.write_bytes(b"")
-            env = {"WINEPREFIX": prefix, "TUXBOX_RASTER_ROOT_FALLBACK": "1", "TUXBOX_LOG": "stderr"}
+            env = {"WINEPREFIX": prefix, "TUXBOX_RASTER_ROOT_FALLBACK": "1", "TUXBOX_LOG": "stderr", "TUXBOX_NULL_PIPELINES": "1"}
             seen = {}
 
             @contextmanager
@@ -172,6 +172,8 @@ class RasterGateTests(unittest.TestCase):
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
         self.assertEqual(seen["env"]["TUXBOX_TRACE_RASTER_ROOTS"], "1")
+        self.assertEqual(seen["env"]["TUXBOX_NULL_PIPELINES"], "0")
+        self.assertEqual(seen["env_after"]["TUXBOX_NULL_PIPELINES"], "1")
         self.assertIsNone(seen["problem"])
         self.assertEqual(seen["left"], ["title.cso"])
         self.assertEqual(seen["env_after"]["TUXBOX_RASTER_ROOT_FALLBACK"], "1")

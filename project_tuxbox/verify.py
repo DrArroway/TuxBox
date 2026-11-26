@@ -561,10 +561,9 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     adds to the reflected root. That root is serialized while the game runs, so
     nothing is prepared before launch: the host worker translates both programs
     against it. `mesh-samplers`: the same pixel program, declaring two samplers
-    the root has in another state, in a mesh pipeline. Only its records-only
-    mesh program's desktop translation (`mesh_samplers.hlsl`) is prepared; the
-    provider must add the literal state to the mesh root it builds and have the
-    worker translate the pixel program against that root.
+    the root has in another state, in a mesh pipeline. Both stages are
+    translated by the worker against the reflected root; the mesh program
+    exports guarded FP16-to-FP32 positions. No desktop shader is prepared.
     """
     from examples.lanes.raster_fixture import mesh, mesh_sampler_pixel, pixel, sampler_pixel, vertex
     from .runtime_shaders import shader_session
@@ -610,9 +609,11 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
             return None
         return problem
 
-    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK")
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION",
+             "TUXBOX_RASTER_ROOT_FALLBACK", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1",
+                    TUXBOX_NULL_PIPELINES="0")
     # The fallback translates against the title's root and would hide a missing reflection.
     for name in ("TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK"):
         host.env.pop(name, None)

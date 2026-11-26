@@ -36,7 +36,7 @@ def pixel():
     return container(0x60, image(5, PIXEL_CODE, (), (), inputs=1), [
         (b"ISGN", signature([
             ("SV_Position", 0, 1, 3, 0, 15, 0),
-            ("TEXCOORD", 1, 0, 3, 1, 15, 15),
+            ("TEXCOORD", 0, 0, 3, 1, 15, 15),
         ])),
         (b"OSGN", signature([("SV_Target", 0, 64, 1, 0, 1, 0)])),
         (b"PSV0", validation(0)),

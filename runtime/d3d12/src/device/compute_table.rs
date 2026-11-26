@@ -192,10 +192,11 @@ fn reflected_root(
         // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED. The program picks descriptors by heap
         // index, so it needs no table layout, only the guest-to-host index map
         // once descriptors are paged.
-        (Program::Compute(_), _) if bindless_compute_root(&signature) => {
+        (Program::Compute(shader), _) if bindless_compute_root(&signature) => {
             // Compute never reads the scalar word; it only marks the map.
             scalar_index = Some((0, 0));
             index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            recovered_samplers = literal_samplers(shader, 5, &signature);
             Some(Vec::new())
         }
         (Program::Compute(shader), params) => {
@@ -392,11 +393,18 @@ fn reflected_root(
         let reader = reader.ok_or(E_POINTER)?;
         let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
         let source = desc.Anonymous.Desc_1_1;
-        if source.NumParameters as usize != signature.params.len() || source.pParameters.is_null() {
+        if source.NumParameters as usize != signature.params.len()
+            || (source.NumParameters != 0 && source.pParameters.is_null())
+        {
             return Err(E_INVALIDARG.into());
         }
-        let mut parameters =
-            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec();
+        // Zero-parameter direct-indexed roots are legal and can have a null
+        // parameter pointer. Avoid forming a Rust slice from that pointer.
+        let mut parameters = if source.NumParameters == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec()
+        };
         let mut range_storage = vec![Vec::new(); tables];
         for (index, ranges) in range_storage.iter_mut().enumerate().filter(|(i, _)| rewrite[*i]) {
             let parameter = &mut parameters[index];

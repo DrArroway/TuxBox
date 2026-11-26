@@ -5,7 +5,21 @@
 //! been narrowed to one elected lane. Take the ballot where the mask is computed, while
 //! every lane that can be in it is there, and let each lane keep it.
 use super::{Emitter, Enc, Insn, Opnd};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+
+thread_local!(static OFF: Cell<bool> = const { Cell::new(false) });
+
+/// Whether this translation leaves lane masks as each lane's own bit.
+pub(super) fn off() -> bool { OFF.with(Cell::get) }
+
+/// Translate without whole-mask ballots, as before they were taken.
+pub(super) fn without<T>(run: impl FnOnce() -> T) -> T {
+    OFF.with(|c| c.set(true));
+    let result = run();
+    OFF.with(|c| c.set(false));
+    result
+}
 
 const VCC: u8 = 106;
 

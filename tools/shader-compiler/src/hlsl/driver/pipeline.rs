@@ -18,7 +18,18 @@ pub fn translate_for_wave32_host(ex: &ShaderExtract) -> Result<Translated, Strin
     if ex.stage != Stage::Compute || ordinary.required_wave_size != Some(64) {
         return Ok(ordinary);
     }
-    translate_paired_wave64(ex)
+    let paired = translate_paired_wave64(ex).and_then(|paired| match paired.hlsl.len() {
+        size if size > MAX_HLSL_BYTES => Err(format!("paired wave64: {} MiB of HLSL", size >> 20)),
+        _ => Ok(paired),
+    });
+    paired.or_else(|error| {
+        // Whole lane masks need the guest's wave width. Where the paired form cannot run
+        // the program, a narrow host keeps the translation it had without them.
+        match mask_ballots::without(|| translate(ex)) {
+            Ok(narrow) if narrow.required_wave_size != Some(64) => Ok(narrow),
+            _ => Err(error),
+        }
+    })
 }
 
 /// [`translate`] for the last stage before the rasteriser (VS or GS), given the
@@ -236,7 +247,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     }
     // Ray tracing resolve keeps whole masks already.
     if ex.stage == Stage::Compute && !lone_lane::on() && !wave_cull && !page_waves && !indexed_lane
-        && em.fspx_wave.is_none() && !hair_multisample && !resolve_wave32 {
+        && em.fspx_wave.is_none() && !hair_multisample && !resolve_wave32 && !mask_ballots::off() {
         em.mask_ballots = mask_ballots::find(&em.insns);
     }
     // Lane-spill slots beyond the tracked range are function-scope temporaries.

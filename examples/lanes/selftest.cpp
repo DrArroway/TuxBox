@@ -15,6 +15,7 @@
 #include "xbox_shader.h"
 #include "raster_shader.h"
 #include "reclaim_shader.h"
+#include "wave_alloc_shader.h"
 #include <algorithm>
 #include <memory>
 
@@ -32,6 +33,10 @@ constexpr std::array<UINT, 18> scarlett_profile{
 // A queue held on a label is released by the provider after five seconds, so a
 // scenario that needs that release must already count as failed.
 constexpr DWORD deadline_ms = 2000;
+
+// Sentinel written to the wave-alloc UAV so a shader that never stores is
+// distinguishable from one that stored the expected value (0).
+constexpr UINT kWaveAllocSentinel = 0xdeadbeefu;
 
 // Xbox command-list and queue slots (GDK gen9/d3d12_xs.h).
 constexpr size_t slot_copy_memory = 62, slot_write32 = 71, slot_write64 = 72, slot_wait64 = 74,
@@ -628,6 +633,70 @@ void raster_tables(ID3D12Device* device) {
             throw std::runtime_error(message);
         }
     }
+}
+
+
+// A console shader whose wave32 masked DPP exclusive prefix the translator must
+// lower to `WavePrefixSum`. The old translator rejects it with "unrecognized
+// masked DPP prologue", so this scenario fails without the wave-alloc lowering.
+// The shader stores one word per lane to the UAV (the exclusive prefix of a
+// wave of ones is the lane id); the scenario reads back every word and requires
+// it to be the expected value, so a numerical miscompile of the lowering is
+// caught here and no inter-lane store order can hide a wrong lane.
+void wave_alloc_scenario(ID3D12Device* device) {
+    constexpr size_t wave_alloc_words = 32;
+    D3D12_ROOT_PARAMETER params[1]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[0].Descriptor = {0, 0};
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 1;
+    signature.pParameters = params;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize wave-alloc root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create wave-alloc root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {wave_alloc_shader, sizeof(wave_alloc_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline from the wave-alloc console shader");
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, wave_alloc_words * sizeof(UINT),
+                         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // Seed the UAV with a sentinel so a missing store is distinguishable from the
+    // expected values (0..31) in the readback.
+    auto sentinel = buffer(device, D3D12_HEAP_TYPE_UPLOAD, wave_alloc_words * sizeof(UINT),
+                           D3D12_RESOURCE_STATE_GENERIC_READ);
+    const std::vector<UINT> fill(wave_alloc_words, kWaveAllocSentinel);
+    compute_fixture::upload(sentinel.Get(), fill.data(), fill.size() * sizeof(UINT));
+    auto proof = buffer(device, D3D12_HEAP_TYPE_READBACK, wave_alloc_words * sizeof(UINT),
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+    Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    auto* list = compute.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, sentinel.Get(), 0, wave_alloc_words * sizeof(UINT));
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    list->SetPipelineState(pipeline.Get());
+    method<SetUav>(list, slot_root_uav)(list, 0, output->GetGPUVirtualAddress());
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(proof.Get(), 0, output.Get(), 0, wave_alloc_words * sizeof(UINT));
+    compute.submit();
+    compute.finish("dispatch of the wave-alloc console shader");
+    D3D12_RANGE range{0, wave_alloc_words * sizeof(UINT)}, empty{};
+    void* mapped{};
+    check(proof->Map(0, &range, &mapped), "map wave-alloc proof");
+    const UINT* rows = static_cast<const UINT*>(mapped);
+    for (size_t i = 0; i < wave_alloc_words; ++i) {
+        if (rows[i] != static_cast<UINT>(i))
+            throw std::runtime_error("wave-alloc shader stored the wrong prefix result at lane " + std::to_string(i) + " (or stored nothing)");
+    }
+    proof->Unmap(0, &empty);
 }
 
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,
@@ -1660,6 +1729,7 @@ constexpr Scenario scenarios[] = {
     {L"xbox-shader", xbox_shader_scenario},
     {L"wave64-shader", wave64_shader_scenario},
     {L"raster-tables", raster_tables},
+    {L"wave-alloc", wave_alloc_scenario},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -1711,8 +1781,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"indirect-dispatch", L"gpu-indirect-dispatch",
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
-                                             L"xbox-shader", L"wave64-shader",
-                                             L"raster-tables"};
+                                             L"xbox-shader", L"wave64-shader", L"raster-tables", L"wave-alloc"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

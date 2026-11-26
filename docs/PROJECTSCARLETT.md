@@ -787,7 +787,9 @@ totals or distinct shaders. No retail inputs were used locally.
 
 The generic translator supports nine additional scalar bit instructions and applies the ordinary-scalar proof to the three forms already added by #56
 (32/64-bit zero counts, zero searches, leading-bit searches, reversal,
-bit setting/clearing and testing). The local reaching-definition check
+bit setting/clearing and testing). The same proof admits `s_quadmask_b32/b64`
+and `s_bitreplicate_b64_b32` on ordinary values; applied to EXEC or VCC they
+are pixel-quad operations and stay refused. The local reaching-definition check
 requires ordinary scalar values, not an assumed full-wave EXEC/VCC mask.
 Unknown halves, branch entries and indirect control flow remain unsupported;
 private packed and mesh paths are outside this proof. The rules follow
@@ -797,7 +799,7 @@ CPU-only controls:
 
 - Capture `cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu scalar_bit_cpu_oracle_fixture -- --nocapture`
   to a fresh fixture file. Run `python tools/check_scalar_bits.py --help`
-  for the DXC/DXV numerical oracle: 1,944 cases, 7,776 checked values.
+  for the DXC/DXV numerical oracle: 2,430 cases, 9,720 checked values.
 - Run `python tools/check_scalar_native.py --help` with the baseline and
   candidate xshader executables: 13 synthetic native programs recovered,
   six deliberately unsupported controls retained, one unchanged control.

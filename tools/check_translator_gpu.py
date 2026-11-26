@@ -45,6 +45,7 @@ CHECKS = {
     "packed-chain-saturate": assembled("check_packed_chain_gpu", "--include-saturate"),
     "packed-chain-unoptimized": assembled("check_packed_chain_gpu", "--optimization", "O0"),
     "sad-mad64": assembled("check_sad_mad64_gpu"),
+    "scalar-masks": assembled("check_scalar_masks_gpu"),
     "f64": assembled("check_f64_exact_gpu"),
     "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
     "readlane": Check("check_readlane_gpu", emitter="readlane_probe", dxc=True),

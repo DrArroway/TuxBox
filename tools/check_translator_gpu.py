@@ -76,6 +76,8 @@ CHECKS = {
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
     "raw-index": Check("check_raw_index",
                        capture=("proven_byte_index_emits_addresses_without_widening_loads", "--hlsl")),
+    "third-table-atomic": Check("check_third_table_atomic",
+                              capture=("third_compute_table_recovers_a_proven_atomic_uav", "--hlsl")),
     "dynamic-cbv": Check("check_dynamic_cbv", capture=("bounded_dynamic_cbv", "--hlsl"), dxc=True),
     "dynamic-code-offset": Check("check_dynamic_code_offset",
                                  capture=("bounded_runtime_code_offset", "--hlsl")),

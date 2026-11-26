@@ -409,7 +409,15 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         }
         // Moving a shared exchange out of a forward guest branch is safe once every
         // invocation rejoins. A backward branch could execute it different numbers of times.
+        // A loop back-edge is safe for a shared exchange when every invocation in the
+        // group runs it the same number of times: the group is a single wave (so SCC and
+        // EXEC are group-uniform) and the branch is uniform per wave (never a per-lane
+        // VCC). Anything else keeps the conservative rejection.
+        let single_wave = count <= 64;
         for branch in em.insns.iter().filter(|i| i.enc == Enc::Sopp && Emitter::branch_cond(i.op).is_some() && i.aux.imm < 0) {
+            if single_wave && !matches!(branch.op, 6 | 7) {
+                continue;
+            }
             let head = branch.offset as i64 + 4 + 4 * branch.aux.imm;
             if em.insns.iter().any(|i| exchanges(i) && (head..=branch.offset as i64).contains(&(i.offset as i64))) {
                 return Err("compute swizzle inside a loop".into());

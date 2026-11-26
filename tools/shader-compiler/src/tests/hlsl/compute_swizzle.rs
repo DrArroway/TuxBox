@@ -43,6 +43,36 @@ fn other_high_offset_bits_and_gds_stay_refused() {
 }
 
 #[test]
+fn uniform_scc_loop_around_the_exchange_translates() {
+    // A 64-lane single wave: an SCC back-edge (uniform, never per-lane) means
+    // every invocation runs the loop and the shared exchange the same number of
+    // times, so the loop is accepted.
+    let ex = fixture::shader_loop(0x041f, 0, 5);
+    assert_eq!(disassemble(&ex.isa)[0].mnemonic, "ds_swizzle_b32");
+    let hlsl = translate(&ex).map(|t| t.hlsl)
+        .expect("uniform SCC loop over a compute swizzle translates");
+    assert!(hlsl.contains("tb_swizzle"), "{hlsl}");
+}
+
+#[test]
+fn unconditional_loop_around_the_exchange_translates() {
+    let ex = fixture::shader_loop(0x041f, 0, 2);
+    let hlsl = translate(&ex).map(|t| t.hlsl)
+        .expect("unconditional loop over a compute swizzle translates");
+    assert!(hlsl.contains("tb_swizzle"), "{hlsl}");
+}
+
+#[test]
+fn divergent_vcc_loop_around_the_exchange_is_refused() {
+    // A VCC back-edge can run lane-selectively: lanes in the loop body run the
+    // exchange a different number of times, which is unsafe.
+    let error = translate(&fixture::shader_loop(0x041f, 0, 7))
+        .map(|t| t.hlsl)
+        .unwrap_err();
+    assert!(error.contains("compute swizzle inside a loop"), "{error}");
+}
+
+#[test]
 fn paired_wave64_lowers_quad_and_bitmask_swizzles_without_shared_memory() {
     use crate::hlsl::translate_paired_wave64;
 

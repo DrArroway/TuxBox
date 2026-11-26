@@ -169,7 +169,7 @@ class RasterGateTests(unittest.TestCase):
 
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
@@ -208,7 +208,7 @@ class RasterGateTests(unittest.TestCase):
         self.assertIsNone(seen["problem"])
         # Only this scenario has the prepared mesh translation, and it is removed after.
         self.assertEqual(seen["mesh"], True)
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
         self.assertEqual(seen["mesh_command"][1:5], ["-T", "ms_6_5", "-E", "main"])
         self.assertTrue(seen["mesh_command"][-1].endswith("examples/lanes/mesh_samplers.hlsl"))
         self.assertEqual(seen["left"], ["title.cso"])

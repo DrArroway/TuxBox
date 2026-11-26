@@ -14,6 +14,7 @@
 #include "gpu_indirect_shader.h"
 #include "xbox_shader.h"
 #include "raster_shader.h"
+#include "lane_spill_shader.h"
 #include "reclaim_shader.h"
 #include "wave_alloc_shader.h"
 #include <algorithm>
@@ -627,6 +628,49 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
     for (UINT y = 0; y < side; ++y)
         std::copy_n(&rows[y * pitch / 4], side, &texels[y * side]);
     return texels;
+}
+
+// A console pixel program writes a lane-spill area with v_writelane_b32, then
+// runs an f16 interpolator whose attribute selector reads the same number as that
+// register (`spill_fixture.py`). The selector is not a register read, so the
+// program translates and writes its constant. A translator that takes it for one
+// refuses the program: the pipeline becomes a stand-in, the draw writes nothing,
+// every texel keeps its clear value at 0, and the scenario throws.
+void lane_spill_interp(ID3D12Device* device) {
+    ComPtr<ID3D12RootSignature> root;
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize empty root signature");
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create empty root signature");
+
+    // One null view; no table is bound, so the program declares no descriptor.
+    D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+    ComPtr<ID3D12DescriptorHeap> view_heap;
+    check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view_heap)), "create view heap");
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(view_heap.Get(), 9)(view_heap.Get());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer = {0, 0, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    device->CreateShaderResourceView(nullptr, &srv, {cpu_base});
+
+    const auto texels = draw_console_raster(device, root.Get(), {lane_spill_pixel, sizeof(lane_spill_pixel)},
+                                            DXGI_FORMAT_R32_UINT, view_heap.Get(), {});
+    for (UINT i = 0; i < texels.size(); ++i) {
+        const UINT found = texels[i];
+        if (found == lane_spill_expected) continue;
+        char message[200];
+        if (!found)
+            std::snprintf(message, sizeof(message), "texel %u,%u is 0: a stand-in pipeline or a skipped draw", i % 16, i / 16);
+        else
+            std::snprintf(message, sizeof(message), "texel %u,%u: expected %#x, found %#x", i % 16, i / 16,
+                          lane_spill_expected, found);
+        throw std::runtime_error(message);
+    }
 }
 
 // A console pixel program reads a descriptor through the second of two root
@@ -2269,6 +2313,7 @@ constexpr Scenario scenarios[] = {
     {L"xbox-shader", xbox_shader_scenario},
     {L"wave64-shader", wave64_shader_scenario},
     {L"raster-tables", raster_tables},
+    {L"lane-spill-interp", lane_spill_interp},
     {L"wave-alloc", wave_alloc_scenario},
     {L"raster-samplers", raster_samplers},
     {L"compute-root", compute_root},
@@ -2329,7 +2374,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
-                                             L"raster-tables", L"wave-alloc", L"raster-samplers", L"compute-root",
+                                             L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single",
                                              L"compute-root-recovery", L"bindless-compute",
                                              L"bindless-sampler"};

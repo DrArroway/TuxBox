@@ -3,8 +3,10 @@ wave-alloc self-test.
 
 It is a small hand-written console program: a constant input, a wave32 masked
 DPP exclusive-prefix (the pattern the translator lowers to `WavePrefixSum`),
-and an `s_endpgm`. The prefix result is stored to a UAV so the self-test can
-read it back and check the shader's arithmetic, not just that it dispatched.
+and an `s_endpgm`. The prefix result is stored to a UAV, one word per lane, so
+the self-test can read back every lane's prefix and require each to match the
+prefix of a wave of ones — the thread id. That tests the lowering of all 32
+lanes rather than a single store, whose winner is not defined.
 Not taken from any game.
 """
 import hashlib
@@ -16,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.reference.scarlett_worker_fixture import container, pack  # noqa: E402
 
 CODE = (
-    0x7e000281,  # v_mov_b32 v0, 1
+    0x7e120300,  # v_mov_b32 v9, v0 (v0 is the thread id; keep it before overwriting)
+    0x7e000281,  # v_mov_b32 v0, 1 (the constant input)
     0xbe803dc1,  # s_or_saveexec_b32 s0, -1
     0xd5010001,  # v_cndmask_b32 v1, 0, v0, s0
     0x00020080,
@@ -38,11 +41,11 @@ CODE = (
     0x4c040302,  # v_sub_nc_u32 v2, v2, v1
     0xbefe0300,  # s_mov_b32 ExecLo, s0
     0x7e080302,  # v_mov_b32 v4, v2
-    0x7e100280,  # v_mov_b32 v8, 0 (address of the result in the UAV)
+    0x34101282,  # v_lshlrev_b32 v8, 2, v9 (byte offset = lane * 4)
     0xf4080402,  # s_load_dwordx4 s[16:19], s[4:5], 0
     0xfa000000,
     0xbf8cc07f,  # s_waitcnt lgkmcnt(0)
-    0xe0701000,  # buffer_store_dword v4, v8, s[16:19], 0 (offset 0)
+    0xe0701000,  # buffer_store_dword v4, v8, s[16:19], 0 (offset = lane * 4)
     0x80040408,
     0xbf810000,  # s_endpgm
 )

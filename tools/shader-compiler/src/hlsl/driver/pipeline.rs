@@ -379,11 +379,15 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
                         // Lockstep cannot prove this program; lower the totals that
                         // wave_sum rejects on control flow to WaveActiveSum, a
                         // whole-wave op that is safe in divergent control flow, and
-                        // re-validate the reductions that remain.
-                        wave_alloc::lower_problematic_totals(&mut em.insns, width)?;
+                        // re-validate the reductions that remain. When the new
+                        // lowering cannot prove the program, fall back to the
+                        // previous behaviour: reject with the wave_sum reason.
+                        if wave_alloc::lower_problematic_totals(&mut em.insns, width).is_err() {
+                            return Err(reason);
+                        }
                         match wave_sum::check_control_flow(&em.insns, width) {
                             Ok(guards) => em.reduction_execz_guards = guards,
-                            Err(reason) => return Err(reason),
+                            Err(_) => return Err(reason),
                         }
                     }
                 }

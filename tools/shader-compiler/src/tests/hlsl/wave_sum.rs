@@ -994,6 +994,22 @@ fn wave32_prefix() -> Vec<Insn> {
 }
 
 #[test]
+fn wave32_prefix_after_an_early_exit_is_not_a_scan_region() {
+    // An exclusive prefix is a whole-wave collective, not a scan region: an
+    // early exit before it must not be rejected as a divergence of a DPP
+    // reduction, and the pipeline's control-flow validation must not see it.
+    let mut ops = vec![insn("s_endpgm", Enc::Sopp, 1, vec![], vec![])];
+    ops.extend(wave32_prefix());
+    offsets(&mut ops);
+    let width = super::super::wave_alloc::prepare(&mut ops, Stage::Compute).unwrap();
+    assert_eq!(width, Some(32));
+    assert!(ops.iter().any(|i| i.mnemonic == "tb_wave_exclusive_prefix_u32"),
+            "the prefix must be lowered");
+    assert!(super::super::wave_sum::check_control_flow(&ops, 32).is_ok(),
+            "the rewritten prefix must not be validated as a reduction region");
+}
+
+#[test]
 fn wave32_prefix_is_rejected_when_the_scratch_temp_is_read_later() {
     // The clean prefix is lowered to the exclusive-prefix pseudo-op.
     let mut clean = wave32_prefix();

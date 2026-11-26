@@ -11,8 +11,11 @@ use std::collections::BTreeSet;
 pub(super) const TOTAL: &str = "tb_wave_total_u32";
 pub(super) const PREFIX: &str = "tb_wave_exclusive_prefix_u32";
 // Opcode for the rewritten instructions, so passes matching READLANE or VOP2
-// opcodes ignore them.
-pub(super) const PSEUDO_OP: u32 = 0x7ff3;
+// opcodes ignore them. Deliberately distinct from `wave_sum::DPP_SCAN` (0x7ff3)
+// and `DPP_REDUCE` (0x7ff1): a rewritten prefix must not be mistaken for a
+// scan region and validated as one, which the whole-wave prefix does not need
+// and would reject.
+pub(super) const PSEUDO_OP: u32 = 0x7ff4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Reg { V(u8), S(u8) }

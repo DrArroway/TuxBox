@@ -8,6 +8,8 @@ pub(super) const READ_LANE: u32 = 0x7ff2;
 // A straight-line DPP8 exchange is not a reduction. Preserve the actual
 // partner, and do not let the approximate single-lane retry erase it.
 pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
+// An inclusive wave32 prefix sum built from DPP16 row shifts (see `lower_row_scan`).
+pub(super) const DPP_SCAN: u32 = 0x7ff3;
 
 /// Prove full-EXEC straight-line within-octet exchanges in complete
 /// 32-thread blocks, including groups containing multiple waves.
@@ -96,6 +98,104 @@ enum NeutralIdentity {
     LiteralBits(u32),
 }
 
+/// Some reductions select into one register and copy it to the accumulator:
+/// `v_cndmask_b32 vS, id, vIn, sM; v_mov_b32 vA, vS`, with every lane active
+/// after the SAVEEXEC. Replace the copy by the same select into vA, so the
+/// reduction starts from the usual select. vS keeps its value for later use.
+pub(super) fn merge_select_copy(insns: &mut [Insn], first: usize) {
+    let (Some(at), Some(before)) = (first.checked_sub(1), first.checked_sub(2)) else { return };
+    let (copy, select) = (&insns[at], &insns[before]);
+    let ([Opnd::Vgpr(acc)], [Opnd::Vgpr(source)], [Opnd::Vgpr(selected)]) =
+        (copy.dst.as_slice(), copy.src.as_slice(), select.dst.as_slice()) else { return };
+    if copy.mnemonic != "v_mov_b32" || copy.enc != Enc::Vop1 || copy.raw.len() != 1
+        || select.mnemonic != "v_cndmask_b32" || select.enc != Enc::Vop3 || select.raw.len() != 2
+        || source != selected || acc == source
+        || insns[first].dst != [Opnd::Vgpr(*acc)]
+        || select.src.iter().any(|o| matches!(o, Opnd::Vgpr(r) if r == acc || r == source))
+    {
+        return;
+    }
+    let acc = *acc;
+    let mut twin = select.clone();
+    twin.offset = copy.offset;
+    twin.dst = vec![Opnd::Vgpr(acc)];
+    // VOP3 VDST is the low byte of the first word.
+    twin.raw[0] = (twin.raw[0] & !0xff) | u32::from(acc);
+    insns[at] = twin;
+}
+
+/// A wave32 inclusive prefix sum of vA over the whole wave, after a SAVEEXEC
+/// that enables every lane:
+///
+/// ```text
+///   v_add_nc_u32 vA, row_shr:N(vA), vA      ; N = 1, 2, 4, 8: prefix within each row
+///   s_mov_b32 exec_lo, 0xffff0000
+///   v_permlanex16_b32 vT, vA, -1, -1         ; FI: lane 15 of the other row
+///   v_add_nc_u32 vA, vT, vA                  ; the upper row adds the lower row's total
+///   s_mov_b32 exec_lo, -1
+/// ```
+///
+/// A row shift past the start of a row adds nothing with either BOUND_CTRL.
+/// The first instruction becomes `tb_row_scan_add32` writing vA and vT (the
+/// upper lanes of vT receive the lower row's total, as the permute leaves them);
+/// the rest become no-ops. Returns the index after the scan.
+pub(super) fn lower_row_scan(insns: &mut [Insn], first: usize) -> Option<usize> {
+    let block = insns.get(first..first + 8)?;
+    let Some(&Opnd::Vgpr(acc)) = block[0].dst.first() else { return None };
+    for (ins, shift) in block[..4].iter().zip([0x111u32, 0x112, 0x114, 0x118]) {
+        let word = *ins.raw.get(1)?;
+        if ins.enc != Enc::Vop2 || ins.mnemonic != "v_add_nc_u32" || ins.raw.len() != 2
+            || ins.src != [Opnd::Raw(250), Opnd::Vgpr(acc)] || ins.dst != [Opnd::Vgpr(acc)]
+            || word & 0xff != u32::from(acc) || (word >> 8) & 0x1ff != shift
+            // No source modifiers; every row and bank enabled.
+            || (word >> 20) & 0xf != 0 || word >> 24 != 0xff
+        {
+            return None;
+        }
+    }
+    let [Opnd::Vgpr(tmp)] = block[5].dst[..] else { return None };
+    let fetch_inactive = block[5].raw.first().is_some_and(|w| (w >> 11) & 3 == 1);
+    if tmp == acc
+        || block[4].mnemonic != "s_mov_b32" || block[4].dst != [Opnd::ExecLo] || block[4].src != [Opnd::Literal(0xffff_0000)]
+        || block[5].mnemonic != "v_permlanex16_b32" || !fetch_inactive
+        || block[5].src != [Opnd::Vgpr(acc), Opnd::ConstInt(-1), Opnd::ConstInt(-1)]
+        || block[6].mnemonic != "v_add_nc_u32" || block[6].enc != Enc::Vop2
+        || block[6].dst != [Opnd::Vgpr(acc)] || block[6].src != [Opnd::Vgpr(tmp), Opnd::Vgpr(acc)]
+        || block[7].mnemonic != "s_mov_b32" || block[7].dst != [Opnd::ExecLo] || block[7].src != [Opnd::ConstInt(-1)]
+    {
+        return None;
+    }
+    // Every lane is active: a wave32 SAVEEXEC of -1 with only lane-local
+    // selects and copies (and scalar masks) since.
+    let mut saved = false;
+    for op in insns[first.saturating_sub(8)..first].iter().rev() {
+        if op.mnemonic == "s_or_saveexec_b32" && op.src == [Opnd::ConstInt(-1)] {
+            saved = true;
+            break;
+        }
+        let local = matches!(op.mnemonic.as_str(), "v_mov_b32" | "v_cndmask_b32" | "s_and_b32" | "s_waitcnt" | "s_nop" | "v_nop");
+        if !local || op.dst.contains(&Opnd::ExecLo) {
+            return None;
+        }
+    }
+    if !saved {
+        return None;
+    }
+    let scan = &mut insns[first];
+    scan.op = DPP_SCAN;
+    scan.aux.imm = 0;
+    scan.mnemonic = "tb_row_scan_add32".into();
+    scan.src = vec![Opnd::Vgpr(acc)];
+    scan.dst = vec![Opnd::Vgpr(acc), Opnd::Vgpr(tmp)];
+    for op in &mut insns[first + 1..first + 8] {
+        op.mnemonic = "v_nop".into();
+        op.enc = Enc::Vop1;
+        op.src.clear();
+        op.dst = vec![Opnd::Vgpr(acc)];
+    }
+    Some(first + 8)
+}
+
 fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> Option<(usize, Opnd, Opnd)> {
     let select = insns.get(first.checked_sub(1)?)?;
     let [ident, _, mask @ Opnd::Sgpr(_)] = select.src[..] else {
@@ -121,6 +221,10 @@ fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> O
     for (index, op) in insns[..first - 1].iter().enumerate().rev() {
         match op.mnemonic.as_str() {
             "s_waitcnt" | "v_nop" => (),
+            // The original select of `merge_select_copy`: the same inputs into
+            // a register the reduction does not read.
+            "v_cndmask_b32" if op.src == select.src && op.dst != select.dst
+                && !op.dst.iter().any(|d| select.src.contains(d)) => (),
             "v_mov_b32" if want_reg.is_some() => {
                 let [Opnd::Vgpr(reg)] = op.dst[..] else { return None };
                 let [Opnd::Literal(bits)] = op.src[..] else { return None };
@@ -577,6 +681,12 @@ pub(super) fn reduction_regions(insns: &[Insn], width: u32)
     -> impl Iterator<Item = (usize, std::ops::RangeInclusive<usize>)> + '_
 {
     insns.iter().enumerate().filter_map(move |(first, ins)| {
+        if ins.op == DPP_SCAN {
+            // From the SAVEEXEC through the scan's own EXEC restore to -1.
+            let start = masked_prologue(insns, first, NeutralIdentity::Immediate(0))
+                .map_or(first.saturating_sub(2), |(index, _, _)| index);
+            return Some((first, start..=first + 7));
+        }
         if ins.op != DPP_REDUCE || ins.aux.imm != 0 {
             return None;
         }
@@ -766,6 +876,8 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<
     let mut verified_reads = Vec::new();
     for (first, region) in reduction_regions(insns, width) {
         let ins = &insns[first];
+        // A row scan sums with the integer add's identity.
+        let operation = if ins.op == DPP_SCAN { "v_add_nc_u32" } else { ins.mnemonic.as_str() };
         let start = insns[*region.start()].offset as i64;
         let end = insns[*region.end()].offset as i64;
         let last_read = *region.end() - 1;
@@ -779,7 +891,7 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<
                 if (pc < start && target >= start) || (pc > end && target <= end)
                     || (pc >= start && pc <= end)
                 {
-                    if !guard_region(insns, branch_index, start as usize, end as usize, first, &ins.mnemonic, &verified_reads) {
+                    if !guard_region(insns, branch_index, start as usize, end as usize, first, operation, &verified_reads) {
                         if std::env::var("TUXBOX_WAVE_DEBUG").is_ok() {
                             let prev = insns.get(branch_index.checked_sub(1).unwrap_or(0));
                             eprintln!("WAVEDEBUG region=[{start:#x}..{end:#x}] op={} branch_idx={} op={} pc={:#x} target={:#x} prev={:?}",

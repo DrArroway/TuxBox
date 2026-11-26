@@ -13,6 +13,17 @@ impl<'a> Emitter<'a> {
     }
 
     pub(in crate::hlsl) fn emit_compute_swizzle(&mut self, idx: usize, ins: &Insn, active: &[usize]) -> Result<(), String> {
+        if ins.mnemonic == GROUP_GATHER {
+            // Every lane publishes its value; each reads the lane its index names.
+            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+            let value = r(&ins.src[0])?;
+            let value = if guard.is_empty() { value } else { format!("({}) ? {value} : 0u", guard.join(" && ")) };
+            self.line(&format!("tb_swizzle[tb_lane] = {value};"));
+            self.line("GroupMemoryBarrierWithGroupSync();");
+            self.line(&format!("uint swizzle{idx} = tb_swizzle[(tb_lane & ~63u) | ({} & 63u)];", r(&ins.src[1])?));
+            self.line("GroupMemoryBarrierWithGroupSync();");
+            return Ok(());
+        }
         if ins.mnemonic == GROUP_READ {
             // A lane read ignores EXEC.
             let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();

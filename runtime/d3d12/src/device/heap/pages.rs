@@ -43,13 +43,16 @@ impl PagePools {
         token
     }
 
-    pub(super) fn import(&self, device: &ID3D12Device13, base: u64, size: u64, pin: ImportPin, source: &'static str) -> windows::core::Result<Arc<ImportedHeap>> {
+    pub(super) fn import(&self, device: &ID3D12Device13, base: u64, size: u64, pin: ImportPin, source: &'static str, mirror: bool) -> windows::core::Result<Arc<ImportedHeap>> {
         let open = || -> windows::core::Result<Arc<ImportedHeap>> {
+            if mirror {
+                return super::shadow::open_shadow_sized(device, base, size, pin, source);
+            }
             let native = unsafe { device.OpenExistingHeapFromAddress1(base as _, size as usize) }.map_err(|error| {
                 trace_import_failure(source, "sized", size, error.code());
                 error
             })?;
-            Ok(Arc::new(ImportedHeap { native, _pin: pin }))
+            Ok(Arc::new(ImportedHeap::direct(native, pin)))
         };
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             use std::sync::atomic::AtomicU64;

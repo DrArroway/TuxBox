@@ -208,6 +208,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             // Without TuxBox's index map the guest heap index is the host heap index.
             h.push_str("struct TBHeapConstants { uint4 data[4096]; };\nuint tb_heap_index(uint i) { return i; }\n");
         }
+        if self.heap_strides_used {
+            // One buffer stride per guest heap slot, kept by the runtime.
+            h.push_str("ByteAddressBuffer tb_heap_strides : register(t1, space32766);\n");
+        }
         for (slot, dwords) in &self.cb_size {
             let space = self.space_suffix(2, *slot);
             let _ = writeln!(h, "cbuffer CB{slot} : register(b{}{space}) {{ uint4 cb{slot}[{}]; }};", self.register_of(2, *slot), dwords.div_ceil(4).max(1));
@@ -342,6 +346,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             // Local thread ID is in v0..v2. Packed argument blocks use s4 for group X;
             // the descriptor-table ABI places group IDs after the root parameters.
             let [tx, ty_, tz] = compute_group(ex);
+            if self.paired {
+                for r in ["v0", "v1", "v2"] { self.regs.insert(r.to_string()); }
+            }
             let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
             let g = match self.packed.as_ref().map(|p| &p.abi) {
                 None if self.resolve_wave32 || lone_lane::on() && ray_resolve::applies(ex) => ray_resolve::group_x_register(ex)
@@ -355,6 +362,16 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     sampler_heap::user_data_end(ex).unwrap(),
                 None => sampler_heap::constants(ex).map_or(4 + nparams, |(start, c)| usize::from(start) + c.count as usize),
             };
+            if self.paired {
+                for k in 0..3 { self.regs.insert(format!("s{}", g + k)); }
+                paired_wave64::prologue(self, &mut h, g);
+                sampler_heap::init_constants(ex, self.packed.is_some(), &self.regs, &mut h);
+                if let Some(plan) = &self.packed { plan.init_args(&mut h); }
+                h.push_str(&self.heap_handle_decls());
+                h.push_str(&self.body);
+                h.push_str("}\n");
+                return Ok(h);
+            }
             if self.compute_swizzle || self.indexed_lane {
                 writeln!(h, "groupshared uint tb_swizzle[{}];", tx * ty_ * tz).unwrap();
             }

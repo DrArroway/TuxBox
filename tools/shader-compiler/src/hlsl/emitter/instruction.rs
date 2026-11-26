@@ -3,6 +3,9 @@ use super::*;
 
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
+        if self.paired {
+            return paired_wave64::emit(self, idx, ins, is_ps, br);
+        }
         self.emit_insn_body(idx, ins, is_ps, br)?;
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
@@ -72,7 +75,7 @@ impl<'a> Emitter<'a> {
             "s_ff1_i32_b64" | "s_ff1_i32_b32" | "tb_first_active_lane" if lone_lane::on() && ins.src == [Opnd::ExecLo] => {
                 return self.ws(&d.ok_or("missing elected lane register")?, "((exec_lo & 1u) ? 0u : 0xffffffffu)");
             }
-            "s_ff1_i32_b64" if ins.src == [Opnd::ExecLo] => {
+            "s_ff1_i32_b64" if ins.src == [Opnd::ExecLo] && !self.paired => {
                 // WaveActiveMin returns the same lane ID to all participating invocations.
                 let dst = d.ok_or("missing elected lane register")?;
                 return self.ws(&dst, "WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu)");

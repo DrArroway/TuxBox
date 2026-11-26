@@ -57,6 +57,7 @@ pub(in crate::hlsl) fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Optio
         let off = insns[first].offset;
         let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
         let red = insns[first].mnemonic.clone();
+        wave_sum::merge_select_copy(insns, first);
         // A full saved-EXEC extrema reduction can begin with quad shuffles,
         // then combine different quads. A quad followed solely by a lane read
         // still selects within its quad and must not become a whole-wave min/max.
@@ -81,6 +82,13 @@ pub(in crate::hlsl) fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Optio
         let saved_extrema = matches!(red.as_str(), "v_min_f32" | "v_max_f32")
             && (first.checked_sub(3).is_some_and(|p| matches!(insns[p].mnemonic.as_str(), "s_or_saveexec_b32" | "s_or_saveexec_b64"))
                 || wave_sum::masked_floating(insns, first));
+        if let Some(next) = (red == "v_add_nc_u32").then(|| wave_sum::lower_row_scan(insns, first)).flatten() {
+            if width.replace(32).is_some_and(|w| w != 32) {
+                return Err(bad("conflicting integer sum wave widths"));
+            }
+            at = next;
+            continue;
+        }
         if matches!(red.as_str(), "v_add_nc_u32" | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32" | "v_add_f32" | "v_and_b32" | "v_or_b32" | "v_xor_b32") || saved_extrema {
             let (required, next) = wave_sum::lower(insns, first).map_err(bad)?;
             if width.replace(required).is_some_and(|w| w != required) {

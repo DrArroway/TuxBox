@@ -79,6 +79,10 @@ fn early_return_distance(rva: usize, bytes: &[u8]) -> Option<usize> {
 pub(crate) fn install_handler() -> bool {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
+        // The first call comes from the DLL attach, before title code runs.
+        if let Some((start, end)) = title_image() {
+            crate::clzero::patch_known_routines(start, end);
+        }
         let handle = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
         VEH_HANDLE.store(handle, Ordering::Release);
     });
@@ -115,7 +119,7 @@ fn log(line: String) {
 }
 
 /// Bounds of the title image (the process executable).
-fn title_image() -> Option<(usize, usize)> {
+pub(crate) fn title_image() -> Option<(usize, usize)> {
     static IMAGE: LazyLock<Option<(usize, usize)>> = LazyLock::new(|| {
         let HMODULE(base) = unsafe { GetModuleHandleW(None) }.ok()?;
         let base = base as usize;

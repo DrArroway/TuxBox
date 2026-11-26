@@ -103,6 +103,15 @@ fn cached_translation(cache: &Path, key: &str, stage: Stage) -> Option<Vec<u8>> 
     (source_digest(&bytes)?.as_bytes() == expected).then_some(bytes)
 }
 
+/// The translator's recorded reason for refusing `key`, when it refused it.
+pub(super) fn refusal_reason(key: &str) -> Option<String> {
+    let cache = compiler_cache(session()?)?;
+    if !CACHED.of(cache).contains(&format!("{key}.unsupported")) {
+        return None;
+    }
+    fs::read_to_string(cache.join(format!("{key}.reason"))).ok()
+}
+
 fn cached_refusal(cache: &Path, key: &str) -> bool {
     if !CACHED.of(cache).contains(&format!("{key}.unsupported")) {
         return false;
@@ -129,6 +138,16 @@ pub(super) fn on_demand(shader: &[u8], source: &str, stage: Stage) -> Option<Vec
     request(source, stage, "dxbc", |pending, requests| {
         fs::write(pending, shader)?;
         fs::rename(pending, requests.join(format!("{source}.dxbc")))
+    })
+}
+
+/// The translation of compute program `source` for hosts with 32-lane waves,
+/// which the compiler keeps beside the ordinary one.
+pub(super) fn narrow_wave(shader: &[u8], source: &str) -> Option<Vec<u8>> {
+    let key = format!("{source}_w32");
+    request(&key, Stage::Compute, "wave32", |pending, requests| {
+        fs::write(pending, shader)?;
+        fs::rename(pending, requests.join(format!("{key}.wave32")))
     })
 }
 
@@ -181,6 +200,9 @@ fn request(
         progress::record(key, Shader::Cached);
         return Some(bytes);
     }
+    // The title thread waits here for the translation (and for any request
+    // ahead of it on the same digest).
+    let _pause = crate::title_watchdog::pause();
     // Serialize the exact digest, not a hash bucket. Unrelated programs
     // must not wait behind a slow translation (or its 90-second timeout).
     static LOCKS: LazyLock<RequestLocks> = LazyLock::new(RequestLocks::default);

@@ -867,3 +867,85 @@ fn straight_dpp8_portability_spans_multiple_waves_without_cross_wave_reads() {
         assert!(!straight_exchange(&mut ops.clone(), group), "{group:?}");
     }
 }
+
+/// The compaction scan from ProjectScarlett compute shaders (0c40c71fbff2 at
+/// 0x97c): a masked select copied to the accumulator, a DPP16 row-shift
+/// inclusive scan, the cross-row add, and the exclusive result.
+fn row_scan_shader(words_before_scan: &[u32]) -> ShaderExtract {
+    let (mut ex, _, _) = fixture::shader(32);
+    let mut words = vec![
+        0xbe82_3dc1,              // s_or_saveexec_b32 s2, -1
+        0xd501_0001, 0x000a_1a80, // v_cndmask_b32 v1, 0, v13, s2
+        0x7e04_0301,              // v_mov_b32 v2, v1
+    ];
+    words.extend_from_slice(words_before_scan);
+    words.extend([
+        0x4a04_04fa, 0xff09_1102, // v_add_nc_u32 v2, row_shr:1 bound_ctrl
+        0x4a04_04fa, 0xff01_1202, // row_shr:2
+        0x4a04_04fa, 0xff01_1402, // row_shr:4
+        0x4a04_04fa, 0xff01_1802, // row_shr:8
+        0xbefe_03ff, 0xffff_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xd778_4803, 0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi
+        0x4a04_0503,              // v_add_nc_u32 v2, v3, v2
+        0xbefe_03c1,              // s_mov_b32 exec_lo, -1
+        0x4c04_0302,              // v_sub_nc_u32 v2, v2, v1
+        0xbefe_0302,              // s_mov_b32 exec_lo, s2
+        0xbf81_0000,              // s_endpgm
+    ]);
+    ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    ex.isa_data = ex.isa.clone();
+    ex
+}
+
+#[test]
+fn row_shift_scan_after_a_select_copy_is_a_wave_prefix_sum() {
+    let translated = super::super::translate(&row_scan_shader(&[])).expect("row scan");
+    assert_eq!(translated.required_wave_size, Some(32));
+    let hlsl = translated.hlsl;
+    // The copy becomes the same select into the accumulator.
+    assert!(hlsl.contains("v2 = select(tb_live, (uint)(") || hlsl.contains("v2 = ((s2 & 1u)"), "{hlsl}");
+    assert!(hlsl.contains("_scan = WavePrefixSum(v2) + v2;"), "{hlsl}");
+    assert!(hlsl.contains("if (WaveGetLaneIndex() >= 16u) v3 = WaveReadLaneAt("), "{hlsl}");
+    assert!(!hlsl.contains("v_permlanex16"), "{hlsl}");
+}
+
+#[test]
+fn row_scan_needs_every_lane_and_the_exact_shifts() {
+    // EXEC changes between the SAVEEXEC and the scan.
+    assert!(super::super::translate(&row_scan_shader(&[0xbefe_0302])).is_err());
+    // A different shift sequence (row_shr:3 in the second step) is not a scan.
+    let mut ex = row_scan_shader(&[]);
+    let mut words: Vec<u32> = ex.isa.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    let second = words.iter().position(|&w| w == 0xff01_1202).unwrap();
+    words[second] = 0xff01_1302;
+    ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    ex.isa_data = ex.isa.clone();
+    assert!(super::super::translate(&ex).is_err());
+}
+
+#[test]
+fn select_copy_merge_keeps_both_registers() {
+    let select = |dst: u8, mask: u8| {
+        let mut i = insn("v_cndmask_b32", Enc::Vop3, 1, vec![Opnd::Vgpr(dst)],
+            vec![Opnd::ConstInt(0), Opnd::Vgpr(13), Opnd::Sgpr(mask)]);
+        i.raw = vec![0xd501_0000 | u32::from(dst), 0x000a_1a80];
+        i
+    };
+    let mut copy = insn("v_mov_b32", Enc::Vop1, 1, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1)]);
+    copy.offset = 8;
+    let add = insn("v_add_nc_u32", Enc::Vop2, 37, vec![Opnd::Vgpr(2)], vec![Opnd::Raw(250), Opnd::Vgpr(2)]);
+    let mut ops = vec![select(1, 2), copy, add.clone()];
+    merge_select_copy(&mut ops, 2);
+    assert_eq!(ops[0].dst, [Opnd::Vgpr(1)]);
+    assert_eq!(ops[1].mnemonic, "v_cndmask_b32");
+    assert_eq!(ops[1].dst, [Opnd::Vgpr(2)]);
+    assert_eq!(ops[1].src, ops[0].src);
+    assert_eq!((ops[1].offset, ops[1].raw[0] & 0xff), (8, 2));
+    // A select that reads the accumulator keeps its copy.
+    let mut reads = select(1, 2);
+    reads.src[1] = Opnd::Vgpr(2);
+    let mut ops = vec![reads, ops[1].clone(), add];
+    ops[1] = insn("v_mov_b32", Enc::Vop1, 1, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1)]);
+    merge_select_copy(&mut ops, 2);
+    assert_eq!(ops[1].mnemonic, "v_mov_b32");
+}

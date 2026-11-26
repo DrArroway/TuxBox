@@ -49,15 +49,26 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn raw_address(&mut self, ins: &Insn) -> Result<String, String> {
         let (indexed, offset) = (ins.aux.mask & 2 != 0, ins.aux.mask & 1 != 0);
         let vector = if indexed {
-            let stride = matches!(self.res.get(&self.cur_idx).and_then(|v| v.first()), Some(Res::HeapRaw(_)))
-                .then(|| self.sibling_stride(ins)).flatten();
+            let heap = match self.res.get(&self.cur_idx).and_then(|v| v.first()) {
+                Some(&Res::HeapRaw(rs)) => Some(rs),
+                _ => None,
+            };
+            let stride = heap.and_then(|_| self.sibling_stride(ins)).map(|stride| format!("{stride}u"));
+            // Otherwise the descriptor's word 1 carries the slot's stride (see the
+            // heap load in `emit_smem`), decoded like the hardware's V#.
+            let stride = stride.or_else(|| {
+                let rs = heap.filter(|_| self.heap_strides && self.heap_strides_used)?;
+                let word1 = Opnd::Sgpr(u8::try_from(rs).ok()?.checked_add(1)?);
+                self.touch(&word1);
+                Some(format!("((({}) >> 16) & 0x3fffu)", r(&word1).ok()?))
+            });
             if (stride.is_none() && !self.raw_byte_index.contains(&ins.offset))
                 || !ins.mnemonic.starts_with("buffer_load_dword")
             {
                 return Err("raw buffer IDXEN needs the console descriptor stride".into());
             }
             let mut index = r(&ins.src[0])?;
-            if let Some(stride) = stride { index = format!("({index} * {stride}u)"); }
+            if let Some(stride) = stride { index = format!("({index} * {stride})"); }
             if offset {
                 let Opnd::Vgpr(v) = ins.src[0] else { return Err("invalid indexed raw address".into()) };
                 let byte_offset = Opnd::Vgpr(v.checked_add(1).ok_or("raw address register overflow")?);

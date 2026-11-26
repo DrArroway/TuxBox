@@ -102,8 +102,27 @@ impl<'a> Emitter<'a> {
         if self.required_wave_size == Some(64) && self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
             self.touch(&hi(&s[2]));
         }
+        if m == GROUP_GATHER {
+            let idx = self.cur_idx;
+            if !self.compute_swizzle { return Err("group gather outside a group exchange".into()); }
+            if self.hoisted_swizzle != Some(idx) { self.emit_compute_swizzle(idx, ins, &[])?; }
+            return self.wv(&d, &format!("swizzle{idx}"));
+        }
         if m == "tb_reflection_prefix32" {
             return self.wv(&d, &format!("WavePrefixSum({})", r(&s[0])?));
+        }
+        if m == "tb_row_scan_add32" {
+            // Every lane is active (see `wave_sum::lower_row_scan`).
+            let [Opnd::Vgpr(acc), Opnd::Vgpr(tmp)] = ins.dst[..] else { return Err("invalid row scan".into()) };
+            if self.pixel_wave || self.portable_wave64 {
+                return Err("row scan needs a native wave32".into());
+            }
+            self.touch(&Opnd::Vgpr(tmp));
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t}_scan = WavePrefixSum(v{acc}) + v{acc};"));
+            self.line(&format!("if (WaveGetLaneIndex() >= 16u) v{tmp} = WaveReadLaneAt(t{t}_scan, 15u);"));
+            return self.ws(&d, &format!("t{t}_scan"));
         }
         if m == "v_nop" {
             return Ok(());

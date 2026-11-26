@@ -52,6 +52,9 @@ impl<'a> Emitter<'a> {
             heap_sampler_slots: BTreeSet::new(),
             heap_map: ex.root_sig.as_ref().is_some_and(|root| root.params.iter().any(|p| matches!(p.kind,
                 crate::meta::RootParamKind::Descriptor { kind: 3, register: 0, space: 32766 }))),
+            heap_strides: ex.root_sig.as_ref().is_some_and(|root| root.params.iter().any(|p| matches!(p.kind,
+                crate::meta::RootParamKind::Descriptor { kind: 3, register: 1, space: 32766 }))),
+            heap_strides_used: false,
             private_samplers: ex.root_sig.as_ref().filter(|r| matches!(ex.stage, Stage::Compute | Stage::Pixel)
                 // Literal samplers in heap-indexing compute shaders are recovered the same
                 // way; samplers read from the sampler heap stay unresolved and fail.
@@ -118,6 +121,7 @@ impl<'a> Emitter<'a> {
             indexed_lane: false,
             single_wave32: false,
             resolve_wave32: false,
+            paired: false,
             wave32_compare_masks,
             light_grid: false,
             page_waves: false,
@@ -139,6 +143,7 @@ impl<'a> Emitter<'a> {
             // in the same register still occupies an attribute slot; d26fd88ff8712f9e).
             pulled_attrs: BTreeSet::new(),
             pixel_wave: false,
+            straight_pixel_quad: None,
             dispatched: false,
             pixel_sum: false,
             flat_attrs: BTreeSet::new(),

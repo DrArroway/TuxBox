@@ -7,6 +7,8 @@ use tuxbox_xshader::{extract, ShaderExtract, Stage};
 
 // Used only for deterministic refusals by the HLSL emitter.
 const UNSUPPORTED_HLSL: u8 = 65;
+/// Generated HLSL above this size would need more than about 9 GB of DXC memory.
+const MAX_HLSL_BYTES: usize = 8 << 20;
 
 enum Error {
     Other(String),
@@ -31,6 +33,7 @@ fn translate(
     consumer: Option<&Path>,
     pixel_order: Option<&Path>,
     stencil_target: Option<u32>,
+    wave32_host: bool,
 ) -> Result<(String, &'static str), Error> {
     use tuxbox_xshader::{hlsl, meta};
 
@@ -93,6 +96,8 @@ fn translate(
         hlsl::translate_ordered(&producer, Some(&interp), &order)
     } else if let Some(target) = stencil_target {
         hlsl::translate_stencil_target(shader, target)
+    } else if wave32_host {
+        hlsl::translate_for_wave32_host(shader)
     } else {
         hlsl::translate(shader)
     }.map_err(Error::Unsupported)?;
@@ -119,6 +124,7 @@ fn translate(
     consumer: Option<&Path>,
     _pixel_order: Option<&Path>,
     stencil_target: Option<u32>,
+    _wave32_host: bool,
 ) -> Result<(String, &'static str), Error> {
     if consumer.is_some() {
         return Err(Error::Unsupported("independent HLSL emitter does not support linked shaders".into()));
@@ -152,7 +158,14 @@ fn run() -> Result<(), Error> {
     let mut consumer = None;
     let mut pixel_order = None;
     let mut stencil_target = None;
+    let mut wave32_host = false;
     while let Some(argument) = args.next() {
+        if argument == "--wave32-host" {
+            if std::mem::replace(&mut wave32_host, true) {
+                return Err("duplicate --wave32-host".into());
+            }
+            continue;
+        }
         if argument == "--stencil-target" {
             let index: u32 = args
                 .next()
@@ -181,6 +194,9 @@ fn run() -> Result<(), Error> {
     if consumer.is_some() && stencil_target.is_some() {
         return Err("a stencil export requires an unlinked pixel shader".into());
     }
+    if wave32_host && (consumer.is_some() || stencil_target.is_some()) {
+        return Err("--wave32-host applies to an unlinked compute shader".into());
+    }
     if pixel_order.is_some() && consumer.is_none() {
         return Err("--pixel-order requires --link-pixel".into());
     }
@@ -203,7 +219,18 @@ fn run() -> Result<(), Error> {
         consumer.as_deref(),
         pixel_order.as_deref(),
         stencil_target,
+        wave32_host,
     )?;
+    // DXC needs about 1.1 GB of memory per MB of generated HLSL at -O0: two
+    // 10 MB programs took 11 GB each and starved the running title. Refuse such
+    // a translation rather than hand it to the compiler.
+    if hlsl.len() > MAX_HLSL_BYTES {
+        return Err(Error::Unsupported(format!(
+            "translated HLSL of {} MiB exceeds the {} MiB compiler budget",
+            hlsl.len() >> 20,
+            MAX_HLSL_BYTES >> 20
+        )));
+    }
     if let Some(path) = profile_output {
         let stage = match shader.stage {
             Stage::Pixel => "ps",

@@ -140,6 +140,12 @@ On November 25, 2026, preparation compiled 20,583 of 25,079 recorded requests an
 
 The counts are per recorded request, so they overstate what a live run loses: a request recorded without its root signature can't be translated offline. Rank failures by the pipelines a run lost with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
 
+### Block dispatcher
+
+When a program's loops can't be nested, the translator puts its basic blocks into one loop in which each thread runs the block it is at. The blocks are tested in program order on the thread's current block, so one pass follows every forward jump and only a jump back needs another. One test skips 24 blocks.
+
+Such programs are compiled without DXC's lifetime markers, or at `-O0` when that fails or the target is `cs_6_6`. At the default level with the markers, RADV (Mesa 26.1.8) spent 130 seconds and 20 GB on one ProjectScarlett pixel program. Without them it took 0.1 seconds.
+
 ### Whole-wave branches
 
 The console branches once per wave, but the translator normally branches once per thread. Where its targeted checks can't show that this is safe around a wave operation, it now branches with the whole wave: branches on EXEC and VCC vote across the wave, as do the condition codes set by mask operations ([analysis](../tools/shader-compiler/src/hlsl/lockstep.rs)). It refuses programs that use a lane mask as a number, or a number as a lane mask. Ray tracing resolve programs, which already keep whole masks, also translate now when their loops go through the block dispatcher.
@@ -147,6 +153,18 @@ The console branches once per wave, but the translator normally branches once pe
 A [GPU check](../tools/check_lockstep_gpu.py) compares both paths with a model of the console on an RTX 4070 Ti SUPER: 245 cases match. Programs that translate through the targeted checks still branch once per thread. With the final branch that routes them to whole-wave translation removed, 160 of 210 cases of the same programs give wrong results, so some shaders that translate today are likely to compute wrong values. This hasn't been traced to anything visible in a game.
 
 Most wave reduction refusals come from programs over 6,000 instructions, where the translator doesn't try its one-lane-per-wave form. In a trial on an earlier set of 1,442 such compute shaders, removing that limit translated 1,211. Six sampled outputs compiled in 2 to 12 seconds with DXC optimization off, and mostly produced 1 to 2 MB of DXIL. Large compiles in a recorded run took the driver 6 minutes or more, so the limit stays until the generated code compiles faster. The outputs weren't tested in a game.
+
+### 64-lane programs on 32-lane hosts
+
+Many console compute programs need all 64 lanes of a wave, and a host such as an NVIDIA card runs at most 32. When the [host profile](USAGE.md#host-profile) shows that, the provider asks the compiler for a second translation of the program (`--wave32-host`), cached beside the ordinary one as `<hash>_w32`. A 64-lane host never asks, so it keeps the ordinary translation.
+
+In that [translation](../tools/shader-compiler/src/hlsl/paired_wave64.rs) each host thread runs two console lanes, `n` and `n + 32`. Scalar registers and lane masks hold their full console values, identical across the wave, so branches and scalar instructions need no special cases. Vector registers are stored once per lane, each vector instruction runs once for each, and the masks it produces are rebuilt from all 64 results. An instruction that crosses lanes in a way the translation doesn't know is refused.
+
+A [GPU check](../tools/check_paired_wave64.py) compares 18 synthetic programs with a model of the console, 256 waves each. All match on an RTX 4070 Ti SUPER and on a Radeon 610M forced to 32 lanes. The check covers lane masks and branches, lane reads and counts, DPP and row exchanges, shared memory with barriers, interleaved loops and groups of four waves. It doesn't cover buffers or textures, and it can't detect a missing memory ordering. Console code may also rely on a wave running in step without a barrier, which neither translation guarantees.
+
+On 39,999 recorded ProjectScarlett requests the second translation differs for 133 compute programs: 111 compile with DXC and DXV, and 22 are refused for lane swizzles, relative vector registers, implicit derivatives or one unhandled buffer write. This hasn't been tested in the game.
+
+A change to either translation shows in a [recorded set of outputs](../tools/shader-compiler/src/tests/hlsl/host_profiles.txt) that names the host profile affected. When the change is intended, update the record with `TUXBOX_BLESS_PROFILES=1` and `cargo test ... host_profiles`.
 
 ### Earlier survey
 

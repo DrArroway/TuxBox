@@ -107,6 +107,22 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(store.fetch(key, output), data)
         self.assertEqual(output.read_bytes(), data)
 
+    def test_rejected_stage_is_not_staged_or_counted_as_reuse(self):
+        from project_tuxbox.dxil_store import reused
+        from project_tuxbox.runtime_shaders import portable_stage
+        cache = self.cache("a")
+        data = self.compile(cache)
+        store = DxilStore.for_cache(cache)
+        key = store.key(self.hlsl.encode(), self.profile)
+        output = self.root / "output.cso"
+        before = reused["dxil"]
+        self.assertEqual(portable_stage(data), 0)
+        self.assertIsNone(store.fetch(key, output, accept=lambda blob: portable_stage(blob) == 5))
+        self.assertFalse(output.exists())
+        self.assertEqual(reused["dxil"], before)
+        self.assertEqual(store.fetch(key, output, accept=lambda blob: portable_stage(blob) == 0), data)
+        self.assertEqual(reused["dxil"], before + 1)
+
     def test_fetch_rejects_oversized_entries_before_copy(self):
         store = DxilStore.for_cache(self.cache("a"))
         key = "a" * 64

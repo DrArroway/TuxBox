@@ -81,12 +81,13 @@ class DxilStore:
         digest.update(hlsl)
         return digest.hexdigest()
 
-    def fetch(self, key, output):
+    def fetch(self, key, output, *, accept=None):
         """Return and stage one bounded, verified snapshot of stored DXIL."""
         try:
             data = bounded_shader(self.root / f"{key}.cso")
             checksum = hashlib.sha256(data).hexdigest().encode("ascii")
-            if exact_marker(self.root / f"{key}.sha256", checksum) and has_dxil_container(data):
+            if (exact_marker(self.root / f"{key}.sha256", checksum) and has_dxil_container(data)
+                    and (accept is None or accept(data))):
                 output.write_bytes(data)
                 reused["dxil"] += 1
                 return data

@@ -367,7 +367,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             # compiler policy changes deliberately leave warm cache entries valid.
             store = DxilStore.for_cache(cache)
             content = store.key(hlsl.read_bytes(), target) if store else None
-            data = store.fetch(content, output) if store else None
+            data = store.fetch(content, output, accept=lambda blob: portable_stage(blob) == target_stage) if store else None
             if data is None or portable_stage(data) != target_stage:
                 output.unlink(missing_ok=True)
                 data = None

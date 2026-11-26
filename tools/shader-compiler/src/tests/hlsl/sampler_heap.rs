@@ -399,3 +399,27 @@ fn a_literal_sampler_takes_the_private_static_the_runtime_appends() {
     let out = super::super::translate(&ex).unwrap();
     assert!(out.hlsl.contains("SamplerState samp21 : register(s21, space32765);"), "{}", out.hlsl);
 }
+
+#[test]
+fn cube_sample_with_lod_clamp_lowers_without_an_offset() {
+    // The sample instruction with dim=3 (cube) and modi=1 (clamp).
+    // v[4:6] coordinates, v7 clamp, v8 result.
+    let mut words = SAMPLE.to_vec();
+    words[6] = 0xf0840118; // image_sample_cl, dim 3
+    words[7] = 0x00a10804; // vaddr v4, dst v8, SRSRC s4, SSAMP s20
+    let out = super::super::translate(&pixel(&words)).unwrap();
+    assert!(out.profile.starts_with("ps_6_"), "{}", out.profile);
+    assert!(out.hlsl.contains("TextureCube<float4>"), "{}", out.hlsl);
+    assert!(out.hlsl.contains(".Sample("), "{}", out.hlsl);
+    assert!(out.hlsl.contains("tb_cube_dir(asfloat(v4), asfloat(v5), asfloat(v6))"), "{}", out.hlsl);
+    assert!(out.hlsl.contains("asfloat(v7)"), "{}", out.hlsl);
+}
+
+#[test]
+fn cube_sample_with_derivative_clamp_is_refused() {
+    // modi=3 (d_cl) has no TextureCube overload carrying a clamp.
+    let mut words = SAMPLE.to_vec();
+    words[6] = 0xf08c0118; // image_sample_d_cl, dim 3
+    words[7] = 0x00a10804; // vaddr v4, dst v8, SRSRC s4, SSAMP s20
+    assert!(refusal(&pixel(&words)).contains("LOD clamp on a cube image"));
+}

@@ -277,12 +277,11 @@ unsafe fn create(
     }
     // The console builds a sampler from literal words, so the title's root need
     // not hold that state; the translation binds a literal only to a static
-    // sampler with the same state. When it finds none and refuses the program,
-    // build the mesh table again with the missing states as private static
-    // samplers. A pixel stage that translates against the root as declared
-    // keeps that root.
-    if rooted[1].is_none()
-        && original[0].is_none()
+    // sampler with the same state, or, when the program declares one sampler,
+    // to that register whatever its state. Build the mesh table again with the
+    // missing states as private static samplers, as the vertex/pixel roots do,
+    // and keep the root as declared only if the program does not translate then.
+    if original[0].is_none()
         && let (Some(root), Some((pixel, _)), Some((mesh, _)), Some(field), Some(table)) =
             (guest_root, original[1], original[7], root_record, pipeline.raster_table.as_ref())
         && let Ok(signature) = tuxbox_dxbc::rootsig::parse_rts0(table.pixel_root.as_ref().unwrap_or(root).payload())

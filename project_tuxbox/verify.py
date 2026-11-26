@@ -492,9 +492,9 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
         host.env.pop(name, None)
     try:
         for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS),
-                                ("mesh-samplers", MESH_SAMPLER_SLOTS)):
+                                ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS)):
             forget(rootless | {mesh_key})
-            if scenario == "mesh-samplers":
+            if scenario.startswith("mesh-"):
                 prepare_mesh()
             messages.clear()
             with shader_session(sources.parent, host.env, messages.append):
@@ -503,7 +503,7 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
                       providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                       config="lanes/MicrosoftGame.config", device_factory="xbox",
-                      log_check=expect_reflected(slots, scenario == "mesh-samplers"))
+                      log_check=expect_reflected(slots, scenario.startswith("mesh-")))
             forget(compiled())
     finally:
         forget(rootless | compiled() | {mesh_key})

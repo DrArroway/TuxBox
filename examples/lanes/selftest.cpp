@@ -793,6 +793,16 @@ void mesh_samplers(ID3D12Device* device) {
                        {mesh_sampler_mesh, sizeof(mesh_sampler_mesh)});
 }
 
+// The `raster-samplers` pixel program, declaring only s0, in a mesh pipeline
+// under a root whose s0 is point-filtered. The translation can bind the literal
+// state to the one declared register, whatever state the root gives it.
+void mesh_sampler_single(ID3D12Device* device) {
+    const auto point = point_sampler(0);
+    auto root = two_table_root(device, &point);
+    draw_linear_sample(device, root.Get(), {raster_sampler_pixel, sizeof(raster_sampler_pixel)},
+                       {mesh_sampler_mesh, sizeof(mesh_sampler_mesh)});
+}
+
 
 // A console shader whose wave32 masked DPP exclusive prefix the translator must
 // lower to `WavePrefixSum`. The old translator rejects it with "unrecognized
@@ -1890,6 +1900,7 @@ constexpr Scenario scenarios[] = {
     {L"wave-alloc", wave_alloc_scenario},
     {L"raster-samplers", raster_samplers},
     {L"mesh-samplers", mesh_samplers},
+    {L"mesh-sampler-single", mesh_sampler_single},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -1942,7 +1953,8 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
-                                             L"raster-tables", L"wave-alloc", L"raster-samplers", L"mesh-samplers"};
+                                             L"raster-tables", L"wave-alloc", L"raster-samplers", L"mesh-samplers",
+                                             L"mesh-sampler-single"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -1954,7 +1966,7 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its mesh program's translation prepared first.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mesh-samplers")))
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12)))
             continue;
         const auto name = narrow(scenario.name);
         try {

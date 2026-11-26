@@ -81,6 +81,8 @@ CHECKS = {
     "root-srv-remap": Check("check_raw_index",
                             capture=("compute_root_srv_uses_the_pipeline_register_not_the_shader_register", "--hlsl"),
                             extra=("--root-srv-remap",)),
+    "pixel-code-offset": Check("check_pixel_code_offset",
+                               capture=("pixel_embedded_table_offset_is_bounded_and_aligned", "--hlsl"), dxc=True),
     "dynamic-cbv": Check("check_dynamic_cbv", capture=("bounded_dynamic_cbv", "--hlsl"), dxc=True),
     "dynamic-code-offset": Check("check_dynamic_code_offset",
                                  capture=("bounded_runtime_code_offset", "--hlsl")),

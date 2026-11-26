@@ -10,6 +10,7 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from examples.lanes.raster_fixture import container as stage_container, image  # noqa: E402
 from tools.reference.scarlett_worker_fixture import container, pack, uav_shader  # noqa: E402
 
 CODE = (0x7E0002FF, 0x12345678, 0xBF810000)
@@ -57,6 +58,43 @@ def wave_expected():
     return [n + sum(range(n & ~63, (n & ~63) + 64)) for n in range(WAVE_THREADS)]
 
 
+ROOT_EXPECTED = 0x7AB1E002
+ROOT_THREADS = 64
+
+
+def root_code(offset):
+    return (
+        0xBE800305,                       # s_mov_b32 s0, s5
+        0xBE810380,                       # s_mov_b32 s1, 0
+        0xF4080200, 0xFA000000 | offset,  # s_load_dwordx4 s[8:11], s[0:1], offset
+        0xBF8CC07F,                       # s_waitcnt lgkmcnt(0)
+        0x7E0002FF, ROOT_EXPECTED,        # v_mov_b32 v0, ROOT_EXPECTED
+        0xE0700000, 0x80020000,           # buffer_store_dword v0, off, s[8:11], 0
+        0xBF810000,                       # s_endpgm
+    )
+
+
+def recovered_root_shader():
+    """Two stores, one in an original table and one in an uncovered second-table slot.
+
+    Only the second descriptor has a corroborating user-data record: whole
+    reflection fails, so the provider must append the missing range rather
+    than replace the original layout.
+    """
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, ROOT_THREADS, 1, 1)
+    resources = ([7, 0, 0, 0], [7, 2, 3, 3])
+    psv = pack([len(info)]) + info + pack([2, 16, *resources[0], *resources[1]])
+    first = list(root_code(0)[:-1])
+    first[0] = 0xBE800304  # s4, table 0
+    second = list(root_code(0x40))
+    second[0] = 0xBE800305  # s5, table 1
+    user = ([3, 16, 1, 3, 0x105],)
+    used = ([0x303, 0, 0, 1, 0x404], [0x303, 16, 3, 1, 0x10504])
+    return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -68,6 +106,8 @@ def header():
     words = ",".join(f"{word}u" for word in wave_expected())
     return ("// Generated from shader_fixture.py.\n"
             + declaration("xbox_shader", shader()) + declaration("wave_shader", wave_shader())
+            + declaration("recovered_root_shader", recovered_root_shader())
+            + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED}u;\n"
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n")
 
 

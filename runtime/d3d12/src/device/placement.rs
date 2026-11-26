@@ -1,9 +1,11 @@
 //! Keep CPU-backed tiled Xbox textures coherent with their desktop images.
 mod descriptors;
+mod guarded_copy;
 mod publication;
 mod upload;
 mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
+pub(crate) use guarded_copy::recover as recover_guarded_copy;
 pub(crate) use publication::QueueAccess;
 
 use super::Device;

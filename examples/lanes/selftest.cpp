@@ -977,6 +977,109 @@ void compute_root(ID3D12Device* device) {
     }
 }
 
+// Two stores under a two-table root the provider reflects only in part, with
+// descriptor paging active (`shader_fixture.py`).
+void compute_root_recovery(ID3D12Device* device) {
+    D3D12_DESCRIPTOR_RANGE1 ranges[]{
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 3, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0}};
+    D3D12_ROOT_PARAMETER1 params[2]{};
+    for (UINT i = 0; i < 2; ++i) {
+        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[i].DescriptorTable = {1, &ranges[i]};
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize extended root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create two-table root signature");
+    auto create = [&](const unsigned char* code, size_t size, ComPtr<ID3D12PipelineState>& pipeline) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+        shader.pRootSignature = root.Get();
+        shader.CS = {code, size};
+        return method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                            IID_PPV_ARGS(&pipeline));
+    };
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(create(recovered_root_shader, sizeof(recovered_root_shader), pipeline), "create partially reflected pipeline");
+    // Table 0 starts at view 0, table 1 at view 8; the appended slot is view 10.
+    constexpr UINT views = 16, view_words = 64, decoy = 0xD0000000;
+    constexpr UINT64 bytes = views * view_words * sizeof(UINT);
+    std::vector<UINT> words(views * view_words);
+    for (UINT i = 0; i < views; ++i) words[i * view_words] = decoy | i;
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(seed.Get(), words.data(), size_t(bytes));
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128u,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create root view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get());
+    const UINT64 gpu_base = method<GpuHandle>(heap.Get(), 10)(heap.Get());
+    const UINT base_view = 80;
+    for (UINT i = 0; i < views; ++i) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.FirstElement = UINT64(i) * view_words;
+        view.Buffer.NumElements = view_words;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        device->CreateUnorderedAccessView(output.Get(), nullptr, &view, {cpu_base + SIZE_T(base_view + i) * stride});
+    }
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ID3D12GraphicsCommandList* list = direct.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    constexpr UINT first_view[]{0, 8};
+    for (UINT i = 0; i < 2; ++i)
+        method<SetTable>(list, slot_compute_table)(list, i, {gpu_base + UINT64(base_view + first_view[i]) * stride});
+    list->SetPipelineState(pipeline.Get());
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    direct.submit();
+    direct.finish("dispatch under a two-table root");
+
+    D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map root readback");
+    std::vector<UINT> got(views * view_words);
+    std::memcpy(got.data(), mapped, size_t(bytes));
+    readback->Unmap(0, &empty);
+    {
+        for (UINT i = 0; i < views; ++i)
+            for (UINT j = 1; j < view_words; ++j)
+                if (got[i * view_words + j] != 0)
+                    throw std::runtime_error("recovery modified a guard word");
+    }
+    for (UINT i = 0; i < views; ++i) {
+        const UINT found = got[i * view_words];
+        const bool written = i == 0 || i == 10;
+        if (found == (written ? root_shader_expected : decoy | i)) continue;
+        char message[160];
+        if (written && found == (decoy | i))
+            std::snprintf(message, sizeof(message), "view %u kept its decoy: a stand-in pipeline or a skipped dispatch", i);
+        else if (found == root_shader_expected)
+            std::snprintf(message, sizeof(message), "view %u was written unexpectedly", i);
+        else
+            std::snprintf(message, sizeof(message), "view %u: expected %#x, found %#x", i,
+                          written ? root_shader_expected : decoy | i, found);
+        throw std::runtime_error(message);
+    }
+}
+
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,
                                           D3D12_SHADER_BYTECODE bytecode) {
     D3D12_ROOT_PARAMETER params[2]{};
@@ -2012,6 +2115,7 @@ constexpr Scenario scenarios[] = {
     {L"compute-root", compute_root},
     {L"mesh-samplers", mesh_samplers},
     {L"mesh-sampler-single", mesh_sampler_single},
+    {L"compute-root-recovery", compute_root_recovery},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -2065,7 +2169,8 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
                                              L"raster-tables", L"wave-alloc", L"raster-samplers", L"compute-root",
-                                             L"mesh-samplers", L"mesh-sampler-single"};
+                                             L"mesh-samplers", L"mesh-sampler-single",
+                                             L"compute-root-recovery"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

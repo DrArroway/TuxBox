@@ -158,3 +158,16 @@ Run `python tuxbox.py verify --only lanes --output build/lanes-results.json` to 
 An interactive run compared the displayed board after keyboard presses, mouse clicks, and input from a hot-plugged virtual Xbox controller. It also checked the three DLLs loaded from the package. [Input and loader results](../../evidence/lanes-xbox-input.json) · [Captured board](../../evidence/lanes-xbox-board.png)
 
 To repeat the keyboard part on Linux, run `python tools/check_lanes_input.py --prefix PREFIX --output build/lanes-input.json`. It launches the package with `tuxbox.py run`, presses keys through XTest, and reads the presented board from the X root window. Left and Right must move the highlighted lane. Steering into the next barrier must show COLLISION, and a later move must be ignored. R must restart, and Escape must exit with status 0 and leave no process in the prefix. The checks read the board, so they hold for any course. On a Wayland desktop the game runs in a private rootful Xwayland; elsewhere, run the check under `xvfb-run`. Add `--adapter VVVV:DDDD` and `--proton` as for the launcher.
+
+
+### Partial compute root recovery
+
+`compute-root-recovery` uses a version 1.1 root with two tables, one
+pre-existing UAV and an independently corroborated missing slot in the
+second table. Only the latter has a user-data record. A logical 128-entry
+heap limited to 64 resident descriptors forces paging. Both writes and
+all other guard words must match; stand-ins are disabled.
+
+```sh
+python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
+```

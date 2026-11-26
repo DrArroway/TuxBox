@@ -23,6 +23,9 @@ pub(super) struct ConstantReadPlan {
     pub(super) uses_native_wave32: bool,
     /// Logical wave width (`32` or `64`) for groupshared `tb_indexed_readlane` sites.
     pub(super) shared_wave_width: Option<u32>,
+    /// Logical wave width (`32` or `64`) when unproven dynamic SGPR selectors
+    /// fall back to bounds-checked `GROUP_READ` (`tb_swizzle`) exchange.
+    pub(super) group_read_width: Option<u32>,
 }
 
 /// A launched compute wave enters with an active low lane. The compiler emits an
@@ -470,7 +473,7 @@ fn is_loop_uniform(
         let j = l + off;
         op.mnemonic == "s_endpgm"
             || cfg.target.get(&j).is_some_and(|&t| {
-                (t == b || t > b) && !is_uniform_branch(op, &states[j], non_uniform_ctl[j])
+                t >= b && !is_uniform_branch(op, &states[j], non_uniform_ctl[j])
             })
     });
     if bad_body {
@@ -539,7 +542,7 @@ impl ExecState {
     }
 }
 
-fn analyze_exec_full(insns: &[Insn], cfg: &CfgInfo) -> Vec<bool> {
+fn analyze_exec_full(insns: &[Insn], cfg: &CfgInfo, wave64: bool) -> Vec<bool> {
     let n = insns.len();
     if n == 0 {
         return Vec::new();
@@ -562,10 +565,11 @@ fn analyze_exec_full(insns: &[Insn], cfg: &CfgInfo) -> Vec<bool> {
         });
         // Track SGPRs that capture a full EXEC mask before EXEC itself changes.
         let is_pair = m.ends_with("_b64");
+        let width_matches = is_pair == wave64;
         let saves_exec = (matches!(m, "s_mov_b32" | "s_mov_b64")
             && ins.src.first() == Some(&Opnd::ExecLo))
             || m.contains("saveexec");
-        if saves_exec && incoming.full {
+        if saves_exec && width_matches && incoming.full {
             if let [Opnd::Sgpr(dst @ 0..=105)] = ins.dst.as_slice() {
                 if !is_pair || *dst < 105 {
                     out.saved_full.insert((*dst, is_pair));
@@ -581,14 +585,16 @@ fn analyze_exec_full(insns: &[Insn], cfg: &CfgInfo) -> Vec<bool> {
             }
         }
         // Update whether every lane in the wave is active in EXEC.
-        let sets_all = (matches!(m, "s_mov_b32" | "s_mov_b64")
-            && ins.dst.first() == Some(&Opnd::ExecLo)
-            && matches!(ins.src.first(), Some(Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX))))
-            || (matches!(m, "s_or_saveexec_b32" | "s_or_saveexec_b64")
+        let sets_all = width_matches
+            && ((matches!(m, "s_mov_b32" | "s_mov_b64")
+                && ins.dst.first() == Some(&Opnd::ExecLo)
                 && matches!(ins.src.first(), Some(Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX))))
-            || (matches!(m, "s_nand_saveexec_b32" | "s_nand_saveexec_b64")
-                && ins.src.first() == Some(&Opnd::ConstInt(0)));
-        let restores_full = matches!(m, "s_mov_b32" | "s_mov_b64")
+                || (matches!(m, "s_or_saveexec_b32" | "s_or_saveexec_b64")
+                    && matches!(ins.src.first(), Some(Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX))))
+                || (matches!(m, "s_nand_saveexec_b32" | "s_nand_saveexec_b64")
+                    && ins.src.first() == Some(&Opnd::ConstInt(0))));
+        let restores_full = width_matches
+            && matches!(m, "s_mov_b32" | "s_mov_b64")
             && ins.dst.first() == Some(&Opnd::ExecLo)
             && matches!(ins.src.first(), Some(Opnd::Sgpr(s)) if incoming.saved_full.contains(&(*s, is_pair)));
         let writes_exec = ins.dst.iter().any(|o| matches!(o, Opnd::ExecLo | Opnd::ExecHi))
@@ -707,24 +713,23 @@ fn non_spill_read_sites(insns: &[Insn]) -> Vec<usize> {
         .collect()
 }
 
-/// Whether `insns` contains any non-spill cross-lane `v_readlane_b32`.
-pub(super) fn has_non_spill_readlane(insns: &[Insn]) -> bool {
-    !non_spill_read_sites(insns).is_empty()
-}
-
 /// Lower constant-lane and upper-bound-proven SGPR `v_readlane_b32` instructions
 /// (excluding SGPR spill VGPRs written by `v_writelane_b32`).
 ///
 /// Validates every non-spill `v_readlane_b32` transactionally before mutating
-/// `insns`, refusing out-of-range lanes, unproven dynamic SGPR lanes, and
-/// non-uniform loop/barrier placements with explicit error reasons.
+/// `insns`, refusing out-of-range lanes, partial-group unproven dynamic SGPR
+/// lanes, and non-uniform loop/barrier placements with explicit error reasons.
+/// When a complete-wave compute group (`count % guest_width == 0`) contains an
+/// unproven dynamic SGPR selector, returns `group_read_width = Some(guest_width)`
+/// so `lower_lane_spills` + `emit_compute_swizzle(GROUP_READ)` lowers it cleanly
+/// with masked `(tb_lane & ~mask) | (sel & mask)` bounds safety.
 pub(super) fn lower_constant_reads(
     group: [u32; 3],
     insns: &mut [Insn],
     required_wave_size: Option<u32>,
     fspx_wave32: bool,
     allow_small_group: bool,
-    allow_unproven_swizzle_fallback: bool,
+    allow_group_read_fallback: bool,
 ) -> Result<ConstantReadPlan, String> {
     let read_sites = non_spill_read_sites(insns);
     if read_sites.is_empty() {
@@ -784,9 +789,8 @@ pub(super) fn lower_constant_reads(
         Default::default()
     };
 
-    let can_swizzle_fallback =
-        allow_unproven_swizzle_fallback && guest_width == 64 && count % 64 == 0;
-    let mut has_unproven_swizzle_read = false;
+    let can_group_read_fallback = allow_group_read_fallback && count % guest_width == 0;
+    let mut has_unproven_group_read = false;
     let mut dst_regs = Vec::with_capacity(read_sites.len());
     for &idx in &read_sites {
         let op = &insns[idx];
@@ -827,8 +831,8 @@ pub(super) fn lower_constant_reads(
                         op.offset
                     ));
                 }
-                None if can_swizzle_fallback => {
-                    has_unproven_swizzle_read = true;
+                None if can_group_read_fallback => {
+                    has_unproven_group_read = true;
                 }
                 None => {
                     return Err(format!(
@@ -847,6 +851,12 @@ pub(super) fn lower_constant_reads(
         dst_regs.push(dst);
     }
 
+    if has_unproven_group_read {
+        return Ok(ConstantReadPlan {
+            group_read_width: Some(guest_width),
+            ..ConstantReadPlan::default()
+        });
+    }
     let cfg = build_cfg(insns, first_off)?;
     let last_read = *read_sites.last().expect("non-empty");
     if let Some(early) = insns[..last_read].iter().find(|op| op.mnemonic == "s_endpgm") {
@@ -854,9 +864,6 @@ pub(super) fn lower_constant_reads(
             "v_readlane_b32 at {:#x}: follows early s_endpgm at {:#x}",
             insns[last_read].offset, early.offset
         ));
-    }
-    if has_unproven_swizzle_read {
-        return Ok(ConstantReadPlan::default());
     }
     let (uniformity, non_uniform_ctl) = analyze_uniformity(insns, &cfg);
     // Check that every enclosing loop (and any earlier loop that shares `tb_guard`)
@@ -887,7 +894,7 @@ pub(super) fn lower_constant_reads(
         }
     }
 
-    let exec_full = analyze_exec_full(insns, &cfg);
+    let exec_full = analyze_exec_full(insns, &cfg, guest_width == 64);
     let can_wave32_group = guest_width == 32 && count % 32 == 0 && group[1] == 1 && group[2] == 1;
     let mut plan = ConstantReadPlan::default();
     let mut modes = Vec::with_capacity(read_sites.len());

@@ -41,6 +41,13 @@ const fn readlane(dst: u8, vsrc: u8, lane: u32) -> [u32; 2] {
     ]
 }
 
+const fn readlane_sgpr(dst: u8, vsrc: u8, s_lane: u8) -> [u32; 2] {
+    [
+        0xd760_0000 | dst as u32,
+        ((s_lane as u32) << 9) | 256 | vsrc as u32,
+    ]
+}
+
 const fn writelane(vdst: u8, ssrc: u8, lane: u32) -> [u32; 2] {
     [
         0xd761_0000 | vdst as u32,
@@ -265,15 +272,81 @@ fn main() {
                 true,
             )
         }
+        "wave64_swizzle_branch_dyn_63" => {
+            // Wave64 [64, 1, 1] ds_swizzle_b32 + dynamic SGPR v_readlane_b32 inside a forward
+            // s_cbranch_execz skip branch where lane 63 skips the readlane.
+            // Active lanes 0..62 MUST receive lane 63's original pre-mask v1 (not 0).
+            let [r0, r1] = readlane_sgpr(7, 1, 5);
+            (
+                [64, 1, 1],
+                vec![
+                    0xbe87_0380,              // s_mov_b32 s7, 0
+                    0x7e08_02ff, 0x0000_003f, // v_mov_b32 v4, 63
+                    0x7e0a_0504,              // v_readfirstlane_b32 s5, v4 (unproven dynamic SGPR = 63)
+                    0x7e04_02bf,              // v_mov_b32 v2, 63
+                    0x7d82_0500,              // v_cmp_lt_u32 vcc, v0, v2 (lanes 0..62 active)
+                    0xbe88_246a,              // s_and_saveexec_b64 s[8:9], vcc
+                    0x7e02_02ff, 0xdead_0000, // v_mov_b32 v1, 0xdead0000 (lane 63 keeps input!)
+                    0xd8d4_041f, 0x0300_0001, // ds_swizzle_b32 v3, v1 offset:0x041f
+                    0xbf88_0002,              // s_cbranch_execz +2 (lane 63 skips readlane)
+                    r0, r1,                   // v_readlane_b32 s7, v1, s5 (reads skipped lane 63!)
+                    0xbefe_0408,              // s_mov_b64 exec, s[8:9]
+                    0xbf81_0000,
+                ],
+                "s7",
+                false,
+            )
+        }
+        "wave64_dyn_sgpr_high_bits_47" => {
+            // Standalone (no ds_swizzle) Wave64 [64, 1, 1] unproven dynamic SGPR v_readlane_b32
+            // where s5 = 0x102f (high bits above 63 set; RDNA2 masks s5 & 63 = 47).
+            let [r0, r1] = readlane_sgpr(7, 1, 5);
+            (
+                [64, 1, 1],
+                vec![
+                    0x7e08_02ff, 0x0000_102f, // v_mov_b32 v4, 0x102f
+                    0x7e0a_0504,              // v_readfirstlane_b32 s5, v4 (unproven dynamic SGPR)
+                    r0, r1,                   // v_readlane_b32 s7, v1, s5 (must mask & 63 -> lane 47)
+                    0xbf81_0000,
+                ],
+                "s7",
+                false,
+            )
+        }
+        "wave32_64t_dyn_sgpr_31" => {
+            // Standalone Wave32 [64, 1, 1] (two 32-lane waves) unproven dynamic SGPR v_readlane_b32
+            // where s5 = 0x201f (RDNA2 Wave32 masks s5 & 31 = 31: wave 0 -> thread 31, wave 1 -> thread 63).
+            let [r0, r1] = readlane_sgpr(7, 1, 5);
+            (
+                [64, 1, 1],
+                vec![
+                    0x7e08_02ff, 0x0000_201f, // v_mov_b32 v4, 0x201f
+                    0x7e0a_0504,              // v_readfirstlane_b32 s5, v4
+                    0x3604_009f,              // v_and_b32 v2, 31, v0
+                    0x7e06_029f,              // v_mov_b32 v3, 31
+                    0x7d82_0702,              // v_cmp_lt_u32 vcc, v2, v3
+                    0xbe84_3c6a,              // s_and_saveexec_b32 s4, vcc_lo (Wave32)
+                    0x7e02_02ff, 0xbad0_0000, // v_mov_b32 v1, 0xbad00000
+                    r0, r1,                   // v_readlane_b32 s7, v1, s5
+                    0xbefe_0304,              // s_mov_b32 exec_lo, s4
+                    0xbf81_0000,
+                ],
+                "s7",
+                false,
+            )
+        }
         other => panic!("unknown readlane probe case: {other}"),
     };
     let end_off = (words.len() - 1) * 4;
     let end_marker = format!("    // {end_off:#06x} s_endpgm");
     let tr = hlsl::translate(&shader(group, &words)).unwrap_or_else(|e| panic!("{case}: {e}"));
-    if expect_wave32 {
-        assert_eq!(tr.required_wave_size, Some(32), "{case} must use WaveSize(32)");
-    } else {
-        assert_eq!(tr.required_wave_size, None, "{case} must be portable (no WaveSize)");
+    let check_wave = std::env::args().nth(2).as_deref() != Some("--no-assert-wave");
+    if check_wave {
+        if expect_wave32 {
+            assert_eq!(tr.required_wave_size, Some(32), "{case} must use WaveSize(32)");
+        } else {
+            assert_eq!(tr.required_wave_size, None, "{case} must be portable (no WaveSize)");
+        }
     }
     print!("{}", instrument(&tr.hlsl, group[0], &end_marker, result_reg));
 }

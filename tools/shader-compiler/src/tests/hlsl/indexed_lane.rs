@@ -218,10 +218,10 @@ fn wave32_masked_exec_readlane_stages_through_groupshared_and_ignores_exec() {
     let ex = compute_shader([32, 1, 1], &words, None);
     let tr = crate::hlsl::translate(&ex).expect("masked wave32 readlane");
     assert_eq!(tr.required_wave_size, None);
-    assert!(tr.hlsl.contains("groupshared uint tb_swizzle[32];"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("#define TB_SWIZZLE_WORDS 32u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];"), "{}", tr.hlsl);
     assert!(tr.hlsl.contains("tb_swizzle[tb_lane] = v1;"), "{}", tr.hlsl);
     assert!(
-        tr.hlsl.contains("tb_swizzle[(tb_lane & ~31u) | (0x1fu & 31u)]"),
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~31u) | (0x1fu & 31u))"),
         "{}",
         tr.hlsl
     );
@@ -253,9 +253,9 @@ fn wave32_multiwave_group_uses_32_lane_stride_and_restored_exec_uses_native() {
     let tr = crate::hlsl::translate(&ex).expect("multi-wave wave32 readlane");
     assert_eq!(tr.required_wave_size, Some(32));
     assert!(tr.hlsl.contains("[WaveSize(32)]"), "{}", tr.hlsl);
-    assert!(tr.hlsl.contains("groupshared uint tb_swizzle[64];"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("#define TB_SWIZZLE_WORDS 64u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];"), "{}", tr.hlsl);
     assert!(
-        tr.hlsl.contains("tb_swizzle[(tb_lane & ~31u) | (0x1fu & 31u)]"),
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~31u) | (0x1fu & 31u))"),
         "{}",
         tr.hlsl
     );
@@ -280,13 +280,13 @@ fn portable_wave64_constant_reads_cross_wave32_boundary_without_wavesize64() {
         assert_eq!(tr.required_wave_size, None);
         assert!(!tr.hlsl.contains("[WaveSize(64)]"), "{}", tr.hlsl);
         assert!(
-            tr.hlsl.contains(&format!("groupshared uint tb_swizzle[{}];", group[0])),
+            tr.hlsl.contains(&format!("#define TB_SWIZZLE_WORDS {}u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];", group[0])),
             "{}",
             tr.hlsl
         );
-        assert!(tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x1fu & 63u)]"), "{}", tr.hlsl);
-        assert!(tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x2fu & 63u)]"), "{}", tr.hlsl);
-        assert!(tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x3fu & 63u)]"), "{}", tr.hlsl);
+        assert!(tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x1fu & 63u))"), "{}", tr.hlsl);
+        assert!(tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x2fu & 63u))"), "{}", tr.hlsl);
+        assert!(tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x3fu & 63u))"), "{}", tr.hlsl);
     }
 }
 
@@ -312,7 +312,7 @@ fn constant_readlane_coexists_with_sgpr_spills_and_uniform_loops() {
     let ex = compute_shader([64, 1, 1], &words, None);
     let tr = crate::hlsl::translate(&ex).expect("spill + uniform loop + readlane");
     assert!(tr.hlsl.contains("tb_s10000"), "{}", tr.hlsl);
-    assert!(tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x1fu & 63u)]"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x1fu & 63u))"), "{}", tr.hlsl);
 }
 
 #[test]
@@ -341,13 +341,21 @@ fn refuses_out_of_range_unproven_dynamic_and_non_uniform_loop_readlanes() {
     .expect("lane 32 in wave32 shader must be refused");
     assert!(err.contains("conflicting wave32 and wave64"), "{err}");
 
-    // 4. Unproven dynamic SGPR lane selector in both 32- and 64-thread groups.
+    // 4. Unproven dynamic SGPR lane selector on partial / non-wave-multiple groups
+    //    must stay refused, while complete-wave groups fall back to masked GROUP_READ.
     let [dyn0, dyn1] = readlane_sgpr(7, 1, 5);
-    for group in [[32, 1, 1], [64, 1, 1]] {
-        let err = crate::hlsl::translate(&compute_shader(group, &[dyn0, dyn1, 0xbf81_0000], None))
+    for (group, words) in [
+        ([7, 3, 1], vec![dyn0, dyn1, 0xbf81_0000]),
+        ([32, 1, 1], vec![0xbefe_04c1, dyn0, dyn1, 0xbf81_0000]),
+        ([96, 1, 1], vec![dyn0, dyn1, 0xbf81_0000]),
+    ] {
+        let err = crate::hlsl::translate(&compute_shader(group, &words, None))
             .err()
-            .expect("unproven dynamic SGPR selector must be refused");
-        assert!(err.contains("upper-bound proof"), "{err}");
+            .expect("unproven dynamic SGPR selector on partial wave must be refused");
+        assert!(
+            err.contains("upper-bound proof") || err.contains("multiple of 64"),
+            "{group:?}: {err}"
+        );
     }
 
     // 5. Dynamic SGPR selector masked above limit (`s5 & 63` in 32-thread group).
@@ -610,7 +618,7 @@ fn f4_detects_all_exec_width_ops_and_checks_conflicts_on_small_groups() {
     let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &conclusive_wave32, None))
         .expect("conclusive wave32 readlane");
     assert!(
-        tr.hlsl.contains("tb_swizzle[(tb_lane & ~31u) | (0x1fu & 31u)]"),
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~31u) | (0x1fu & 31u))"),
         "{}",
         tr.hlsl
     );
@@ -677,9 +685,9 @@ fn f6_hoisted_indexed_read_guards_load_against_oob_on_partial_groups() {
     ];
     let tr = crate::hlsl::translate(&compute_shader([7, 3, 1], &words, None))
         .expect("partial group guarded hoisted readlane");
-    assert!(tr.hlsl.contains("groupshared uint tb_swizzle[21];"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("#define TB_SWIZZLE_WORDS 21u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];"), "{}", tr.hlsl);
     assert!(
-        tr.hlsl.contains("(!j5) ? tb_swizzle[(tb_lane & ~31u) | (s24 & 31u)] : 0u;"),
+        tr.hlsl.contains("(!j5) ? tb_swizzle_read((tb_lane & ~31u) | (s24 & 31u)) : 0u;"),
         "{}",
         tr.hlsl
     );
@@ -714,7 +722,7 @@ fn wave64_exec_lo_b32_inspect_keeps_wave64_and_ambiguous_b32_exec_refuses() {
         .expect("wave64 reading exec_lo and exec_hi via s_mov_b32 must keep wave64");
     assert_eq!(tr.required_wave_size, None);
     assert!(
-        tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x1fu & 63u)]"),
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x1fu & 63u))"),
         "{}",
         tr.hlsl
     );
@@ -731,7 +739,7 @@ fn wave64_exec_lo_b32_inspect_keeps_wave64_and_ambiguous_b32_exec_refuses() {
         .expect("wave64 s_and_b32 reading exec_lo must keep wave64");
     assert_eq!(tr.required_wave_size, None);
     assert!(
-        tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x1fu & 63u)]"),
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x1fu & 63u))"),
         "{}",
         tr.hlsl
     );
@@ -772,7 +780,7 @@ fn unproven_swizzle_fallback_refuses_partial_groups_and_preserves_skipped_lanes(
     }
 
     // 2. Wave32 [64, 1, 1] shader with ds_swizzle_b32 + non-exec s_mov_b64 + unproven selector
-    // MUST refuse instead of falling back to 64-lane GROUP_READ.
+    // falls back to Wave32-masked GROUP_READ (~31u / & 31u), NEVER hardcoded 64-lane base (~63u).
     let wave32_swizzle_unproven = [
         0xbe84_3c6a,             // s_and_saveexec_b32 s4, vcc_lo (Wave32)
         0xbe8a_040c,             // s_mov_b64 s[10:11], s[12:13]
@@ -781,10 +789,35 @@ fn unproven_swizzle_fallback_refuses_partial_groups_and_preserves_skipped_lanes(
         0xbefe_0304,             // s_mov_b32 exec_lo, s4
         0xbf81_0000,
     ];
-    let err = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave32_swizzle_unproven, None))
-        .err()
-        .expect("wave32 swizzle shader must not fall back to 64-lane GROUP_READ");
-    assert!(err.contains("upper-bound proof"), "{err}");
+    let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &wave32_swizzle_unproven, None))
+        .expect("wave32 complete-wave unproven selector falls back to 32-lane GROUP_READ");
+    assert!(
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~31u) | (s5 & 31u))"),
+        "{}",
+        tr.hlsl
+    );
+    assert!(!tr.hlsl.contains("~63u"), "{}", tr.hlsl);
+
+    // 2b. Standalone (no ds_swizzle_b32) unproven dynamic SGPR v_readlane_b32 on complete
+    // wave groups ([32,1,1] Wave32, [64,1,1] Wave32, [64,1,1] Wave64) falls back cleanly
+    // with exact wave-width masking and unconditional staging.
+    let tr_w32_32 = crate::hlsl::translate(&compute_shader([32, 1, 1], &[dyn0, dyn1, 0xbf81_0000], None))
+        .expect("standalone [32,1,1] unproven dynamic SGPR falls back to 32-lane GROUP_READ");
+    assert!(tr_w32_32.hlsl.contains("tb_swizzle_read((tb_lane & ~31u) | (s5 & 31u))"), "{}", tr_w32_32.hlsl);
+    assert!(!tr_w32_32.hlsl.contains("~63u"), "{}", tr_w32_32.hlsl);
+
+    let tr_w64_64 = crate::hlsl::translate(&compute_shader([64, 1, 1], &[dyn0, dyn1, 0xbf81_0000], None))
+        .expect("standalone [64,1,1] unproven dynamic SGPR falls back to 64-lane GROUP_READ");
+    assert!(tr_w64_64.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (s5 & 63u))"), "{}", tr_w64_64.hlsl);
+
+    let tr_w32_64 = crate::hlsl::translate(&compute_shader(
+        [64, 1, 1],
+        &[0xbe84_3c6a, dyn0, dyn1, 0xbefe_0304, 0xbf81_0000],
+        None,
+    ))
+    .expect("standalone wave32 [64,1,1] unproven dynamic SGPR falls back to 32-lane GROUP_READ");
+    assert!(tr_w32_64.hlsl.contains("tb_swizzle_read((tb_lane & ~31u) | (s5 & 31u))"), "{}", tr_w32_64.hlsl);
+    assert!(!tr_w32_64.hlsl.contains("~63u"), "{}", tr_w32_64.hlsl);
 
     // 3. Valid [64, 1, 1] Wave64 ds_swizzle_b32 + GROUP_READ inside a conditional skip branch
     // MUST publish each lane's actual VGPR unconditionally (preserving skipped lanes' values),
@@ -802,10 +835,10 @@ fn unproven_swizzle_fallback_refuses_partial_groups_and_preserves_skipped_lanes(
     ];
     let tr = crate::hlsl::translate(&compute_shader([64, 1, 1], &swizzle_branch_read, None))
         .expect("wave64 64-lane swizzle GROUP_READ inside forward branch");
-    assert!(tr.hlsl.contains("groupshared uint tb_swizzle[64];"), "{}", tr.hlsl);
+    assert!(tr.hlsl.contains("#define TB_SWIZZLE_WORDS 64u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];"), "{}", tr.hlsl);
     assert!(tr.hlsl.contains("tb_swizzle[tb_lane] = v1;"), "{}", tr.hlsl);
     assert!(
-        tr.hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (s5 & 63u)] : 0u;"),
+        tr.hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (s5 & 63u)) : 0u;"),
         "{}",
         tr.hlsl
     );
@@ -863,10 +896,11 @@ fn refused_readlane_is_not_swallowed_by_lone_lane_retry() {
         "out of range",
     );
 
-    // 2. Unproven dynamic SGPR selector on [64, 1, 1] (`lone_lane::prepare` accepts `Sgpr(_)`).
+    // 2. Unproven dynamic SGPR selector on Wave64 [32, 1, 1] (`count % 64 != 0`, so GROUP_READ
+    //    fallback is unsafe and `lower_constant_reads` refuses it; `lone_lane::retry` must not swallow it).
     let [dyn0, dyn1] = readlane_sgpr(7, 1, 5);
     assert_refused_despite_lone_lane(
-        [64, 1, 1],
+        [32, 1, 1],
         &[
             ELECT_ATOMIC[0], ELECT_ATOMIC[1], ELECT_ATOMIC[2], ELECT_ATOMIC[3],
             0xbefe_04c1, // s_mov_b64 exec, -1
@@ -927,4 +961,30 @@ fn smem_loads_are_not_treated_as_workgroup_uniform_for_readlane_loops() {
             .unwrap_or_else(|| panic!("{label}-conditioned loop must be refused as non-uniform"));
         assert!(err.contains("non-uniform loop"), "{label}: {err}");
     }
+}
+
+#[test]
+fn non_readlane_failure_still_allows_lone_lane_retry_when_readlane_present() {
+    // Election + atomic shader using `s_ff1_i32_b64 exec_lo` (whose primary path fails in
+    // `mark_wave_allocations`, NOT in `indexed_lane::lower_constant_reads`) AND containing a
+    // non-spill `v_readlane_b32 s7, v1, 0`. Disabling the blanket `has_non_spill_readlane`
+    // early return lets `lone_lane::retry` rescue this shader just like on `main`.
+    let [r0, r1] = readlane_const(7, 1, 0);
+    let words = [
+        0xbe88_147e,              // s_ff1_i32_b64 s8, exec_lo (fails verify_lane_election on primary)
+        0x7da4_0008,              // v_cmpx_eq_u32 exec, s8, v0
+        0xd800_0000, 0x0000_0403, // ds_add_u32 v3, v4
+        0xbefe_04c1,              // s_mov_b64 exec, -1
+        r0, r1,                   // v_readlane_b32 s7, v1, 0
+        0xbf81_0000,
+    ];
+    let ex = compute_shader([64, 1, 1], &words, None);
+    let primary = crate::hlsl::translate_outputs_once(&ex, None, &[], None);
+    assert!(
+        primary.is_err(),
+        "primary path must fail on unverified election before lower_constant_reads"
+    );
+    let tr = crate::hlsl::translate(&ex)
+        .expect("non-readlane primary failure must still fall back to lone_lane::retry");
+    assert!(!tr.hlsl.contains("Wave"), "{}", tr.hlsl);
 }

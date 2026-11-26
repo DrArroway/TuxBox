@@ -39,19 +39,21 @@ impl<'a> Emitter<'a> {
             if self.dispatched || !self.compute_swizzle {
                 return Err("group lane read requires structured compute swizzle lowering".into());
             }
+            let mask = if ins.aux.imm == 31 { 31u32 } else { 63u32 };
+            let width = mask + 1;
             let count = compute_group(self.ex)
                 .into_iter()
                 .try_fold(1u32, u32::checked_mul)
                 .unwrap_or(0);
-            if count == 0 || count > 1024 || count % 64 != 0 {
-                return Err("group lane read requires complete blocks of 64 lanes".into());
+            if count == 0 || count > 1024 || count % width != 0 {
+                return Err(format!("group lane read requires complete blocks of {width} lanes"));
             }
             // READLANE ignores EXEC. Publish each lane's actual VGPR even when
             // that lane skipped the guest branch, then guard only the load on
-            // active skip flags and mask the selector to 0..63.
+            // active skip flags and mask the selector to 0..width-1.
             self.line(&format!("tb_swizzle[tb_lane] = {};", r(&ins.src[0])?));
             self.line("GroupMemoryBarrierWithGroupSync();");
-            let load = format!("tb_swizzle_read((tb_lane & ~63u) | ({} & 63u))", r(&ins.src[1])?);
+            let load = format!("tb_swizzle_read((tb_lane & ~{mask}u) | ({} & {mask}u))", r(&ins.src[1])?);
             if active.is_empty() {
                 self.line(&format!("uint swizzle{idx} = {load};"));
             } else {

@@ -322,6 +322,16 @@ pub(super) fn refused_for_heap_strides(shader: &[u8], root: &[u8]) -> bool {
     compile::refusal_reason(&key).is_some_and(|reason| reason.contains("IDXEN needs the console descriptor stride"))
 }
 
+/// A retry with the stride table translated `shader`, so the attempts without
+/// it, on `root` and root-less, are not unsupported shaders.
+pub(super) fn superseded(shader: &[u8], root: &[u8]) {
+    for attempt in [with_root(shader, root).as_deref(), Some(shader)].into_iter().flatten() {
+        if let Some(key) = source_digest(attempt) {
+            crate::progress::supersede(&key);
+        }
+    }
+}
+
 /// The original table layout has already been verified. A program whose
 /// embedded root is the pipeline root needs the ordinary prepared translation;
 /// any other program must use the actual pipeline root (never silently fall

@@ -73,7 +73,25 @@ fn missing_literal_samplers(shader: &[u8], stage: u32, existing: &[[u32; 13]]) -
     if private.iter().all(covered) { Vec::new() } else { private }
 }
 
-fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
+/// Private static samplers for each literal state no static sampler of the root
+/// visible to the stage has (`inline_sampler::unmatched`). They take registers
+/// after every sampler register the root uses: the translator names a sampler by
+/// its register, so `missing_literal_samplers`' registers from 0 can overlap the
+/// root's own in another space. That also covers a root that indexes the heap
+/// (flag 0x800) and a program `inline_sampler::private` cannot vouch for.
+/// `missing_literal_samplers` remains for the rest.
+fn literal_samplers(shader: &[u8], stage: u32, signature: &tuxbox_dxbc::rootsig::RootSig) -> Vec<[u32; 13]> {
+    if let Some(unmatched) = tuxbox_dxbc::inline_sampler::unmatched(shader, stage, signature) {
+        return unmatched;
+    }
+    if signature.flags & 0x800 == 0 {
+        missing_literal_samplers(shader, stage, &signature.static_samplers)
+    } else {
+        Vec::new()
+    }
+}
+
+pub(super) fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
     D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER(s[0] as i32),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),
@@ -97,10 +115,7 @@ pub(super) fn sampler_root(
     node: u32,
 ) -> Result<Option<(ID3D12RootSignature, RootSource)>> {
     let Ok(signature) = parse_rts0(original.payload()) else { return Ok(None) };
-    if signature.flags & 0x800 != 0 {
-        return Ok(None);
-    }
-    let recovered = missing_literal_samplers(shader, 5, &signature.static_samplers);
+    let recovered = literal_samplers(shader, 5, &signature);
     if recovered.is_empty() {
         return Ok(None);
     }
@@ -169,7 +184,21 @@ fn reflected_root(
     // The user-data layout confirmed every compute binding against this root.
     let mut verified_compute = false;
     let mut recovered_samplers = Vec::new();
+    // The index map's root SRV is read by every stage of a compute root, only by
+    // the pixel stage of a raster one.
+    let mut index_map_visibility = D3D12_SHADER_VISIBILITY_PIXEL;
     let bindings = match (&program, signature.params.as_slice()) {
+        // A bindless root: no tables, only constants and root descriptors, with
+        // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED. The program picks descriptors by heap
+        // index, so it needs no table layout, only the guest-to-host index map
+        // once descriptors are paged.
+        (Program::Compute(shader), _) if bindless_compute_root(&signature) => {
+            // Compute never reads the scalar word; it only marks the map.
+            scalar_index = Some((0, 0));
+            index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            recovered_samplers = literal_samplers(shader, 5, &signature);
+            Some(Vec::new())
+        }
         (Program::Compute(shader), params) => {
             let tables = match params {
                 [tables @ .., last] if matches!(last.kind, RootParamKind::Constants { num32: 1..=4, .. }) => tables,
@@ -187,8 +216,8 @@ fn reflected_root(
             }
             if signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
                 recovered_samplers = tuxbox_dxbc::inline_sampler::private(shader, 5).unwrap_or_default();
-            } else if signature.flags & 0x800 == 0 {
-                recovered_samplers = missing_literal_samplers(shader, 5, &signature.static_samplers);
+            } else {
+                recovered_samplers = literal_samplers(shader, 5, &signature);
             }
             let checked = tuxbox_dxbc::compute_table::compute_root_bindings(&layout_view(shader), &signature).map(
                 |(bindings, constants)| {
@@ -225,7 +254,11 @@ fn reflected_root(
             corroborated_raster = true;
             // A static sampler the title compiled into the pixel shader and left out
             // of this root. The translation reads the root built here, so it finds it.
-            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature).unwrap_or_default();
+            // Otherwise (a heap-indexing program, or a state the root names another
+            // way), each literal state the root lacks takes a private register.
+            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature)
+                .or_else(|| tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature))
+                .unwrap_or_default();
             Some(bindings)
         }
         (Program::Raster { vertex, pixel }, [table, rest @ ..])
@@ -265,8 +298,8 @@ fn reflected_root(
                     .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
                     .unwrap_or_default();
             }
-            else if !signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
-                recovered_samplers = missing_literal_samplers(pixel, 0, &signature.static_samplers);
+            else if !signature.static_samplers.is_empty() {
+                recovered_samplers = literal_samplers(pixel, 0, &signature);
             }
             for b in pixel_bindings {
                 if let Some(existing) = bindings.iter().find(|r| r.slot == b.slot) {
@@ -360,11 +393,18 @@ fn reflected_root(
         let reader = reader.ok_or(E_POINTER)?;
         let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
         let source = desc.Anonymous.Desc_1_1;
-        if source.NumParameters as usize != signature.params.len() || source.pParameters.is_null() {
+        if source.NumParameters as usize != signature.params.len()
+            || (source.NumParameters != 0 && source.pParameters.is_null())
+        {
             return Err(E_INVALIDARG.into());
         }
-        let mut parameters =
-            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec();
+        // Zero-parameter direct-indexed roots are legal and can have a null
+        // parameter pointer. Avoid forming a Rust slice from that pointer.
+        let mut parameters = if source.NumParameters == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec()
+        };
         let mut range_storage = vec![Vec::new(); tables];
         for (index, ranges) in range_storage.iter_mut().enumerate().filter(|(i, _)| rewrite[*i]) {
             let parameter = &mut parameters[index];
@@ -420,7 +460,7 @@ fn reflected_root(
             // after this draw has been recorded.
             parameters.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ShaderVisibility: index_map_visibility,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: 0,
@@ -448,8 +488,9 @@ fn reflected_root(
             desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
         }
         let samplers: Vec<_> = recovered_samplers.into_iter().map(static_sampler).collect();
-        // Recovered samplers join the root's own: `omitted` gives them registers the
-        // root does not use, and the other recoveries apply only to a root with none.
+        // Recovered samplers join the root's own: `omitted` and `unmatched` give them
+        // registers the root does not use, `missing_literal_samplers` the private
+        // space, and the other recoveries apply only to a root with none.
         let samplers: Vec<_> = if samplers.is_empty() || source.NumStaticSamplers == 0 {
             samplers
         } else {
@@ -481,6 +522,19 @@ fn reflected_root(
             heap_strides,
         })))
     }
+}
+
+/// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no descriptor tables: only root
+/// constants and root descriptors, every resource picked by heap index. The
+/// root also needs room for the index map's root SRV, two of its 64 DWORDs; a
+/// fuller root stays the guest's rather than failing to serialize.
+fn bindless_compute_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
+    let cost = signature.params.iter().try_fold(0u32, |cost, p| match p.kind {
+        RootParamKind::Constants { num32, .. } => Some(cost.saturating_add(num32)),
+        RootParamKind::Descriptor { .. } => Some(cost.saturating_add(2)),
+        _ => None,
+    });
+    signature.flags & 0x400 != 0 && cost.is_some_and(|cost| cost <= 62)
 }
 
 /// Keep every embedded range and append FSSM slots the root left out.
@@ -523,7 +577,15 @@ fn append_corroborated_ranges(
         for (index, param) in signature.params.iter().enumerate() {
             let RootParamKind::Table(declared) = &param.kind else { continue };
             let additions: Vec<_> = extra.iter().filter(|binding| binding.table as usize == index).collect();
+            // Root replacement invalidates arguments in every table, not
+            // just the one receiving a range. Paging must reserve the
+            // original tables' resident spans as well.
+            let Some((mut extent, mut views)) = finite_table(declared) else {
+                return Ok(TableLayout::Unsupported);
+            };
             if additions.is_empty() {
+                lengths[index] = extent;
+                accessed_views.extend(views.into_iter().map(|range| (index, range)));
                 continue;
             }
             let table = parameters[index].Anonymous.DescriptorTable;
@@ -556,7 +618,7 @@ fn append_corroborated_ranges(
                 NumDescriptorRanges: stored[index].len() as u32,
                 pDescriptorRanges: stored[index].as_ptr(),
             };
-            let Some((mut extent, mut views)) = finite_table(declared) else { continue };
+
             for binding in &additions {
                 extent = extent.max(binding.slot.saturating_add(1));
                 if binding.kind < 2 {
@@ -633,3 +695,7 @@ pub(super) fn capture_stage_root(stage: &[u8], root: &RootSource) {
         write(directory.join(format!("{shader}.dxbc")), stage);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/device/compute_table.rs"]
+mod tests;

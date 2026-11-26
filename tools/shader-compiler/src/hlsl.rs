@@ -344,6 +344,7 @@ struct Emitter<'a> {
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
     indexed_lane: bool,
+    indexed_lane_wave32: bool,
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,
     resolve_wave32: bool,

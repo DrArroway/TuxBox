@@ -120,6 +120,7 @@ impl<'a> Emitter<'a> {
             reflected_lds_words: None,
             hoisted_swizzle: None,
             indexed_lane: false,
+            indexed_lane_wave32: false,
             single_wave32: false,
             resolve_wave32: false,
             paired: false,

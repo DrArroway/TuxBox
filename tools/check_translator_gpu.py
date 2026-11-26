@@ -47,6 +47,7 @@ CHECKS = {
     "sad-mad64": assembled("check_sad_mad64_gpu"),
     "f64": assembled("check_f64_exact_gpu"),
     "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
+    "readlane": Check("check_readlane_gpu", emitter="readlane_probe", dxc=True),
     **{f"wave-extrema-{width}": Check("check_wave_extrema", emitter="wave_extrema", dxc=True,
                                       extra=("--width", str(width)))
        for width in (32, 64)},

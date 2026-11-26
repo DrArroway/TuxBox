@@ -62,8 +62,20 @@ impl<'a> Emitter<'a> {
             }
             "tb_first_exec_lane" => return self.ws(&d.ok_or("missing election result")?, &format!("election{idx}")),
             "tb_indexed_readlane" => {
-                if self.hoisted_swizzle != Some(idx) { self.emit_indexed_read(idx, ins)?; }
+                if self.hoisted_swizzle != Some(idx) { self.emit_indexed_read(idx, ins, &[])?; }
                 self.ws(&d.ok_or("missing lane-read destination")?, &format!("readlane{idx}"))?;
+                return Ok(());
+            }
+            indexed_lane::WAVE32_READ_LANE => {
+                if self.dispatched {
+                    return Err("wave32 lane read in a block-dispatched program".into());
+                }
+                let value = r(&s[0])?;
+                let lane = match s[1] {
+                    Opnd::ConstInt(k @ 0..=31) => format!("{k}u"),
+                    _ => format!("({} & 31u)", r(&s[1])?),
+                };
+                self.ws(&d.ok_or("missing lane-read destination")?, &format!("WaveReadLaneAt({value}, {lane})"))?;
                 return Ok(());
             }
             "tb_view_occluded" => {

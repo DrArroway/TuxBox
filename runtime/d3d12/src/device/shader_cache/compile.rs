@@ -247,26 +247,58 @@ fn request(
     }
     // The title is now waiting on the host worker; the progress panel counts it.
     let _waiting = progress::waiting();
-    let start = Instant::now();
-    loop {
+    let reply = await_reply(Duration::from_secs(90), std::thread::sleep, || {
         if let Some(bytes) = read_portable_file(&result, stage) {
+            return Some(Some(bytes));
+        }
+        failed.exists().then_some(None)
+    });
+    match reply {
+        Some(Some(bytes)) => {
             REPLIES.of(dir).insert(name);
             progress::record(key, Shader::Translated);
-            return Some(bytes);
+            Some(bytes)
         }
-        if failed.exists() {
+        Some(None) => {
             // The host records a refusal in its cache before it reports the failure.
             if let Some(cache) = compiler_cache(dir) {
                 CACHED.of(cache).insert(format!("{key}.unsupported"));
             }
             progress::record(key, Shader::Unsupported);
-            return None;
+            None
         }
-        if start.elapsed() >= Duration::from_secs(90) {
+        None => {
             progress::record(key, Shader::TimedOut);
+            None
+        }
+    }
+}
+
+/// The longest pause between two looks for the host's reply.
+const SLOWEST_LOOK: Duration = Duration::from_millis(25);
+
+/// Look for the host's reply until it arrives or `limit` passes.
+///
+/// The host answers a shader it has compiled before in a few milliseconds, and
+/// a title that creates its shaders one at a time waits for each answer. A fixed
+/// 25 ms pause therefore held such a title at about 40 shaders a second. The
+/// pauses start at 1 ms and double, so a long compile still settles at 25 ms.
+fn await_reply<T>(
+    limit: Duration,
+    mut pause: impl FnMut(Duration),
+    mut look: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let start = Instant::now();
+    let mut next = Duration::from_millis(1);
+    loop {
+        if let Some(reply) = look() {
+            return Some(reply);
+        }
+        if start.elapsed() >= limit {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        pause(next);
+        next = (next * 2).min(SLOWEST_LOOK);
     }
 }
 

@@ -63,7 +63,7 @@ compiler. The runtime reports an actual compiler load failure separately
 from other pipeline errors. This is not a confirmed fix for the black-screen
 report in #39.
 
-Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`.
+Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`. With it, the launcher also adds `force_raw_va_cbv` to `VKD3D_CONFIG`, so constant buffers bound by address are read from the guest's 16-byte offsets.
 
 ## Launch
 

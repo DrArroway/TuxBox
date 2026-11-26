@@ -332,7 +332,7 @@ class ConsoleConstantBuffers(unittest.TestCase):
             self.assertEqual(env["VK_ADD_LAYER_PATH"], "/user/extra")
             self.assertEqual(env["VK_INSTANCE_LAYERS"], "VK_LAYER_TUXBOX_console_cbv:overlay")
             self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;second")
-            self.assertEqual(env["VKD3D_CONFIG"], "force_static_cbv")
+            self.assertEqual(env["VKD3D_CONFIG"], "force_raw_va_cbv,force_static_cbv")
             self.assertEqual(env["PRESSURE_VESSEL_FILESYSTEMS_RO"], layer + ":/user/mount")
             before = env.copy()
             configure_console_cbv("proton", env, self.exe, self.log.status)
@@ -352,13 +352,14 @@ class ConsoleConstantBuffers(unittest.TestCase):
                "VKD3D_CONFIG": "other"}
         with patch("project_tuxbox.console_cbv.console_cbv_layer", return_value=self.layer) as layer:
             configure_console_cbv("proton", env, self.exe, self.log.status)
-            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,other")
+            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,force_raw_va_cbv,other")
             self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;VK_EXT_descriptor_buffer;VK_EXT_descriptor_heap")
             layer.assert_not_called()
             wine = {"PROTONPATH": str(self.root)}
             configure_console_cbv("wine", wine, self.exe, self.log.status)
             self.assertEqual(wine["VK_ADD_LAYER_PATH"], self.layer)
-            self.assertNotIn("VKD3D_CONFIG", wine)
+            # Without the raw address, NVIDIA rounds a root CBV down to 64 bytes.
+            self.assertEqual(wine["VKD3D_CONFIG"], "force_raw_va_cbv")
             self.assertNotIn("VKD3D_DISABLE_EXTENSIONS", wine)
             fork = {"PROTONPATH": str(self.root)}
             configure_console_cbv("proton", fork, self.exe, self.log.status)

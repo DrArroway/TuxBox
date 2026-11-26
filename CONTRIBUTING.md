@@ -32,7 +32,7 @@ It runs the code checks below, builds every provider and guest, and then runs La
 | Shader cache | A console shader loaded from a cache prepared before launch, translated while running, then reused without compiling again |
 | [Benchmark](examples/lanes/README.md#benchmark) | Submission, fence handover, copy and pipeline timings. Add `--baseline` with an earlier result to compare. |
 
-On Linux it also runs the [D3D12 regression controls](tools/check_d3d12_regressions.py), which cover buffer imports, page remapping, descriptor tables and other provider behaviour in isolated copies of the prefix. They need `--proton`, `--prefix`, `--windows-dxc` pointing at Microsoft's x64 `dxcompiler.dll` and `dxil.dll`, plus Bubblewrap and `xvfb-run`:
+On Linux it also runs the [D3D12 regression controls](tools/check_d3d12_regressions.py), which cover buffer imports, page remapping, descriptor tables and other provider behaviour in isolated copies of the prefix. They need `--proton`, `--prefix`, `--windows-dxc` pointing at Microsoft's x64 `dxcompiler.dll` and `dxil.dll`, plus Bubblewrap and `xvfb-run`. The `root-cbv-offsets` control runs with the launcher's [constant-buffer settings](docs/PROJECTSCARLETT.md), so it also needs a C compiler and the Vulkan headers:
 
 ```sh
 python tuxbox.py check --proton PROTON --prefix PREFIX --windows-dxc DXC/bin/x64

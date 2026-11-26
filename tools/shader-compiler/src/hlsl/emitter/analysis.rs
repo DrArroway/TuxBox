@@ -506,7 +506,8 @@ impl<'a> Emitter<'a> {
             let old_dst = ((setreg && modeled_hwreg_mask(ins.raw[0]) != 0)
                 || matches!(ins.mnemonic.as_str(), "v_pk_fmac_f16" | "v_fma_f16" | "v_rcp_f16")
                 || ((half_round_or_conversion(&ins.mnemonic) || ins.mnemonic == "v_cvt_f16_f32") && keep_other_bits)
-                || int16::new_half(ins))
+                || int16::new_half(ins)
+                || half_exact::keeps_high_half(&ins.mnemonic))
                 .then(|| ins.dst.first()).flatten();
             for o in ins.src.iter().chain(old_dst) {
                 if let Opnd::Sgpr(n) | Opnd::Vgpr(n) = o {

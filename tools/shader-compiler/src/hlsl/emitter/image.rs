@@ -494,14 +494,20 @@ impl<'a> Emitter<'a> {
             if cmp { format!("scmp{s}") } else { format!("samp{s}") }
         } else { return Err("missing sampler binding".into()); };
         let zero_off = if noff == 1 { "0".to_string() } else { format!("int{}({})", noff.max(1), vec!["0"; noff.max(1)].join(", ")) };
-        // Optional trailing ", offset[, clamp]" arguments.
-        let tail = |offset: &Option<String>, clamp: &Option<String>| -> Result<String, String> {
+        // Optional trailing ", offset[, clamp]" arguments. Cube images have no
+        // texel offset, so a clamp is emitted directly instead; plain and bias
+        // sampling take a trailing clamp, but a derivative-based sample has no
+        // matching TextureCube overload.
+        let tail = |call: &str, offset: &Option<String>, clamp: &Option<String>| -> Result<String, String> {
             Ok(match (offset, clamp) {
                 (None, None) => String::new(),
                 (Some(o), None) => format!(", {o}"),
                 (o, Some(c)) => {
                     if noff == 0 {
-                        return Err("LOD clamp on a cube image unsupported".into());
+                        if call == "SampleGrad" {
+                            return Err("LOD clamp on a cube image unsupported".into());
+                        }
+                        return Ok(format!(", {c}"));
                     }
                     format!(", {}, {c}", o.clone().unwrap_or_else(|| zero_off.clone()))
                 }
@@ -656,24 +662,24 @@ impl<'a> Emitter<'a> {
         let call = if let Some(z) = &zref {
             // Depth-compare sampling returns a single value.
             match modi {
-                0 if in_loop => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
-                0 => format!("{tex}.SampleCmp({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
-                4 if !a16 && self.immediate_zero_before(idx, addr_reg(base + ncoord)) => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
-                7 => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
+                0 if in_loop => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail("SampleCmp", &offset, &None)?),
+                0 => format!("{tex}.SampleCmp({smp}, {cvec}, {z}{})", tail("SampleCmp", &offset, &None)?),
+                4 if !a16 && self.immediate_zero_before(idx, addr_reg(base + ncoord)) => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail("SampleCmp", &offset, &None)?),
+                7 => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail("SampleCmp", &offset, &None)?),
                 _ => return Err("depth-compare sample with explicit LOD/bias/gradient unsupported in SM5".into()),
             }
         } else {
             match modi {
-                0 | 1 if in_loop => format!("{tex}.SampleLevel({smp}, {cvec}, 0.0{})", tail(&offset, &None)?),
-                5 | 6 if in_loop => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail(&offset, &None)?),
-                0 | 1 => format!("{tex}.Sample({smp}, {cvec}{})", tail(&offset, &clamp)?),
+                0 | 1 if in_loop => format!("{tex}.SampleLevel({smp}, {cvec}, 0.0{})", tail("SampleCmp", &offset, &None)?),
+                5 | 6 if in_loop => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail("SampleCmp", &offset, &None)?),
+                0 | 1 => format!("{tex}.Sample({smp}, {cvec}{})", tail("Sample", &offset, &clamp)?),
                 2 | 3 => {
                     let (dx, dy) = grads.clone().ok_or("missing gradients")?;
-                    format!("{tex}.SampleGrad({smp}, {cvec}, {dx}, {dy}{})", tail(&offset, &clamp)?)
+                    format!("{tex}.SampleGrad({smp}, {cvec}, {dx}, {dy}{})", tail("SampleGrad", &offset, &clamp)?)
                 }
-                4 => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", lod.clone().ok_or("missing lod")?, tail(&offset, &None)?),
-                5 | 6 => format!("{tex}.SampleBias({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail(&offset, &clamp)?),
-                _ => format!("{tex}.SampleLevel({smp}, {cvec}, 0.0{})", tail(&offset, &None)?),
+                4 => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", lod.clone().ok_or("missing lod")?, tail("SampleCmp", &offset, &None)?),
+                5 | 6 => format!("{tex}.SampleBias({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail("SampleBias", &offset, &clamp)?),
+                _ => format!("{tex}.SampleLevel({smp}, {cvec}, 0.0{})", tail("SampleCmp", &offset, &None)?),
             }
         };
         if !in_loop && matches!(modi, 0 | 1 | 5 | 6) {

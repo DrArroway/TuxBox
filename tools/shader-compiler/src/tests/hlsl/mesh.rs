@@ -61,22 +61,24 @@ fn class5_descriptor_load_uses_the_guest_heap_index() {
 
 /// One register holds both output counts, so the compiler checks it once and
 /// combines each mask with itself. Assembled with llvm-mc for wave64.
+const ONE_COUNT: [u32; 70] = [
+    0x7e3c0280, 0xbf068014, 0x8580807e, 0xb5940080, 0x8582807e, 0x88800000,
+    0x88820202, 0x88800002, 0xd5010001, 0x00010280, 0x7e000501, 0x87000081,
+    0xbf068100, 0xbe80047e, 0x8582807e, 0xd5010001, 0x00090214, 0x8984c102,
+    0x7e0c0501, 0x7da40080, 0xbf88000d, 0x8f078c06, 0x8aea027e, 0x88060607,
+    0xbefc0306, 0xbf900009, 0xbf8c0000, 0xbf870006, 0xbf8a0000, 0x7e027081,
+    0xf80008c0, 0x00000000, 0xf8000941, 0x00000001, 0xbf8cff0f, 0xbefe0400,
+    0xbf8a0000, 0x7d880014, 0x8780046a, 0xbe862400, 0xbf880012, 0xd5480001,
+    0x02291513, 0xd5480002, 0x02292913, 0x363026ff, 0x000003ff, 0x7d860214,
+    0xd4c30002, 0x00020414, 0xd4c30000, 0x00023014, 0x8882026a, 0x88800200,
+    0xd5010001, 0x0001ff13, 0x80000000, 0xf8000941, 0x00000001, 0xbf8cff0f,
+    0xbefe0406, 0x7d880014, 0x8780046a, 0xbe802400, 0xbf880004, 0xf80008cf,
+    0x33323130, 0xf800020f, 0x1211100f, 0xbf810000,
+];
+
 #[test]
 fn one_count_for_vertices_and_primitives_is_recognized() {
-    let words: [u32; 70] = [
-        0x7e3c0280, 0xbf068014, 0x8580807e, 0xb5940080, 0x8582807e, 0x88800000,
-        0x88820202, 0x88800002, 0xd5010001, 0x00010280, 0x7e000501, 0x87000081,
-        0xbf068100, 0xbe80047e, 0x8582807e, 0xd5010001, 0x00090214, 0x8984c102,
-        0x7e0c0501, 0x7da40080, 0xbf88000d, 0x8f078c06, 0x8aea027e, 0x88060607,
-        0xbefc0306, 0xbf900009, 0xbf8c0000, 0xbf870006, 0xbf8a0000, 0x7e027081,
-        0xf80008c0, 0x00000000, 0xf8000941, 0x00000001, 0xbf8cff0f, 0xbefe0400,
-        0xbf8a0000, 0x7d880014, 0x8780046a, 0xbe862400, 0xbf880012, 0xd5480001,
-        0x02291513, 0xd5480002, 0x02292913, 0x363026ff, 0x000003ff, 0x7d860214,
-        0xd4c30002, 0x00020414, 0xd4c30000, 0x00023014, 0x8882026a, 0x88800200,
-        0xd5010001, 0x0001ff13, 0x80000000, 0xf8000941, 0x00000001, 0xbf8cff0f,
-        0xbefe0406, 0x7d880014, 0x8780046a, 0xbe802400, 0xbf880004, 0xf80008cf,
-        0x33323130, 0xf800020f, 0x1211100f, 0xbf810000,
-    ];
+    let words = ONE_COUNT;
     let recognize = |words: &[u32]| {
         let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
         super::super::mesh_exports::recognize(&disassemble(&bytes), 128, None)
@@ -227,6 +229,53 @@ fn a_guarded_half_result_in_a_recognized_program() {
     let mut primitive_guard = words.clone();
     primitive_guard[1] = 0x7da80030; // v_cmpx_gt_u32 s48, v0
     assert!(!check(&primitive_guard));
+}
+
+#[test]
+fn a_guarded_half_result_ahead_of_one_shared_count() {
+    // One register, s20, is both counts. The vertex exports still test it against
+    // v0, so a guard on it keeps the same lanes they run; no other register could
+    // stand for the vertex count. The position export reads v7.
+    let guard = 0x7da80014; // v_cmpx_gt_u32 s20, v0
+    let program = |block: &[u32], after: &[u32], exports: &[u32]| {
+        let mut words = vec![OPEN, guard, 0xbf880000 | block.len() as u32];
+        words.extend(block);
+        words.push(CLOSE);
+        words.extend(after);
+        words.extend(exports);
+        let insns = disassemble(&bytes(&words));
+        let found = super::mesh_exports::recognize(&insns, 128, None).unwrap_or_else(|reason| panic!("{reason}"));
+        assert_eq!((found.vertices, found.primitives, found.lane_index), (Opnd::Sgpr(20), Opnd::Sgpr(20), Opnd::Vgpr(0)));
+        (insns, found)
+    };
+    let kept = |(insns, found): (Vec<Insn>, super::mesh_exports::MeshExports)| kept_half_unread(&insns, 7, &found);
+    let mut position = ONE_COUNT;
+    assert_eq!(position[66], 0x33323130);
+    position[66] = 0x33323107; // exp pos0 v7, v49, v50, v51 done
+    // The allocation's s_cmpk_gt_u32 s20, 0x80 reads the count and does not write it.
+    assert!(kept(program(&[HALF, WIDEN], &[], &position)));
+    assert!(kept(program(&[HALF, LOW, WIDEN], &[], &position)));
+    // A guard on a register that is not the count, or on another lane.
+    let other = |(mut insns, found): (Vec<Insn>, super::mesh_exports::MeshExports), word: u32| {
+        insns[1] = disassemble(&bytes(&[word])).remove(0);
+        insns[1].offset = 4;
+        kept_half_unread(&insns, 7, &found)
+    };
+    assert!(!other(program(&[HALF, WIDEN], &[], &position), GUARD), "s46 is not the count");
+    assert!(!other(program(&[HALF, WIDEN], &[], &position), 0x7da80214), "v_cmpx_gt_u32 s20, v1");
+    // The count rewritten between the guard and the exports.
+    assert!(!kept(program(&[HALF, WIDEN], &[0x81148114], &position)), "s_add_i32 s20, s20, 1");
+    // Lanes past the count read the register after the block.
+    assert!(!kept(program(&[HALF], &[LOW], &position)));
+    assert!(!kept(program(&[HALF, WIDEN], &[0x7e100507], &position)), "v_readfirstlane_b32 s8, v7");
+    // A swizzle takes the register whole, from other lanes.
+    assert!(!kept(program(&[HALF, 0xd8d40000, 0x08000007, WIDEN], &[], &position)), "ds_swizzle_b32 v8, v7");
+    // The primitive part reads v7 as the packed triangle. With one count its lanes
+    // are those of the guard, but the proof stops at the vertex exports.
+    let mut triangle = position;
+    assert_eq!((triangle[42], triangle[44], triangle[45], triangle[55]), (0x02291513, 0x02292913, 0x363026ff, 0x0001ff13));
+    (triangle[42], triangle[44], triangle[45], triangle[55]) = (0x02291507, 0x02292907, 0x36300eff, 0x0001ff07);
+    assert!(!kept(program(&[HALF, WIDEN], &[], &triangle)));
 }
 
 /// A 128-vertex export sequence with separate counts, assembled with

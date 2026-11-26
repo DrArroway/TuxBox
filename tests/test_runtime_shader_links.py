@@ -365,7 +365,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         dxil = portable_program(0, b"pixel")
         store = Mock()
         store.key.return_value = "content"
-        store.fetch.return_value = False
+        store.fetch.return_value = None
         store.is_slow.return_value = True
 
         def run(args, *, timeout):

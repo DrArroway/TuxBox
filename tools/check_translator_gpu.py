@@ -53,7 +53,7 @@ CHECKS = {
        for width in (32, 64)},
     **{f"wave-guard-{width}-{variant}": Check("check_wave_guard", emitter="wave_guard",
                                               extra=("--width", str(width), "--variant", variant))
-       for width in (32, 64) for variant in ("original", "chain", "chain-zero")},
+       for width in (32, 64) for variant in ("original", "chain", "chain-zero", "result-chain")},
     "wave-guard-64-2d": Check("check_wave_guard", emitter="wave_guard",
                               extra=("--width", "64", "--group", "8", "8", "1")),
     "wave-guard-64-3d": Check("check_wave_guard", emitter="wave_guard",

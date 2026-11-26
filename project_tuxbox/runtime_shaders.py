@@ -431,7 +431,7 @@ def remove_request(path):
 def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
-    with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as wait:
+    with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as (wait, wake):
         pinned = None
         if dxc_helper:
             try:
@@ -442,7 +442,7 @@ def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
             except OSError as error:
                 report(f"Could not stage persistent DXC, using the CLI: {error}")
         with PersistentDxc(pinned, jobs, report) if pinned else nullcontext() as persistent:
-            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent)
+            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent, wake=wake)
 
 
 @contextmanager
@@ -455,23 +455,40 @@ def request_notifications(directory, stop):
     init = getattr(libc, "inotify_init1", None)
     fd = init(os.O_NONBLOCK | os.O_CLOEXEC) if init else -1
     if fd < 0:
-        yield lambda: stop.wait(0.05)
+        yield (lambda: stop.wait(0.05)), None
         return
     try:
         moved_to = 0x00000080
         if libc.inotify_add_watch(fd, os.fsencode(directory), moved_to) < 0:
-            yield lambda: stop.wait(0.05)
+            yield (lambda: stop.wait(0.05)), None
             return
         changes = select.poll()
         changes.register(fd, select.POLLIN)
+        # A finished job wakes the same wait as a new request, so the worker
+        # can listen for requests while jobs run.
+        finished, finish = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        changes.register(finished, select.POLLIN)
 
         def wait():
             # A bounded fallback scan also handles filesystems without events
             # and lets shutdown finish when there is no outstanding work.
-            if changes.poll(50):
-                os.read(fd, 65536)
+            for ready, _ in changes.poll(50):
+                try:
+                    os.read(ready, 65536)
+                except BlockingIOError:
+                    pass
 
-        yield wait
+        def wake():
+            try:
+                os.write(finish, b"\0")
+            except BlockingIOError:
+                pass  # A full pipe wakes the wait already.
+
+        try:
+            yield wait, wake
+        finally:
+            os.close(finished)
+            os.close(finish)
     finally:
         os.close(fd)
 
@@ -537,7 +554,7 @@ def ordered_requests(directory):
     return [source for _, _, source in sorted(entries)]
 
 
-def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, persistent=None):
+def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, persistent=None, wake=None):
     def bind_cache():
         options = {"dxc_helper": persistent.helper} if persistent is not None else {}
         tools, cache = snapshot_compiler_cache(xshader, session.parent, **options)
@@ -636,10 +653,19 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
                         except (OSError, ValueError, subprocess.SubprocessError) as exc:
                             complete(source, key, error=exc)
                             continue
-                    active[key] = (source, pool.submit(compile_one, source, key, tools, cache))
-            if active:
-                # Wake immediately when any worker completes, with a bounded
-                # rescan interval for new requests. Do not spin during stop.
+                    future = pool.submit(compile_one, source, key, tools, cache)
+                    if wake:
+                        # The pool joins its threads before the caller closes
+                        # the notifications, so no callback outlives them.
+                        future.add_done_callback(lambda _: wake())
+                    active[key] = (source, future)
+            if active and wake:
+                # Wake immediately when any worker completes or a request is
+                # published. Do not spin during stop.
+                wait()
+            elif active:
+                # Without notifications, wake when any worker completes, with
+                # a bounded rescan interval for new requests.
                 wait_futures([future for _, future in active.values()],
                              timeout=0.05, return_when=FIRST_COMPLETED)
             elif not stop.is_set():

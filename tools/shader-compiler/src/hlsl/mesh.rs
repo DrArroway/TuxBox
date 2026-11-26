@@ -113,9 +113,20 @@ pub(super) fn translate(
         && (body
             .iter()
             .any(|op| matches!(op.mnemonic.as_str(), "s_cbranch_vccz" | "s_cbranch_vccnz"))
-            || validate_lane_ops(&body, &own_reads, false).is_err_and(|e| e.starts_with("mesh broadcast")));
-    validate_lane_ops(&body, &own_reads, wave_control)?;
+            || validate_lane_ops(&body, &own_reads, false, true).is_err_and(|e| e.starts_with("mesh broadcast")));
+    // A swizzle exchanges values inside blocks of 32 lanes. Each of the 128
+    // threads is one lane, so they can meet at barriers as compute groups do.
+    let swizzles = info.vertices == 128 && body.iter().any(|op| op.mnemonic == "ds_swizzle_b32");
+    if swizzles {
+        for &(head, back) in &loops(&body) {
+            if body[head..=back].iter().any(|op| op.mnemonic == "ds_swizzle_b32") {
+                return Err("mesh swizzle inside a loop".into());
+            }
+        }
+    }
+    validate_lane_ops(&body, &own_reads, wave_control, swizzles)?;
     let mut em = Emitter::new(ex, body);
+    em.compute_swizzle = swizzles;
     em.chosen_samplers = chosen_samplers;
     for op in em.insns.iter().flat_map(|ins| ins.dst.iter().chain(&ins.src)) {
         if let Opnd::Temp(n @ super::LANE_TEMP_BASE..) = op {
@@ -237,6 +248,9 @@ pub(super) fn translate(
     if wave_control {
         h.push_str(&super::page_waves::declarations([128, 1, 1], false));
     }
+    if swizzles {
+        h.push_str("#define TB_SWIZZLE_WORDS 128u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];\nuint tb_swizzle_read(uint i) { return i < TB_SWIZZLE_WORDS ? tb_swizzle[i] : 0u; }\n");
+    }
     em.push_helpers(&mut h);
     signature(&mut h, "Vertex", &ex.output_sig, &ex.flat_outputs, interpolation, output_order)?;
     signature(&mut h, "Primitive", &ex.primitive_sig, &[], None, output_order)?;
@@ -248,6 +262,9 @@ pub(super) fn translate(
     h.push_str("MeshLane evaluate(uint lane, uint group) {\n");
     if wave_control {
         h.push_str("    uint tb_wave_tid = lane;\n");
+    }
+    if swizzles {
+        h.push_str("    uint tb_lane = lane;\n");
     }
     h.push_str("    MeshLane result = (MeshLane)0;\n    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;\n");
     for register in ["s3", "v5"] {
@@ -412,7 +429,7 @@ fn validate_launch(body: &[Insn], group_shift: i64, lane_index: Opnd) -> Result<
 
 /// The logical 64-lane wave is split across desktop invocations. A first-lane
 /// broadcast can be scalarized only when its source is already uniform.
-fn validate_lane_ops(body: &[Insn], own: &BTreeSet<usize>, wave_control: bool) -> Result<(), String> {
+fn validate_lane_ops(body: &[Insn], own: &BTreeSet<usize>, wave_control: bool, swizzles: bool) -> Result<(), String> {
     // Flat loads read the constant tables that follow the code.
     let program_counter = body.iter().any(|op| op.mnemonic == "s_getpc_b64");
     if wave_control {
@@ -448,6 +465,12 @@ fn validate_lane_ops(body: &[Insn], own: &BTreeSet<usize>, wave_control: bool) -
                 "mesh broadcast of a lane-dependent value at {:#x}",
                 ins.offset
             ));
+        }
+        if swizzles && m == "ds_swizzle_b32" {
+            if let Some(Opnd::Vgpr(dst)) = ins.dst.first() {
+                uniform.remove(dst);
+            }
+            continue;
         }
         if matches!(ins.enc, Enc::Ds | Enc::Exp)
             || (ins.enc == Enc::Flat && !(m.starts_with("flat_load_dword") && program_counter))

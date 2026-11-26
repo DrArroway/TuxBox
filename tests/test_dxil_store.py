@@ -106,9 +106,9 @@ class DxilReuse(unittest.TestCase):
             if args[0].name == "xshader":
                 translated.wait(5)
 
-        def fetch(store, key, output):
+        def fetch(store, key, output, **kwargs):
             # Force both initial lookups to miss before either can publish.
-            result = original_fetch(store, key, output)
+            result = original_fetch(store, key, output, **kwargs)
             with guard:
                 first = output not in fetched
                 fetched.add(output)

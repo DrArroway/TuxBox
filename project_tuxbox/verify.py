@@ -32,7 +32,7 @@ LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", 
                    "indirect-dispatch", "gpu-indirect-dispatch",
                    "dispatch-wait", "direct-copy-wait", "texture-readback", "texture-publication",
                    "ray-tracing-builder", "thread-dimensions",
-                   "descriptor-reclaim")
+                   "descriptor-reclaim", "unwritten-descriptors")
 
 
 class LanesShader:
@@ -1160,6 +1160,7 @@ GATE_LABELS = {
     "lanes-selftest-ray-tracing-builder": "Single, copied and batched builds through XboxBvhBuilder",
     "lanes-selftest-thread-dimensions": "Slot 80 thread-dimension dispatch converted using the bound PSO group size",
     "lanes-selftest-descriptor-reclaim": "Shader-visible descriptor slot reclamation across completed, in-flight, ClearState, and OOM lists",
+    "lanes-selftest-unwritten-descriptors": "A descriptor table with slots the title never wrote, in a heap whose title memory held leftover bytes",
     "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
     "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",
     "lanes-shader-cache-reused": "The worker's translation reused on the next launch without compiling",

@@ -4,6 +4,9 @@
 #include "screen.h"
 #include "../../runtime/d3d12/compute_fixture.h"
 #include "../../runtime/d3d12/frame_stream.h"
+extern "C" {
+#include "../../runtime/xmem/xmem.h"
+}
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -2342,6 +2345,120 @@ void descriptor_reclaim(ID3D12Device* device) {
     verify_outputs(next_idx, "fail-closed OOM control");
 }
 
+// A title allocator that hands back memory it has used before, as a title's own
+// allocator may. The provider takes a descriptor heap's records from it.
+UINT reused_allocations = 0;
+void* WINAPI reused_title_memory(SIZE_T bytes, UINT64 attributes) {
+    void* memory = XMemAllocDefault(bytes, attributes);
+    if (memory) {
+        std::memset(memory, 0xA5, bytes);
+        ++reused_allocations;
+    }
+    return memory;
+}
+void WINAPI release_title_memory(void* memory, UINT64 attributes) { XMemFreeDefault(memory, attributes); }
+
+// A table with slots the title never writes, in a heap whose title memory held
+// leftover bytes. The root declares t0..t3 and the program reads only t0, which
+// D3D12 allows. The unwritten slots must read as no descriptor; refusing the
+// table skips the dispatch and leaves the sentinel.
+void unwritten_descriptors(ID3D12Device* device) {
+    constexpr UINT heap_slots = 16, table = 4, sentinel = 0xdeadbeefu;
+    constexpr UINT key = 0x1234u, salt = 0x50005u, word = 0x2au;
+    constexpr UINT expected = word * 131u + key * 17u + salt;
+    D3D12_DESCRIPTOR_RANGE ranges[]{{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0},
+                                    {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 1},
+                                    {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 5}};
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable = {UINT(std::size(ranges)), ranges};
+    D3D12_ROOT_SIGNATURE_DESC sig{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&sig, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+          "serialize unwritten-slot root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "create unwritten-slot root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root.Get();
+    pso_desc.CS = {reclaim_dxil, sizeof(reclaim_dxil)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &pso_desc, 0, nullptr,
+                                                                        IID_PPV_ARGS(&pipeline)),
+          "create unwritten-slot compute pipeline");
+
+    const UINT constants[64]{key, salt};
+    auto cb = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(constants), D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto source = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(UINT), D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(UINT), D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, sizeof(UINT), D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, sizeof(UINT), D3D12_RESOURCE_STATE_COPY_DEST);
+    compute_fixture::upload(cb.Get(), constants, sizeof(constants));
+    compute_fixture::upload(source.Get(), &word, sizeof(word));
+    compute_fixture::upload(seed.Get(), &sentinel, sizeof(sentinel));
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, heap_slots,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    reused_allocations = 0;
+    XMemSetAllocationHooks(reused_title_memory, release_title_memory);
+    const HRESULT created = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap));
+    XMemSetAllocationHooks(nullptr, nullptr);
+    check(created, "create view heap in reused title memory");
+    if (!reused_allocations) throw std::runtime_error("the view heap did not take title memory");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get());
+    const UINT64 gpu_base = method<GpuHandle>(heap.Get(), 10)(heap.Get());
+    auto cpu_at = [&](UINT slot) -> D3D12_CPU_DESCRIPTOR_HANDLE { return {cpu_base + SIZE_T(table + slot) * stride}; };
+
+    // Slots 0 (b0), 1 (t0) and 5 (u0). Slots 2 to 4 (t1..t3) are never written.
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{cb->GetGPUVirtualAddress(), sizeof(constants)};
+    device->CreateConstantBufferView(&cbv, cpu_at(0));
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = 1;
+    srv.Buffer.StructureByteStride = sizeof(UINT);
+    device->CreateShaderResourceView(source.Get(), &srv, cpu_at(1));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = 1;
+    uav.Buffer.StructureByteStride = sizeof(UINT);
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, cpu_at(5));
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ID3D12GraphicsCommandList* list = direct.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, sizeof(UINT));
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    list->SetPipelineState(pipeline.Get());
+    method<SetTable>(list, slot_compute_table)(list, 0, {gpu_base + UINT64(table) * stride});
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, sizeof(UINT));
+    direct.submit();
+    direct.finish("dispatch through a table with unwritten slots");
+
+    D3D12_RANGE read{0, sizeof(UINT)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map unwritten-slot readback");
+    UINT found = 0;
+    std::memcpy(&found, mapped, sizeof(found));
+    readback->Unmap(0, &empty);
+    if (found == expected) return;
+    char message[160];
+    if (found == sentinel)
+        std::snprintf(message, sizeof(message), "output kept its sentinel: the table was refused and the dispatch skipped");
+    else
+        std::snprintf(message, sizeof(message), "expected %#x, found %#x", expected, found);
+    throw std::runtime_error(message);
+}
+
 // A zero-parameter direct-indexed compute root, with the requested UAV at
 // logical slot 80. The paged trial caps native residency at 64 descriptors.
 // Check the entire buffer, including decoys and guard words. With `table`, the
@@ -2526,6 +2643,7 @@ constexpr Scenario scenarios[] = {
     {L"ray-tracing-builder", ray_tracing_builder},
     {L"thread-dimensions", thread_dimensions},
     {L"descriptor-reclaim", descriptor_reclaim},
+    {L"unwritten-descriptors", unwritten_descriptors},
     {L"xbox-shader", xbox_shader_scenario},
     {L"wave64-shader", wave64_shader_scenario},
     {L"raster-tables", raster_tables},
@@ -2591,7 +2709,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"indirect-dispatch", L"gpu-indirect-dispatch",
                                              L"dispatch-wait", L"texture-readback", L"texture-publication",
                                              L"ray-tracing-builder",
-                                             L"thread-dimensions", L"descriptor-reclaim",
+                                             L"thread-dimensions", L"descriptor-reclaim", L"unwritten-descriptors",
                                              L"xbox-shader", L"wave64-shader",
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",

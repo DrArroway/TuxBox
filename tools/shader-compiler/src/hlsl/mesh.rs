@@ -368,7 +368,11 @@ fn validate_launch(body: &[Insn], group_shift: i64, lane_index: Opnd) -> Result<
             _ if ins.mnemonic.ends_with("_b64") => 2,
             _ => 1,
         };
+        // `v_readlane_b32` writes an SGPR, though the generic VOP3 decoder puts it in `Vgpr`.
+        let scalar_dst = ins.mnemonic == "v_readlane_b32";
         ins.dst.iter().any(|dst| match (*dst, reg) {
+            (V(first), S(n)) if scalar_dst => n == first,
+            (V(_), V(_)) if scalar_dst => false,
             (S(first), S(n)) | (V(first), V(n)) => n >= first && u16::from(n - first) < width,
             _ => false,
         })

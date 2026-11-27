@@ -330,6 +330,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
                         "-Vn", "gpu_indirect_dxil", str(src / "gpu_indirect.hlsl")], cwd=objects, check=True)
         course = tools.compile(src / "course.cpp", objects, f"/I{objects}")
         screen = tools.compile(src / "screen.cpp", objects)
+        panel = tools.compile(src / "panel.cpp", objects)
         controls = tools.compile(src / "input.cpp", objects)
         game = tools.compile(src / "game.cpp", objects)
         subprocess.run([sys.executable, str(src / "shader_fixture.py"), "xbox_shader.h"], cwd=objects, check=True)
@@ -338,7 +339,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         subprocess.run([sys.executable, str(src / "spill_fixture.py"), "lane_spill_shader.h"], cwd=objects, check=True)
         selftest = tools.compile(src / "selftest.cpp", objects, f"/I{objects}")
         xmem, d3d, gameinput = OUTPUT / "xmem-smoke", OUTPUT / "d3d12-smoke", OUTPUT / "gameinput"
-        tools.link(objects / "lanes.exe", course, screen, controls, game, selftest, xmem / "xmem.lib",
+        tools.link(objects / "lanes.exe", course, screen, panel, controls, game, selftest, xmem / "xmem.lib",
                    d3d / "d3d12_xs.lib",
                    gameinput / "guest-gameinput.lib", "onecore_apiset.lib", "/nodefaultlib:kernel32.lib")
         for source in (objects / "lanes.exe", xmem / "xmem.dll", xmem / "tuxbox_xhttp.dll", d3d / "d3d12_xs.dll",

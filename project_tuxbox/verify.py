@@ -972,7 +972,8 @@ def verify(host, output, adapter, selected=None, samples=1):
             # Xwayland instead, and fail fast with the cause if that isn't possible either.
             capture = screen_capture_problem()
             server = private_x_server(work, adapter=adapter) if capture else nullcontext()
-            saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG")}
+            saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG",
+                                                      "TUXBOX_OVERLAY")}
             with server as private:
                 if private:
                     capture = screen_capture_problem(display=private[0], xauthority=private[1])
@@ -994,6 +995,14 @@ def verify(host, output, adapter, selected=None, samples=1):
                                 rf"xbox-frame PASS pci={pci} submissions=2 snapshots=2 pixels=16588800/16588800 "
                                 r"inset=921600 guards=3 fence=2 compute_fence=7 format=rgb10a2 displayed=2/2 "
                                 r"client=\d+x\d+ origin=-?\d+,-?\d+ monitor=\d+x\d+", providers=frame_provider, device_factory="xbox")
+                    # The same screen sampling shows the provider's panel over Lanes.
+                    host.env["TUXBOX_OVERLAY"] = "1"
+                    present("lanes-overlay", "lanes/lanes.exe", ["--replay", "--panel", *gpu_args, "--report"],
+                            rf"lanes-replay PASS pci={pci} course=16/16 win=16/16 safe-miss=1 collision=1 frames=2 "
+                            r"input=gameinput panel=1",
+                            providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                       "lanes/d3d12_xs.dll": (*graphics_symbols, "D3D12XboxCreateDevice")},
+                            config="lanes/MicrosoftGame.config", device_factory="xbox")
                 finally:
                     for key, value in saved.items():
                         if value is None:
@@ -1143,6 +1152,7 @@ GATE_LABELS = {
     "guest-command-errors": "Guest command rejection, fence isolation and list recovery",
     "guest-present": "Xbox PresentX and two screen-verified frames",
     "lanes-xbox-replay": "Lanes Xbox imports, course, board readback and gameplay replay",
+    "lanes-overlay": "TuxBox's performance panel on screen over Lanes",
     "lanes-selftest-labels": "Bottom-of-pipe label writes with and without a flush",
     "lanes-selftest-cross-queue": "Compute and direct queues waiting on each other's labels",
     "lanes-selftest-compute-frame": "Compute queue frame submission",

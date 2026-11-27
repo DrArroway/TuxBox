@@ -80,6 +80,8 @@ def run_game(args, exe, host, package_dir, profile=None):
                         log.status("Shader preparation complete." if supported else
                                    "No matching shader preparation profile for this title and provider.")
                         return 0 if supported else 1
+            if args.overlay:
+                host.env["TUXBOX_OVERLAY"] = "1"
             log.status("Starting game")
             start = monotonic()
             code = host.run_game(exe, args.arguments, log, package=package_dir,
@@ -110,6 +112,8 @@ def main():
     run.add_argument("--log-file", type=Path, metavar="PATH", help="also append the game log to this file; none is saved otherwise")
     run.add_argument("--mangohud", action="store_true",
                      help="show Vulkan performance metrics and record frame times beside the log file on Linux")
+    run.add_argument("--overlay", action="store_true",
+                     help="show TuxBox's panel with frame rate, frame times and processor and memory use")
     run.add_argument("--require-current-provider", action="store_true",
                      help="refuse launch unless staged D3D12 DLL matches build/d3d12-smoke/d3d12_xs.dll")
     run.add_argument("--profile-pipelines", action="store_true",

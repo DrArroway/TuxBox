@@ -50,6 +50,9 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
+| `TUXBOX_OVERLAY` | off | `1` shows frame rate, frame times, processor and memory use (`run --overlay`) |
+| `TUXBOX_OVERLAY_POS` | `tl` | `tl`, `tr`, `bl` or `br` |
+| `TUXBOX_FRAME_LOG` | off | File to write each frame's time to, as CSV; the game must be able to write it |
 | `TUXBOX_KEYBOARD_GAMEPAD` | on | `0` leaves only physical XInput controllers |
 | `TUXBOX_STORAGE_THREADS` | CPU cores, at most 8 | Storage request threads |
 | `TUXBOX_MANGOHUD_PCI` | chosen automatically | PCI address of the GPU MangoHud reports |

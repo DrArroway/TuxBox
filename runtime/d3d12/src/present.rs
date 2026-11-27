@@ -2,7 +2,8 @@
 
 mod overlay;
 mod window;
-use overlay::Overlay;
+use crate::performance::Monitor;
+use overlay::{Overlay, PerformancePanel};
 use window::OutputWindow;
 
 use std::mem::{ManuallyDrop, swap};
@@ -105,6 +106,9 @@ struct SwapChain {
     frames: [Frame; 2],
     device: ID3D12Device,
     overlay: Overlay,
+    /// Present only when `TUXBOX_OVERLAY` or `TUXBOX_FRAME_LOG` is set.
+    monitor: Option<Monitor>,
+    performance: PerformancePanel,
     window: OutputWindow,
     width: u32,
     height: u32,
@@ -148,6 +152,8 @@ impl SwapChain {
                 frames: [Frame::new(device)?, Frame::new(device)?],
                 device: device.clone(),
                 overlay: Overlay::new(params.Format, params.Width, params.Height),
+                monitor: Monitor::from_env(device),
+                performance: PerformancePanel::new(params.Format, params.Width, params.Height),
                 window,
                 width: params.Width,
                 height: params.Height,
@@ -188,12 +194,18 @@ impl SwapChain {
                 .ok_or(DXGI_ERROR_INVALID_CALL)?;
             wait_for(&self.fence, frame.retire)?;
             let buffer = self.chain.GetBuffer(index)?;
+            if let Some(monitor) = &mut self.monitor {
+                monitor.frame();
+            }
             // This frame's previous use has retired, so its panel upload
-            // buffer is free to rewrite.
-            let panel = self.overlay.prepare(&self.device, index as usize);
+            // buffers are free to rewrite.
+            let panels = [
+                self.overlay.prepare(&self.device, index as usize),
+                self.monitor.as_ref().and_then(|monitor| self.performance.prepare(&self.device, index as usize, monitor)),
+            ];
             frame.allocator.Reset()?;
             frame.list.Reset(&frame.allocator, None)?;
-            record_copy(&frame.list, source, &buffer, panel.as_ref());
+            record_copy(&frame.list, source, &buffer, &panels);
             let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
             frame.list.Close()?;
             frame.source = Some(source.clone());
@@ -267,7 +279,7 @@ fn record_copy(
     list: &ID3D12GraphicsCommandList,
     source: &ID3D12Resource,
     buffer: &ID3D12Resource,
-    panel: Option<&overlay::Placement>,
+    panels: &[Option<overlay::Placement>],
 ) {
     let transition = |resource: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -299,7 +311,7 @@ fn record_copy(
     unsafe {
         list.ResourceBarrier(&barriers);
         list.CopyResource(buffer, source);
-        if let Some(panel) = panel {
+        for panel in panels.iter().flatten() {
             overlay::record(list, buffer, panel);
         }
         for barrier in &mut barriers {

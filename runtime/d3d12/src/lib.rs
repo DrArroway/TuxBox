@@ -12,6 +12,7 @@ mod diagnostics;
 mod exports;
 mod failures;
 mod guids;
+mod performance;
 mod present;
 mod private_driver;
 mod progress;

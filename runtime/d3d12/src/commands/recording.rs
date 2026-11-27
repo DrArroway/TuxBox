@@ -10,6 +10,8 @@ pub(super) struct ActiveList {
     mesh: OnceLock<Option<ID3D12GraphicsCommandList6>>,
     raytracing: Option<ID3D12GraphicsCommandList4>,
     pub(super) has_commands: bool,
+    /// Whether an `ExecuteIndirect` recorded now reads its arguments in order.
+    pub(super) indirect: indirect_order::Order,
 }
 
 impl ActiveList {
@@ -24,6 +26,7 @@ impl ActiveList {
             mesh: OnceLock::new(),
             raytracing,
             has_commands: false,
+            indirect: Default::default(),
         }
     }
 
@@ -333,10 +336,12 @@ impl Recording {
     }
 
     pub(super) fn record_write(&mut self, address: u64, bytes: u64) {
+        self.active.indirect.written();
         self.written_ranges.record(address, bytes);
     }
 
     pub(super) fn record_unknown_write(&mut self) {
+        self.active.indirect.written();
         self.written_ranges.record_unknown();
     }
 
@@ -550,7 +555,10 @@ impl Recording {
         rasterizes: bool,
         draw: impl FnOnce(&ID3D12GraphicsCommandList),
     ) {
-        self.record_unknown_write();
+        // Unlike a dispatch or a copy, a draw is not taken as a writer of
+        // indirect arguments: a barrier before each indirect draw would end
+        // the host's render pass every time.
+        self.written_ranges.record_unknown();
         let null_usage = self.bindings.null_usage.clone();
         let display_bound = self.display_bound;
         let native = self.active.native.clone();

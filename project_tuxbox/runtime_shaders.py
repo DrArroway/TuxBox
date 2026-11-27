@@ -245,21 +245,36 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     """Compile HLSL for the requested stage and return fully validated DXIL bytes."""
     entry = [] if target == "lib_6_3" else ["-E", "main"]
     unoptimised = [dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl]
-    # Large generated pixel programs can spend the cap in Jump Threading.
-    # Try this validated variant before consulting the baseline slow marker;
-    # an older DXC's flag rejection falls back just like a candidate timeout.
-    # Programs of the shader compiler's block dispatcher take it at any size: at
-    # default optimisation with lifetime markers some cost RADV minutes and more
-    # than 20 GB, so without this variant they are compiled at -O0.
+    # With lifetime markers, DXC can spend most of a compile in Jump Threading on
+    # generated programs. Every profile but cs_6_6, which has its own variant
+    # below, therefore starts without them at the default optimisation level,
+    # before consulting the slow marker. A timeout goes straight to -O0, since
+    # the markers would only make the compile slower. Output that fails, as when
+    # an older DXC rejects the flag, falls back to the default compile, except
+    # for programs of the shader compiler's block dispatcher: with the markers
+    # some cost RADV minutes and more than 20 GB, so those use -O0.
     dispatched = target != "cs_6_6" and DISPATCHER in hlsl.read_bytes()
-    if dispatched or target == "ps_6_6" and hlsl.stat().st_size >= (256 << 10):
+    if target != "cs_6_6":
+        # A timeout without the markers has its own marker: older slow markers
+        # came from compiles that kept them, so they don't rule this one out.
+        timed_out = f"{target}.unmarked"
+        if store and not dispatched and store.is_slow(request, timed_out):
+            run_tool(unoptimised, timeout=o0_timeout(hlsl))
+            return validated_dxil(dxv, output, stage)
         try:
             run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
                       "-Fo", output, hlsl], timeout=15)
             if not output.exists():
                 raise ValueError("compiler returned no DXIL output")
             return validated_dxil(dxv, output, stage)
-        except (subprocess.TimeoutExpired, ValueError):
+        except subprocess.TimeoutExpired:
+            if store and not dispatched:
+                store.mark_slow(request, target)
+                store.mark_slow(request, timed_out)
+            output.unlink(missing_ok=True)
+            run_tool(unoptimised, timeout=o0_timeout(hlsl))
+            return validated_dxil(dxv, output, stage)
+        except ValueError:
             output.unlink(missing_ok=True)
     # A dispatched program whose candidate failed, or a request that timed out
     # before, goes straight to -O0 rather than spending the cap again.

@@ -17,7 +17,7 @@ Running out of memory on the way into the game is a main blocker. The console is
 A warm launch reached player selection in 69 s. Cold launches take many minutes, and it is too slow. The first launch, with nothing cached, matters most, and fixes should help any title.
 
 - **Measure each stage.** A shader goes from console code to HLSL, DXC (DXIL), dxil-spirv in vkd3d-proton, then the driver. Compare time and memory per stage for a cold and a warm start.
-- **Make DXC faster.** Try its settings, or our own build of it. `-O1 -disable-lifetime-markers` for every shader saved 7% to 19% of DXC time offline, but two 3-minute launches with the driver cache off showed no gain, so it was not adopted.
+- **Make DXC faster.** Try its settings, or our own build of it. Lifetime markers are now off for every shader. With the simpler branch and mesh code, 800 random ProjectScarlett programs compiled 1.26 times as fast offline: 3.9 times for `ms_6_6`, but only 1.05 times for `cs_6_6`, half of the total. No launch gain has been measured.
 - **Benchmark a shorter route.** On Linux, translating straight to SPIR-V would drop DXC and dxil-spirv. Windows would keep DXIL. Compare both against the per-stage baseline before building either.
 - **Measure speed in the checks.** A change that alters compile speed without changing coverage should show in `tuxbox.py check`, with outputs still verified.
 - **Fewer empty stand-ins.** A large compile that passes its deadline is replaced by an empty pipeline for the whole session. Swapping in the finished result later is untested. Lowering the number of large compiles with available memory went with hundreds more stand-ins in one cold launch; the cause was not isolated.

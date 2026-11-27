@@ -1,4 +1,4 @@
-use super::{isa_writes_no_image, may_write_images};
+use super::{isa_table_image_writes, isa_writes_no_image, may_write_images, table_image_writes};
 use crate::rdna2;
 
 fn isa(words: &[u32]) -> Vec<u8> {
@@ -55,4 +55,73 @@ fn what_cannot_be_read_counts_as_a_write() {
     // Desktop or unknown containers are not console code.
     assert!(may_write_images(&[]));
     assert!(may_write_images(b"DXBC not a container"));
+}
+
+/// s_mov_b32 s0, s5 and s_mov_b32 s1, 0: the address of table 1's pointer.
+const TABLE_ADDRESS: [u32; 2] = [0xbe80_0305, 0xbe81_0380];
+/// s_load_dwordx8 s[8:15], s[0:1], with a constant byte offset.
+fn fetch(offset: u32) -> [u32; 2] {
+    [0xf40c_0200, 0xfa00_0000 | offset]
+}
+/// image_store v0, v[1:2], s[8:15] dmask:0x1 dim:2D
+const STORE: [u32; 2] = [0xf020_1108, 0x0002_0001];
+/// Table 1's pointer arrives in s5.
+const TABLES: [(u8, u32); 1] = [(5, 1)];
+
+fn program(parts: &[&[u32]]) -> Vec<u8> {
+    isa(&parts.concat())
+}
+
+#[test]
+fn a_store_through_a_table_slot_names_that_slot() {
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &STORE, &[ENDPGM]]);
+    assert_eq!(mnemonics_of(&code), ["s_mov_b32", "s_mov_b32", "s_load_dwordx8", "image_store", "s_endpgm"]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), Some(vec![(1, 3)]));
+    // A fetch that no store uses names nothing.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), Some(Vec::new()));
+}
+
+fn mnemonics_of(code: &[u8]) -> Vec<String> {
+    rdna2::instructions(code).map(|op| op.mnemonic).collect()
+}
+
+#[test]
+fn a_store_that_cannot_be_traced_to_a_table_slot_is_unknown() {
+    // The pointer's register is not a table pointer: the heap base, say.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &[(6, 2)]), None);
+    // The high half of the address was never cleared.
+    let code = program(&[&TABLE_ADDRESS[..1], &fetch(0x60), &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), None);
+    // The offset comes from a register (s0 here), not a constant.
+    let code = program(&[&TABLE_ADDRESS, &[0xf40c_0200, 0x0000_0000], &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), None);
+    // An offset that is not a whole descriptor.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x64), &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), None);
+    // One dword of the descriptor is overwritten before the store: s_mov_b32 s9, 0.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &[0xbe89_0380], &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), None);
+    // No descriptor was loaded at all.
+    assert_eq!(isa_table_image_writes(&program(&[&STORE, &[ENDPGM]]), &TABLES), None);
+}
+
+#[test]
+fn paths_that_disagree_about_the_descriptor_are_unknown() {
+    // s_cbranch_scc0 over the second fetch: the store sees slot 3 or slot 4.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &[0xbf84_0002], &fetch(0x80), &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), None);
+    // Both paths fetch the same slot: still that slot.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &[0xbf84_0002], &fetch(0x60), &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), Some(vec![(1, 3)]));
+    // Two stores through two slots name both.
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &STORE, &fetch(0x20), &STORE, &[ENDPGM]]);
+    assert_eq!(isa_table_image_writes(&code, &TABLES), Some(vec![(1, 1), (1, 3)]));
+}
+
+#[test]
+fn a_container_that_is_not_console_code_is_unknown() {
+    assert_eq!(table_image_writes(&[]), None);
+    assert_eq!(table_image_writes(b"DXBC not a container"), None);
 }

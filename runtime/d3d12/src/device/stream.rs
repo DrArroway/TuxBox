@@ -377,6 +377,40 @@ unsafe fn create(
         let root = match layout {
             TableLayout::Original => Some(root),
             TableLayout::Reflected(table) => {
+                let payload = table.layout.payload().to_vec();
+                // A heap-indexed IDXEN access needs each slot's buffer stride:
+                // retry on the same root with the stride table appended, as
+                // the direct compute path does. Only a stage whose refusal
+                // reason matches the missing stride (and whose translation
+                // succeeds against that root) takes that retry.
+                let untranslated = [vertex, pixel].into_iter().any(|source| {
+                    shader_cache::raster_with_root(source, &payload)
+                        .is_none_or(|variant| shader_cache::prepared(&variant).is_none())
+                });
+                let strides_retry = if untranslated
+                    && [vertex, pixel].into_iter().any(|source| {
+                        shader_cache::refused_for_heap_strides(source, &payload)
+                    })
+                {
+                    let retry = super::compute_table::reflected_with_strides(
+                        &device.native, root, Program::Raster { vertex, pixel }, node_mask,
+                    )
+                    .ok()
+                    .and_then(|layout| match layout {
+                        TableLayout::Reflected(strided) => Some(strided),
+                        _ => None,
+                    });
+                    retry.filter(|strided| {
+                        let payload = strided.layout.payload().to_vec();
+                        [vertex, pixel].into_iter().all(|source| {
+                            shader_cache::raster_with_root(source, &payload)
+                                .is_some_and(|variant| shader_cache::prepared(&variant).is_some())
+                        })
+                    })
+                } else {
+                    None
+                };
+                let table = strides_retry.unwrap_or(table);
                 unsafe { field.write(table.native.as_raw()) };
                 Some(&pipeline.raster_table.insert(table).layout)
             }

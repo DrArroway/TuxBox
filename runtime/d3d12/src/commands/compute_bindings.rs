@@ -269,7 +269,8 @@ impl Bindings {
         arena: Option<&Arc<crate::device::descriptor_paging::Arena>>,
         leases: &mut crate::device::descriptor_paging::DescriptorLeases,
         heap: Option<&super::descriptors::ResourceHeap>, reads: &mut Vec<std::ops::Range<usize>>,
-        resources: &crate::device::MediaResources, dispatch: impl FnOnce(),
+        resources: &crate::device::MediaResources,
+        scene: Option<(&SceneRoot, &[u64], Option<[u64; 2]>)>, dispatch: impl FnOnce(),
     ) -> Result<()> {
         let layout = if COMPUTE { &self.layout } else { &self.graphics_layout };
         if !layout.as_ref().is_some_and(|l| l.matches(&table.original)) {
@@ -311,10 +312,19 @@ impl Bindings {
         };
         unsafe {
             if COMPUTE {
-                list.SetComputeRootSignature(&table.native);
+                // A ray-query program's scene root is the reflected root with
+                // its private scene SRVs appended.
+                list.SetComputeRootSignature(scene.map_or(&table.native, |(root, ..)| &root.native));
                 // Changing root signatures invalidates the native arguments. Replay
                 // constants and descriptors, then substitute each reflected table.
                 self.apply_compute_args(list, bases);
+                if let Some((root, scenes, geometry)) = scene {
+                    let mut slot = root.appended;
+                    for &va in scenes.iter().chain(geometry.iter().flatten()) {
+                        list.SetComputeRootShaderResourceView(slot, va);
+                        slot += 1;
+                    }
+                }
                 if let Some((slot, address)) = strides {
                     list.SetComputeRootShaderResourceView(slot, address);
                 }

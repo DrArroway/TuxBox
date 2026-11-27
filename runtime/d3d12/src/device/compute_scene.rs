@@ -409,6 +409,7 @@ pub(super) fn private_root(
     source: &[u8],
     translated: &[u8],
     explicit: Option<&RootSource>,
+    host_root: Option<&RootSource>,
     node_mask: u32,
 ) -> Result<Option<SceneRoot>> {
     let (Some(guest), Some(host)) = (bindings(source), bindings(translated)) else {
@@ -425,7 +426,11 @@ pub(super) fn private_root(
     let private = layout.private_registers();
     let private_count = private.len() as u32;
     let original = explicit.cloned().unwrap_or_else(|| RootSource::new(source));
-    let bytes = &original.bytes;
+    // Extend the host root the program is bound with: the reflected table
+    // layout when the title's root needed one, otherwise the title's root.
+    // Bindings are still matched against the title's root.
+    let base = host_root.cloned().unwrap_or_else(|| original.clone());
+    let bytes = &base.bytes;
     let mut reader = None::<ID3D12VersionedRootSignatureDeserializer>;
     // The native deserializer owns and validates every pointer in the returned description.
     unsafe {
@@ -460,7 +465,7 @@ pub(super) fn private_root(
         let mut params = core::slice::from_raw_parts(ptr, count as usize).to_vec();
         let binding = scene_sources(&params, &layout);
         crate::diagnostics::log_once(&Once::new(), || {
-            let hash = super::shader_cache::source_digest(&bytes[original.payload.clone()])
+            let hash = super::shader_cache::source_digest(&bytes[base.payload.clone()])
                 .unwrap_or_default();
             format!(
                 "shader {} root {hash} v{} flags={:#x} staticSamplers={samplers} scene={binding:?}{}",

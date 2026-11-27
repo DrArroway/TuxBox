@@ -460,7 +460,24 @@ impl Recording {
                 crate::diagnostics::display::record_null(tag, false);
             }
         };
-        if let Some(table) = self.bindings.reflected_table::<true>() {
+        if self.bindings.reflected_table::<true>().is_some() {
+            // A ray-query program can also need the reflected table layout:
+            // its scene root then extends the reflected root.
+            let scenes = if self.bindings.scene_root().is_some() {
+                match self.inline_scenes(list) {
+                    Ok(scenes) => Some(scenes),
+                    Err(error) => {
+                        Self::skip("compute dispatch: inline ray scene binding", error.code());
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let Some(table) = self.bindings.reflected_table::<true>() else { return };
+            let scene = scenes.as_ref().and_then(|(vas, geometry)| {
+                self.bindings.scene_root().map(|root| (root, vas.as_slice(), *geometry))
+            });
             if let Err(error) = self.bindings.with_reflected_table::<true>(
                 table,
                 list,
@@ -470,9 +487,17 @@ impl Recording {
                 self.resource_heap.as_ref(),
                 &mut self.sampled_heaps,
                 &self.resources,
+                scene,
                 dispatch,
             ) {
                 Self::skip("compute dispatch with a reflected table", error.code());
+            } else if let Some((root, vas, _)) = scene {
+                crate::diagnostics::log_once(&root.program.first_dispatch, || {
+                    format!(
+                        "recorded inline compute shader {} dispatch with scene GPU VA {:#x} through a reflected table",
+                        root.program.source_hash, vas[0]
+                    )
+                });
             }
             return;
         }
@@ -494,53 +519,54 @@ impl Recording {
             unsafe { self.bindings.dispatch_with_root(&list.native, root, dispatch) };
             return;
         }
-        let Some(root) = self.bindings.scene_root() else {
+        if self.bindings.scene_root().is_none() {
             dispatch();
             return;
-        };
-        let result = self
-            .bindings
-            .scene_resource(list)
-            .and_then(|scene| {
-                let mut held: Vec<&ID3D12Resource> = scene.scenes.iter().map(|s| &s.0).collect();
-                held.extend(scene.geometry.iter().flatten().map(|g| &g.0));
-                raytracing::retain(self, &held)?;
-                Ok(scene)
-            })
-            .and_then(|scene| {
-                let vas: Vec<u64> = scene.scenes.iter().map(|s| s.1).collect();
-                let va = vas[0];
-                let geometry = scene
-                    .geometry
-                    .as_ref()
-                    .map(|[instances, normals]| [instances.1, normals.1]);
-                if scene.recheck_on_submit()
-                    && !matches!(
-                        self.scene_commands.last(),
-                        Some(raytracing::SceneCommand::Check(last)) if *last == scene
-                    )
-                {
-                    self.scene_commands
-                        .try_reserve(1)
-                        .map_err(|_| E_OUTOFMEMORY)?;
-                    self.scene_commands
-                        .push(raytracing::SceneCommand::Check(scene));
-                }
-                unsafe {
-                    self.bindings
-                        .dispatch_scene(&self.active.native, root, &vas, geometry, dispatch)
-                };
-                crate::diagnostics::log_once(&root.program.first_dispatch, || {
-                    format!(
-                        "recorded inline compute shader {} dispatch with scene GPU VA {va:#x}",
-                        root.program.source_hash
-                    )
-                });
-                Ok(())
+        }
+        let result = self.inline_scenes(list).map(|(vas, geometry)| {
+            let Some(root) = self.bindings.scene_root() else { return };
+            unsafe {
+                self.bindings
+                    .dispatch_scene(&self.active.native, root, &vas, geometry, dispatch)
+            };
+            crate::diagnostics::log_once(&root.program.first_dispatch, || {
+                format!(
+                    "recorded inline compute shader {} dispatch with scene GPU VA {:#x}",
+                    root.program.source_hash, vas[0]
+                )
             });
+        });
         if let Err(error) = result {
             Self::skip("compute dispatch: inline ray scene binding", error.code());
         }
+    }
+
+    /// Resolve the native scenes the bound ray-query program reads and keep
+    /// them alive with the list: their GPU addresses, in private register
+    /// order, and the geometry tables of a single scene.
+    fn inline_scenes(&mut self, list: &List) -> windows::core::Result<(Vec<u64>, Option<[u64; 2]>)> {
+        let scene = self.bindings.scene_resource(list)?;
+        let mut held: Vec<&ID3D12Resource> = scene.scenes.iter().map(|s| &s.0).collect();
+        held.extend(scene.geometry.iter().flatten().map(|g| &g.0));
+        raytracing::retain(self, &held)?;
+        let vas: Vec<u64> = scene.scenes.iter().map(|s| s.1).collect();
+        let geometry = scene
+            .geometry
+            .as_ref()
+            .map(|[instances, normals]| [instances.1, normals.1]);
+        if scene.recheck_on_submit()
+            && !matches!(
+                self.scene_commands.last(),
+                Some(raytracing::SceneCommand::Check(last)) if *last == scene
+            )
+        {
+            self.scene_commands
+                .try_reserve(1)
+                .map_err(|_| E_OUTOFMEMORY)?;
+            self.scene_commands
+                .push(raytracing::SceneCommand::Check(scene));
+        }
+        Ok((vas, geometry))
     }
 
     pub(super) fn draw(
@@ -640,6 +666,7 @@ impl Recording {
                 self.resource_heap.as_ref(),
                 &mut self.sampled_heaps,
                 &self.resources,
+                None,
                 draw,
             ) {
                 Self::skip("draw with a reflected table", error.code());

@@ -388,3 +388,19 @@ fn sampler_heap_binding_uses_the_reaching_pointer() {
     let reason = emit(clobbered).unwrap_err();
     assert!(reason.contains("base s24 is not a root table pointer"));
 }
+
+#[test]
+fn validate_launch_ignores_readlane_sgpr_destination_matching_lane_vgpr() {
+    let words = [
+        0xd765_0002u32, 0x0001_00c1, // v_mbcnt_lo_u32_b32 v2, -1, 0
+        0x7e00_0505,                 // v_readfirstlane_b32 s0, v5
+        0x9381_ff03, 0x0004_0018,    // s_bfe_u32 s1, s3, 0x00040018
+        0xd766_0002, 0x0002_04c1,    // v_mbcnt_hi_u32_b32 v2, -1, v2
+        0x9016_8700,                 // s_lshr_b32 s22, s0, 7
+        0xd746_0002, 0x0409_0c01,    // v_lshl_add_u32 v2, s1, 6, v2
+        0xd760_0002, 0x0001_0100,    // v_readlane_b32 s2, v0, 0 (writes s2, not v2)
+    ];
+    let isa: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let body = disassemble(&isa);
+    super::validate_launch(&body, 7, Opnd::Vgpr(2)).expect("v_readlane_b32 writes SGPR, not lane_index VGPR");
+}

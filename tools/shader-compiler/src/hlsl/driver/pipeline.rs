@@ -253,7 +253,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     if !wave_cull && !page_waves { {
         // Complete-wave compute groups can exchange unproven dynamic SGPR lane reads
         // through group memory with wave-width masking (`& 31u` or `& 63u`).
-        if ex.stage == Stage::Pixel && pixel_heap_base(ex, 5).is_some() { lower_first_lane_reads(&mut insns); }
+        if ex.stage == Stage::Pixel { lower_first_lane_reads(&mut insns); }
         lower_lane_spills(&mut insns, resolve_wave32, has_group_read_fallback)?;
         if let Some(width) = read_plan.group_read_width {
             for ins in insns.iter_mut().filter(|i| i.mnemonic == GROUP_READ) {

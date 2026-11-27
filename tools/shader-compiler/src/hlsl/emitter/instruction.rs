@@ -35,6 +35,9 @@ impl<'a> Emitter<'a> {
             reflection_far::emit(self, ins);
             return Ok(());
         }
+        if m == scarlett_rays::MNEMONIC {
+            return scarlett_rays::emit(self, ins);
+        }
         if m == "tb_radiance_query" {
             radiance_probe::emit(self, ins);
             return Ok(());

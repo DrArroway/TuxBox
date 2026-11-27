@@ -170,8 +170,10 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     if lone_lane::on() { lone_lane::prepare(&mut insns)?; }
     let resolve_wave32 = !lone_lane::on() && ray_resolve::wave32(ex, &insns)?;
     let probe = radiance_probe::identify(ex);
-    let probe_trace = probe.is_some();
+    let scarlett_walk = scarlett_rays::identify(ex);
+    let probe_trace = probe.is_some() || scarlett_walk.is_some();
     if let Some(probe) = probe { radiance_probe::prepare(probe, &mut insns); }
+    if let Some(walk) = scarlett_walk { scarlett_rays::prepare(walk, &mut insns); }
     // Slot 80 explicitly selects a wave width. Only opt in straight-line
     // loads, stores and lane-local arithmetic with ordinary operands.
     let portable_compute_group = (ex.stage == Stage::Compute && insns.iter().all(|ins| {
@@ -663,6 +665,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
             hlsl.insert_str(0, &page_waves::declarations(compute_group(ex), branchless));
         }
     }
+    if scarlett_walk.is_some() { let d = scarlett_rays::declarations(&hlsl); hlsl.insert_str(0, &d); }
     if let Some(probe) = probe {
         hlsl.insert_str(0, radiance_probe::DECLARATIONS);
         if matches!(probe, radiance_probe::Probe::ReflectionFar | radiance_probe::Probe::Reflection | radiance_probe::Probe::ScreenGather | radiance_probe::Probe::ScreenGatherFar) { hlsl.insert_str(0, "#define TB_SCREEN_GATHER 1\n"); }

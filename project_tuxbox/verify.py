@@ -1057,12 +1057,16 @@ def verify(host, output, adapter, selected=None, samples=1):
                             frame_match + r" displayed=2/2", providers=frame_provider, device_factory="xbox")
                     present("guest-present-rgb10", "d3d12-smoke/xbox-frame-rgb10.exe", [*gpu_args, "--present", "--report"],
                             frame_match + r" format=rgb10a2 displayed=2/2", providers=frame_provider, device_factory="xbox")
-                    for mode in ("owned", "oversized", "fit"):
+                    for mode in ("owned", "oversized", "fit", "splash"):
                         present(f"guest-present-4k-{mode}", "d3d12-smoke/xbox-frame-4k.exe",
                                 [mode, *gpu_args, "--present", "--report"],
                                 rf"xbox-frame PASS pci={pci} submissions=2 snapshots=2 pixels=16588800/16588800 "
                                 r"inset=921600 guards=3 fence=2 compute_fence=7 format=rgb10a2 displayed=2/2 "
-                                r"client=\d+x\d+ origin=-?\d+,-?\d+ monitor=\d+x\d+", providers=frame_provider, device_factory="xbox")
+                                r"client=\d+x\d+ origin=-?\d+,-?\d+ monitor=\d+x\d+"
+                                + (" splash=held,ended" if mode == "splash" else ""),
+                                providers=frame_provider, device_factory="xbox",
+                                dependencies=("d3d12-smoke/splash/MicrosoftGame.Config", "d3d12-smoke/splash/splash.png")
+                                if mode == "splash" else ())
                     # The same screen sampling shows the provider's panel over Lanes.
                     host.env["TUXBOX_OVERLAY"] = "1"
                     present("lanes-overlay", "lanes/lanes.exe", ["--replay", "--panel", *gpu_args, "--report"],
@@ -1197,6 +1201,7 @@ GATE_LABELS = {
     "guest-present-4k-owned": "4K RGB10 display scaled to a TuxBox window",
     "guest-present-4k-oversized": "4K RGB10 display fitted to the title window’s monitor",
     "guest-present-4k-fit": "4K RGB10 display scaled inside a smaller title window",
+    "guest-present-4k-splash": "Package splash over a fitted 4K title window until frames come steadily",
     "guest-present-rgb10": "Two RGB10A2 frames sampled from the desktop window",
     "d3d12-frame-events": "Frame origins, timeout tokens, completed presentation events and display statistics",
     "d3d12-heaps": "Placed resources and allocation offsets in a shared memory heap",

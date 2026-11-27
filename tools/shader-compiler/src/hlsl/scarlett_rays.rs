@@ -14,6 +14,9 @@ pub(crate) enum Walk {
     /// CS_RaytraceShadows_Mixed: a sun shadow ray per pixel against the near
     /// scene and, if nothing was hit, against the far scene.
     RaytraceShadows,
+    /// CS_LaserLightShadowRaytracing: per lamp, the distance to the nearest
+    /// triangle along its beam.
+    LaserLightShadow,
 }
 
 pub(crate) fn identify(ex: &ShaderExtract) -> Option<Walk> {
@@ -36,6 +39,11 @@ pub(crate) fn identify(ex: &ShaderExtract) -> Option<Walk> {
         {
             Some(Walk::RaytraceShadows)
         }
+        "CS_LaserLightShadowRaytracing_c3ab3042_Wrapped"
+            if matches_program(&ex.isa, 3332, 0xab98828801484e03) =>
+        {
+            Some(Walk::LaserLightShadow)
+        }
         _ => None,
     }
 }
@@ -44,9 +52,10 @@ pub(super) const MNEMONIC: &str = "tb_scarlett_ray_query";
 
 /// One walk in the guest ISA.
 struct Loop {
-    /// The load of the scene's root node pointer and the store that seeds the
-    /// shared-memory stack. Both only feed the walk.
-    scratch: [usize; 2],
+    /// Instructions before the walk that only feed it: the load of the scene's
+    /// root node pointer, the store that seeds the shared-memory stack, and
+    /// the setup of lane storage the walk spills to.
+    scratch: &'static [usize],
     /// From the walk's first instruction through its back edge. Nothing
     /// outside this range branches into it except to `at`, and nothing in it
     /// branches out.
@@ -63,6 +72,14 @@ struct Loop {
     min: Option<u8>,
     /// Nonzero after an accepted triangle; zero before the walk.
     hit: u8,
+    /// The walk keeps the nearest triangle: each accepted one shortens the
+    /// maximum distance (`ray[6]`) to its own, so after the walk that register
+    /// holds the nearest hit. Otherwise the walk stops at the first triangle.
+    closest: bool,
+    /// A scalar load of the scene's root node that code outside the walk also
+    /// tests (zero for an empty scene). It becomes a nonzero constant; the
+    /// native query handles an empty scene itself.
+    root: Option<(usize, u8)>,
     /// The scene's descriptor: the user SGPR holding the table pointer (the
     /// walk reads it through a copy) and the byte offset in the table.
     table: u8,
@@ -70,7 +87,7 @@ struct Loop {
 }
 
 const IRRADIANCE_SHADOW: &[Loop] = &[Loop {
-    scratch: [0x017c, 0x0334],
+    scratch: &[0x017c, 0x0334],
     first: 0x03bc,
     last: 0x0acc,
     at: 0x03c0,
@@ -79,6 +96,8 @@ const IRRADIANCE_SHADOW: &[Loop] = &[Loop {
     hit: 10,
     table: 5,
     scene: 128,
+    closest: false,
+    root: None,
 }];
 
 // The near walk keeps its world ray in v45, v2, v4 (origin), v12, v11, v10
@@ -86,7 +105,7 @@ const IRRADIANCE_SHADOW: &[Loop] = &[Loop {
 // leaves a sphere around the cache and runs only if the near walk missed.
 const IRRADIANCE_SHADOW_FAR: &[Loop] = &[
     Loop {
-        scratch: [0x0384, 0x0418],
+        scratch: &[0x0384, 0x0418],
         first: 0x0428,
         last: 0x0b34,
         at: 0x042c,
@@ -95,9 +114,11 @@ const IRRADIANCE_SHADOW_FAR: &[Loop] = &[
         hit: 7,
         table: 5,
         scene: 128,
+        closest: false,
+        root: None,
     },
     Loop {
-        scratch: [0x0bc4, 0x0b7c],
+        scratch: &[0x0bc4, 0x0b7c],
         first: 0x0c24,
         last: 0x133c,
         at: 0x0c28,
@@ -106,6 +127,8 @@ const IRRADIANCE_SHADOW_FAR: &[Loop] = &[
         hit: 7,
         table: 5,
         scene: 96,
+        closest: false,
+        root: None,
     },
 ];
 
@@ -114,7 +137,7 @@ const IRRADIANCE_SHADOW_FAR: &[Loop] = &[
 // at 0x1658 is entered by the branch at 0x0e8c, which jumps to 0x1660.
 const RAYTRACE_SHADOWS: &[Loop] = &[
     Loop {
-        scratch: [0x06b0, 0x0678],
+        scratch: &[0x06b0, 0x0678],
         first: 0x06d4,
         last: 0x0ddc,
         at: 0x06d8,
@@ -123,9 +146,11 @@ const RAYTRACE_SHADOWS: &[Loop] = &[
         hit: 15,
         table: 5,
         scene: 128,
+        closest: false,
+        root: None,
     },
     Loop {
-        scratch: [0x0ec0, 0x0f14],
+        scratch: &[0x0ec0, 0x0f14],
         first: 0x0f24,
         last: 0x162c,
         at: 0x0f28,
@@ -134,9 +159,11 @@ const RAYTRACE_SHADOWS: &[Loop] = &[
         hit: 14,
         table: 5,
         scene: 32,
+        closest: false,
+        root: None,
     },
     Loop {
-        scratch: [0x0e30, 0x0e7c],
+        scratch: &[0x0e30, 0x0e7c],
         first: 0x1658,
         last: 0x1d6c,
         at: 0x1660,
@@ -145,14 +172,36 @@ const RAYTRACE_SHADOWS: &[Loop] = &[
         hit: 14,
         table: 5,
         scene: 32,
+        closest: false,
+        root: None,
     },
 ];
+
+// The walk runs from 0x0170 to its last back edge at 0x0cbc. Lanes 12-14 of
+// v5, cleared at 0x008c-0x00b4, are its spill area. The branch at
+// 0x00ec skips it when the scene's root word (s32, loaded at 0x00c4) is not
+// positive. The beam starts at v1, v2, v3 with direction v6, v9, v11 and
+// length v4; after the walk v4 is the nearest hit and v7 nonzero on a hit.
+const LASER_LIGHT_SHADOW: &[Loop] = &[Loop {
+    scratch: &[0x008c, 0x0090, 0x0098, 0x00b4],
+    first: 0x0170,
+    last: 0x0cbc,
+    at: 0x0170,
+    ray: [1, 2, 3, 6, 9, 11, 4],
+    min: None,
+    hit: 7,
+    table: 5,
+    scene: 32,
+    closest: true,
+    root: Some((0x00c4, 32)),
+}];
 
 fn loops(walk: Walk) -> &'static [Loop] {
     match walk {
         Walk::IrradianceShadow => IRRADIANCE_SHADOW,
         Walk::IrradianceShadowFar => IRRADIANCE_SHADOW_FAR,
         Walk::RaytraceShadows => RAYTRACE_SHADOWS,
+        Walk::LaserLightShadow => LASER_LIGHT_SHADOW,
     }
 }
 
@@ -163,8 +212,17 @@ pub(super) fn prepare(walk: Walk, ops: &mut Vec<Insn>) {
     for l in loops(walk) {
         let at = l.at;
         ops.retain(|op| {
-            !(l.scratch.contains(&op.offset) || (op.offset >= l.first && op.offset <= l.last && op.offset != at))
+            op.offset == at
+                || !(l.scratch.contains(&op.offset) || (op.offset >= l.first && op.offset <= l.last))
         });
+        if let Some((offset, sgpr)) = l.root {
+            let load = ops.iter_mut().find(|op| op.offset == offset).expect("matched walk ISA");
+            load.mnemonic = "s_mov_b32".into();
+            load.enc = Enc::Sop1;
+            load.op = 3;
+            load.dst = vec![Opnd::Sgpr(sgpr)];
+            load.src = vec![Opnd::ConstInt(1)];
+        }
         let query = ops.iter_mut().find(|op| op.offset == at).expect("matched walk ISA");
         query.mnemonic = MNEMONIC.into();
         query.enc = Enc::Vop1;
@@ -173,7 +231,11 @@ pub(super) fn prepare(walk: Walk, ops: &mut Vec<Insn>) {
             Opnd::Sgpr(l.table),
             Opnd::Literal(l.scene),
         ]).collect();
-        query.dst = vec![Opnd::Vgpr(l.hit)];
+        query.dst = if l.closest {
+            vec![Opnd::Vgpr(l.hit), Opnd::Vgpr(l.ray[6])]
+        } else {
+            vec![Opnd::Vgpr(l.hit)]
+        };
     }
 }
 
@@ -203,6 +265,15 @@ pub(super) fn emit(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
         Opnd::Vgpr(r) => format!("asfloat(v{r})"),
         _ => "0.0".into(),
     };
+    if let Some(Opnd::Vgpr(distance)) = ins.dst.get(1) {
+        // The walk keeps the nearest triangle with minimum <= t < maximum;
+        // like the first-hit walks it tests no mask and culls nothing.
+        em.line(&format!(
+            "if (exec_lo & 1u) {{ float t; if (tbScarlettNearest(tbScarlettScene{scene}, asfloat(uint3({}, {}, {})), asfloat(uint3({}, {}, {})), {min}, asfloat({}), t)) {{ v{hit} = 1u; v{distance} = asuint(t); }} }}",
+            v(0)?, v(1)?, v(2)?, v(3)?, v(4)?, v(5)?, v(6)?
+        ));
+        return Ok(());
+    }
     // The walk accepts the first triangle with minimum <= t < maximum and
     // tests no instance mask. It also reads a facing-cull field from each
     // console instance's flags; the native query culls nothing, which matches
@@ -223,7 +294,16 @@ pub(super) fn declarations(hlsl: &str) -> String {
             out += &format!("RaytracingAccelerationStructure tbScarlettScene{i} : register(t{i}, space900);\n");
         }
     }
-    out + r#"bool tbScarlettOccluded(RaytracingAccelerationStructure scene, float3 origin, float3 direction, float nearT, float farT) {
+    if hlsl.contains("tbScarlettOccluded(tbScarlett") {
+        out += OCCLUDED;
+    }
+    if hlsl.contains("tbScarlettNearest(tbScarlett") {
+        out += NEAREST;
+    }
+    out
+}
+
+const OCCLUDED: &str = r#"bool tbScarlettOccluded(RaytracingAccelerationStructure scene, float3 origin, float3 direction, float nearT, float farT) {
     if (!(farT > nearT) || !(nearT >= 0.0)) return false;
     RayDesc ray = {origin, nearT, direction, farT};
     RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
@@ -231,8 +311,20 @@ pub(super) fn declarations(hlsl: &str) -> String {
     query.Proceed();
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
-"#
+"#;
+
+const NEAREST: &str = r#"bool tbScarlettNearest(RaytracingAccelerationStructure scene, float3 origin, float3 direction, float nearT, float farT, out float t) {
+    t = farT;
+    if (!(farT > nearT) || !(nearT >= 0.0)) return false;
+    RayDesc ray = {origin, nearT, direction, farT};
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xffu, ray);
+    query.Proceed();
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return false;
+    t = query.CommittedRayT();
+    return true;
 }
+"#;
 
 #[cfg(test)]
 #[path = "../tests/hlsl/scarlett_rays.rs"]

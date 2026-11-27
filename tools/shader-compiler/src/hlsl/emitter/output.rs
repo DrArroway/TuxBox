@@ -364,14 +364,15 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             if self.paired {
                 for r in ["v0", "v1", "v2"] { self.regs.insert(r.to_string()); }
             }
-            let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
+            let guest_params = ex.root_sig.as_ref().map(sampler_heap::guest_params);
+            let nparams = guest_params.map_or(4, <[_]>::len);
             let g = match self.packed.as_ref().map(|p| &p.abi) {
                 None if self.resolve_wave32 || lone_lane::on() && ray_resolve::applies(ex) => ray_resolve::group_x_register(ex)
                     .ok_or("unverified resolve compute user-data layout")?,
                 Some(RootAbi::RegisterWave32 | RootAbi::RegisterWave64) => 6 + 2 * (nparams - 2), // two tables followed by root CBV pairs
                 Some(RootAbi::ArgumentBlock) => 4,
                 Some(RootAbi::Ps09Raster) => 11,
-                None if ex.root_sig.as_ref().is_some_and(|r| r.flags & 0x400 != 0 && r.params.len() == 2 && r.params.iter().all(|p| matches!(p.kind, crate::meta::RootParamKind::Table(_))))
+                None if ex.root_sig.as_ref().is_some_and(|r| r.flags & 0x400 != 0) && guest_params.is_some_and(|params| params.len() == 2 && params.iter().all(|p| matches!(p.kind, crate::meta::RootParamKind::Table(_))))
                     && tuxbox_dxbc::compute_table::two_tables_and_heap(&ex.fssm) => 7,
                 None if sampler_heap::user_data_end(ex).is_some() =>
                     sampler_heap::user_data_end(ex).unwrap(),

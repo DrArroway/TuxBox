@@ -445,3 +445,80 @@ fn cube_sample_with_derivatives_and_a_lod_clamp_lowers() {
     let expected = format!("{}, {}, asfloat(v11));", along(4, 5), along(6, 7));
     assert!(call.ends_with(&expected), "{call}");
 }
+
+/// The Lanes `bindless-table` program under its root: one table with two raw
+/// UAVs (u0 and u1, space1), one root constant (b0) and the direct-indexing
+/// flag, followed by `private` root SRVs of the runtime (registers in space 32766).
+fn table_constant_and_heap(private: &[u32]) -> ShaderExtract {
+    use crate::meta::{RootParam, RootRange};
+    let words = [
+        0xbe800304u32, 0xbe810380, // s[0:1] = table 0
+        0xf4080200, 0xfa000020, // s[8:11] = table[s0:1] + 0x20
+        0x8f028505, // s2 = s5 << 5, the root constant
+        0xf4080303, 0x04000000, // s[12:15] = heap[s6:7][s2]
+        0x7e000281, // v0 = 1
+        0xe0700000, 0x80020000, // table UAV store
+        0x7e0202ff, 0x7ab1e232, // v1
+        0xe0700000, 0x80030100, // heap UAV store
+        0xbf810000,
+    ];
+    let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut ex = super::super::mesh::heap_extract(&[], 0x400, &isa);
+    ex.stage = Stage::Compute;
+    ex.shader_model = (6, 6);
+    ex.psv_threads = Some([64, 1, 1]);
+    ex.fssm = fssm(
+        &[[3, 8, 1, 1, 0x4], [0, 0, 1, 0, 0x105], [5, 0, 1, 0, 6]],
+        &[[0x303, 8, 1, 1, 0x404], [2, 0, 0, 0, 0x1_0504]],
+    );
+    ex.resources = vec![
+        PsvResource { res_type: 7, space: 1, lower: 1, upper: 1 },
+        PsvResource { res_type: 2, space: 0, lower: 0, upper: 0 },
+    ];
+    let root = ex.root_sig.as_mut().unwrap();
+    root.version = 2;
+    root.params = vec![
+        RootParam { visibility: 0, kind: RootParamKind::Table(vec![
+            RootRange { range_type: 1, num: 2, base_register: 0, space: 1, offset_in_table: u32::MAX }]) },
+        RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 1 } },
+    ];
+    root.params.extend(private.iter().map(|&register| RootParam {
+        visibility: 0, kind: RootParamKind::Descriptor { kind: 3, register, space: 32766 },
+    }));
+    ex
+}
+
+#[test]
+fn the_runtimes_private_root_srvs_leave_a_compute_roots_layout_alone() {
+    let guest = super::super::translate(&table_constant_and_heap(&[])).unwrap().hlsl;
+    for line in [
+        "cbuffer TBIndex0_0 : register(b0, space0) { uint tb_index0_0; };",
+        "s5 = tb_index0_0.x;",
+        "s12 = tb_heap_index(s2 >> 5);",
+        "uint tb_heap_index(uint i) { return i; }",
+        "RWByteAddressBuffer raw_ubuf1 : register(u1, space1);",
+    ] {
+        assert!(guest.contains(line), "{line}\n{guest}");
+    }
+    // With the index map appended, the root constant and every register stay
+    // where the title's root put them. Only the heap index goes through the map.
+    let mapped = super::super::translate(&table_constant_and_heap(&[0])).unwrap().hlsl;
+    let expected = guest.replace(
+        "uint tb_heap_index(uint i) { return i; }",
+        "uint tb_heap_index(uint i) { return tb_heap_map.Load(0) == 0u ? i : tb_heap_map.Load(4u+i*4u); }",
+    );
+    let declared: String = mapped.lines()
+        .filter(|line| *line != "ByteAddressBuffer tb_heap_map : register(t0, space32766);")
+        .flat_map(|line| [line, "\n"]).collect();
+    assert_ne!(declared, mapped, "{mapped}");
+    assert_eq!(declared, expected);
+    // The stride table alone, or after the map, changes how the heap descriptor
+    // is loaded, not where the constant is. A root SRV of the title's own is a
+    // parameter like any other: it does change the root's shape.
+    for private in [&[1][..], &[0, 1]] {
+        let strided = super::super::translate(&table_constant_and_heap(private)).unwrap().hlsl;
+        for line in ["cbuffer TBIndex0_0 : register(b0, space0) { uint tb_index0_0; };", "s5 = tb_index0_0.x;", "tb_heap_strides.Load"] {
+            assert!(strided.contains(line), "{private:?}: {line}\n{strided}");
+        }
+    }
+}

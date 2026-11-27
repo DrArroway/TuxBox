@@ -9,10 +9,24 @@ pub(super) struct DirectSampler {
     pub component: u32,
 }
 
+/// The title's own root parameters. The runtime appends its private root SRVs
+/// (space 32766: the heap index map and the stride table) after them. The
+/// console program was compiled without those, so they take no launch register
+/// and are no part of the layout its registers follow.
+pub(super) fn guest_params(root: &crate::meta::RootSig) -> &[crate::meta::RootParam] {
+    let private = root.params.iter().rev()
+        .take_while(|p| matches!(p.kind, RootParamKind::Descriptor { kind: 3, space: 32766, .. }))
+        .count();
+    &root.params[..root.params.len() - private]
+}
+
 pub(super) fn constants(ex: &ShaderExtract) -> Option<(u8, DirectSampler)> {
     use tuxbox_dxbc::compute_table::records;
     let root = ex.root_sig.as_ref()?;
-    let (index, start) = match (ex.stage, root.params.as_slice()) {
+    // The pixel form names the index map itself; compute roots are matched as
+    // the title declared them.
+    let params = if ex.stage == Stage::Compute { guest_params(root) } else { root.params.as_slice() };
+    let (index, start) = match (ex.stage, params) {
         (Stage::Pixel, [table, _, rest @ ..])
             if matches!(table.kind, RootParamKind::Table(_))
                 && (rest.is_empty()

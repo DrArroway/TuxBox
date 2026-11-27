@@ -6,6 +6,7 @@ runs the result on the GPU and compares every output word with a reference
 model. No game data is used. Builds the translator's example emitters first.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import sys
 from time import monotonic
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from project_tuxbox.jobs import check_jobs  # noqa: E402
 MANIFEST = ROOT / "tools/shader-compiler/Cargo.toml"
 TARGET = "x86_64-unknown-linux-gnu"
 
@@ -217,8 +220,7 @@ def main(argv=None):
           flush=True)
     host = {"provider": a.provider.resolve(), "proton": a.proton.resolve(), "prefix": a.prefix.resolve(),
             "compiler-dir": a.compiler_dir.resolve(), "adapter": a.adapter.lower()}
-    results = []
-    for name in a.only or CHECKS:
+    def run_check(name):
         started = monotonic()
         log = work / f"{name}.log"
         with log.open("w") as stream:
@@ -234,11 +236,19 @@ def main(argv=None):
                 status = "no program"
         lines = log.read_text(errors="replace").strip().splitlines()
         summary = lines[-1][:300] if lines else ""
-        results.append({"check": name, "passed": status == 0, "seconds": round(monotonic() - started, 1),
-                        "summary": summary})
-        print(f"{'PASS' if status == 0 else 'FAIL'}  {name}  {summary}", flush=True)
-        if status != 0:
-            print("\n".join(lines[-12:]), flush=True)
+        row = {"check": name, "passed": status == 0, "seconds": round(monotonic() - started, 1),
+               "summary": summary}
+        return row, lines
+
+    results = []
+    # Each check has its own work directory, Wine prefix and sandbox. Results are
+    # reported in the listed order.
+    with ThreadPoolExecutor(check_jobs()) as pool:
+        for row, lines in pool.map(run_check, a.only or CHECKS):
+            results.append(row)
+            print(f"{'PASS' if row['passed'] else 'FAIL'}  {row['check']}  {row['summary']}", flush=True)
+            if not row["passed"]:
+                print("\n".join(lines[-12:]), flush=True)
     passed = all(row["passed"] for row in results)
     (work / "summary.json").write_text(json.dumps(
         {"schema": 1, "adapter": host["adapter"], "passed": passed, "checks": results}, indent=2) + "\n")

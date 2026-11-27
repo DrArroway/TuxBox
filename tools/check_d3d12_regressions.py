@@ -5,6 +5,7 @@ The supplied build artifacts must come from the intended revision. The
 source Proton prefix is copied and never modified. Logs remain local.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -14,9 +15,14 @@ import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Lock
 from time import monotonic
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from project_tuxbox.jobs import check_jobs  # noqa: E402
+# The launcher builds its Vulkan layer on first use; one case at a time.
+LAYER_BUILD = Lock()
 
 CASES = {
     "root-cbv-window": ("d3d12-root-cbv-window", (), "d3d12-root-cbv-window", ("words=120/120","window=65536","offsets=0,256,65280,65536,65792")),
@@ -208,8 +214,7 @@ def main(argv=None):
         ap.error("missing build, Proton or compiler artifact")
     fingerprints={k:sha(p) for k,p in artifacts.items()}
     a.work.mkdir(parents=True)
-    rows=[]
-    for case in selected:
+    def run_case(case):
         start=monotonic()
         name,extra,_,_=CASES[case]
         with TemporaryDirectory(dir=a.work,prefix=case+"-") as temp:
@@ -232,7 +237,8 @@ def main(argv=None):
             settings,failure={},None
             if case in LAUNCHER_CBV:
                 try:
-                    settings=launcher_cbv(a.proton.resolve(),trial/(name+".exe"))
+                    with LAYER_BUILD:
+                        settings=launcher_cbv(a.proton.resolve(),trial/(name+".exe"))
                     env.update(settings)
                 except (OSError,subprocess.CalledProcessError) as error:
                     failure=f"constant-buffer setup failed: {error}"
@@ -258,12 +264,18 @@ def main(argv=None):
             # Logs are local only; the JSON receipt contains a fixed case
             # name, exit status and the known fixture's synthetic PASS line.
             ok,receipt=validate(case,a.adapter,status,log.read_text(errors="replace"))
-            rows.append(dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt,
-                             null_fallback_enabled=case=="null-usage"))
+            row=dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt,
+                     null_fallback_enabled=case=="null-usage")
             if case in LAUNCHER_CBV:
                 # The names say which route ran. Paths stay out of the receipt.
-                rows[-1]["launcher_cbv"]={k:settings.get(k,"") for k in ("VKD3D_CONFIG","VK_INSTANCE_LAYERS","VKD3D_DISABLE_EXTENSIONS")}
-            print(case,"PASS" if ok else "FAIL",*([failure] if failure else []),flush=True)
+                row["launcher_cbv"]={k:settings.get(k,"") for k in ("VKD3D_CONFIG","VK_INSTANCE_LAYERS","VKD3D_DISABLE_EXTENSIONS")}
+            return row,failure
+    rows=[]
+    # Each case runs in its own sandbox with a copied prefix and its own X server.
+    with ThreadPoolExecutor(check_jobs()) as pool:
+        for row,failure in pool.map(run_case,selected):
+            rows.append(row)
+            print(row["case"],"PASS" if row["passed"] else "FAIL",*([failure] if failure else []),flush=True)
     unchanged=fingerprints=={k:sha(p) for k,p in artifacts.items()}
     report=dict(schema=1,scope="Synthetic D3D12 provider controls; not retail execution",
                 adapter=a.adapter.lower(),proton=(a.proton/"version").read_text().strip(),

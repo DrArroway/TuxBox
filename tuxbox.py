@@ -135,7 +135,7 @@ def main():
     check.add_argument("--adapter", help="select a hardware graphics adapter by PCI vendor:device")
     gate = subs.add_parser("check", help="run every check a change needs before it can be merged")
     gate.add_argument("--no-gpu", action="store_true",
-                      help="run only the checks CI runs; the change still needs a GPU run before merging")
+                      help="run only the checks CI runs; see CONTRIBUTING.md for the GPU checks a change needs")
     gate.add_argument("--baseline", type=Path, metavar="RESULTS",
                       help="compare the Lanes benchmark with an earlier check's results")
     gate.add_argument("--windows-dxc", type=Path, metavar="DIR",

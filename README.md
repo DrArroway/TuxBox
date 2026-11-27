@@ -50,7 +50,7 @@ Press Left or Right to change lanes, or Space to take a turn in your current lan
 
 ## Contributing
 
-Every change must pass `python tuxbox.py check`, which includes running Lanes on a real GPU. [How to contribute](CONTRIBUTING.md)
+Every change must pass the checks relevant to it, on a real GPU where it affects one. [How to contribute](CONTRIBUTING.md#test-what-your-change-touches)
 
 ## License
 

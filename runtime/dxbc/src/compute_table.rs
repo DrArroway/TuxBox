@@ -186,7 +186,10 @@ fn read_bindings(
                 let mut types = rows.chunks_exact(stride).filter_map(|row| {
                     if word(row, 8)? != register || word(row, 12)? != register { return None; }
                     let ty = word(row, 0)?;
-                    ((ty == raw && shape == 1) || ((ty == typed || ty == structured)
+                    // An acceleration structure is a raw SRV in PSV, told apart only by
+                    // its resource kind (24-byte rows). FSSM gives its descriptor shape 4.
+                    let scene = !uav && shape == 4 && word(row, 16) == Some(RT_ACCELERATION_STRUCTURE);
+                    ((ty == raw && (shape == 1 || scene)) || ((ty == typed || ty == structured)
                         && (4..=2048).contains(&shape) && shape.is_multiple_of(4))).then_some(ty)
                 });
                 let ty = types.next()?;
@@ -383,6 +386,9 @@ pub fn missing_root_descriptors(bytes: &[u8], root: &crate::rootsig::RootSig) ->
 /// Binding kind for a root SRV read through its GPU address in two SGPRs. The
 /// shader names it with its own register, which the host root must then carry.
 pub const ROOT_SRV: u32 = 5;
+
+/// PSV resource kind (DXIL `ResourceKind`) of a ray tracing acceleration structure.
+const RT_ACCELERATION_STRUCTURE: u32 = 16;
 
 /// A raster descriptor record under a root with several leading tables names its
 /// table in the high half of the location, as compute records do, and table N is

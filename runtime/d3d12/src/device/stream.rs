@@ -444,7 +444,7 @@ unsafe fn create(
     }
     if let Some((code, Some(index))) = original[5]
         && let Some(root) =
-            super::compute_scene::private_root(&device.native, code, &stages[index], guest_root, node_mask)?
+            super::compute_scene::private_root(&device.native, code, &stages[index], guest_root, None, node_mask)?
     {
         if fields
             .iter()

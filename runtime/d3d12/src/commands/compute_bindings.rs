@@ -44,23 +44,26 @@ impl SceneLocation {
 
 #[derive(PartialEq)]
 pub(super) struct SceneCheck {
-    location: SceneLocation,
-    pub(super) scene: (ID3D12Resource, u64),
+    locations: Vec<SceneLocation>,
+    /// One native scene per private scene register, in register order.
+    pub(super) scenes: Vec<(ID3D12Resource, u64)>,
     pub(super) geometry: Option<[(ID3D12Resource, u64); 2]>,
 }
 
 impl SceneCheck {
     pub(super) fn recheck_on_submit(&self) -> bool {
-        matches!(self.location, SceneLocation::Table(_)) || self.geometry.is_some()
+        self.locations.iter().any(|l| matches!(l, SceneLocation::Table(_))) || self.geometry.is_some()
     }
 
     pub(super) fn validate(&self, list: &super::List) -> Result<()> {
         let owner = list.parent.as_ref().ok_or(E_INVALIDARG)?;
-        if unsafe { self.location.resolve(owner)? } != self.scene {
-            return Err(E_INVALIDARG.into());
+        for (location, scene) in self.locations.iter().zip(&self.scenes) {
+            if unsafe { location.resolve(owner)? } != *scene {
+                return Err(E_INVALIDARG.into());
+            }
         }
         if let Some(geometry) = &self.geometry
-            && unsafe { crate::device::blas::inline_geometry(owner, self.scene.1)? } != *geometry
+            && unsafe { crate::device::blas::inline_geometry(owner, self.scenes[0].1)? } != *geometry
         {
             return Err(E_INVALIDARG.into());
         }
@@ -288,7 +291,8 @@ impl Bindings {
         leases: &mut crate::device::descriptor_paging::DescriptorLeases,
         heap: Option<&super::descriptors::ResourceHeap>, reads: &mut Vec<std::ops::Range<usize>>,
         heap_reads: &mut Vec<std::ops::Range<usize>>,
-        resources: &crate::device::MediaResources, dispatch: impl FnOnce(),
+        resources: &crate::device::MediaResources,
+        scene: Option<(&SceneRoot, &[u64], Option<[u64; 2]>)>, dispatch: impl FnOnce(),
     ) -> Result<()> {
         let layout = if COMPUTE { &self.layout } else { &self.graphics_layout };
         if !layout.as_ref().is_some_and(|l| l.matches(&table.original)) {
@@ -339,10 +343,19 @@ impl Bindings {
         };
         unsafe {
             if COMPUTE {
-                list.SetComputeRootSignature(&table.native);
+                // A ray-query program's scene root is the reflected root with
+                // its private scene SRVs appended.
+                list.SetComputeRootSignature(scene.map_or(&table.native, |(root, ..)| &root.native));
                 // Changing root signatures invalidates the native arguments. Replay
                 // constants and descriptors, then substitute each reflected table.
                 self.apply_compute_args(list, bases);
+                if let Some((root, scenes, geometry)) = scene {
+                    let mut slot = root.appended;
+                    for &va in scenes.iter().chain(geometry.iter().flatten()) {
+                        list.SetComputeRootShaderResourceView(slot, va);
+                        slot += 1;
+                    }
+                }
                 if let Some((slot, address)) = strides {
                     list.SetComputeRootShaderResourceView(slot, address);
                 }
@@ -406,26 +419,31 @@ impl Bindings {
             return Err(E_INVALIDARG.into());
         }
         let owner = list.parent.as_ref().ok_or(E_INVALIDARG)?;
-        let location = match scene.source {
-            SceneSource::Table { slot, offset } => {
-                SceneLocation::Table(self.table_entry(slot, offset)?)
-            }
-            SceneSource::RootSrv(slot) => {
-                let Some(Argument::Buffer(BufferView::Srv(address))) = self.compute_args.get(&slot) else {
-                    return Err(E_INVALIDARG.into());
-                };
-                SceneLocation::Address(*address)
-            }
-        };
-        let backing = unsafe { location.resolve(owner)? };
-        let geometry = if scene.program.triangle_geometry {
-            Some(unsafe { crate::device::blas::inline_geometry(owner, backing.1)? })
-        } else {
-            None
+        let mut locations = Vec::with_capacity(scene.sources.len());
+        let mut scenes = Vec::with_capacity(scene.sources.len());
+        for source in scene.sources.iter() {
+            let location = match *source {
+                SceneSource::Table { slot, offset } => {
+                    SceneLocation::Table(self.table_entry(slot, offset)?)
+                }
+                SceneSource::RootSrv(slot) => {
+                    let Some(Argument::Buffer(BufferView::Srv(address))) = self.compute_args.get(&slot) else {
+                        return Err(E_INVALIDARG.into());
+                    };
+                    SceneLocation::Address(*address)
+                }
+            };
+            scenes.push(unsafe { location.resolve(owner)? });
+            locations.push(location);
+        }
+        let geometry = match (scene.program.triangle_geometry, scenes.as_slice()) {
+            (false, _) => None,
+            (true, [only]) => Some(unsafe { crate::device::blas::inline_geometry(owner, only.1)? }),
+            (true, _) => return Err(E_INVALIDARG.into()),
         };
         Ok(SceneCheck {
-            location,
-            scene: backing,
+            locations,
+            scenes,
             geometry,
         })
     }
@@ -572,17 +590,19 @@ impl Bindings {
         &self,
         host: &ID3D12GraphicsCommandList,
         root: &SceneRoot,
-        va: u64,
+        scenes: &[u64],
         geometry: Option<[u64; 2]>,
         dispatch: impl FnOnce(),
     ) {
         unsafe {
             host.SetComputeRootSignature(&root.native);
             self.apply_compute_args(host, &[]);
-            host.SetComputeRootShaderResourceView(root.appended, va);
-            if let Some([instances, normals]) = geometry {
-                host.SetComputeRootShaderResourceView(root.appended + 1, instances);
-                host.SetComputeRootShaderResourceView(root.appended + 2, normals);
+            // Private root SRVs follow the title's parameters: scenes in
+            // register order, then the geometry tables of a single scene.
+            let mut slot = root.appended;
+            for &va in scenes.iter().chain(geometry.iter().flatten()) {
+                host.SetComputeRootShaderResourceView(slot, va);
+                slot += 1;
             }
             dispatch();
             host.SetComputeRootSignature(self.compute.as_ref());

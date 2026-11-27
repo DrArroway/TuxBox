@@ -117,6 +117,7 @@ pub const MAX_HLSL_BYTES: usize = 8 << 20;
 mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
+pub(crate) mod scarlett_rays;
 mod screen_gather;
 mod reflection_far;
 mod sampler_heap;

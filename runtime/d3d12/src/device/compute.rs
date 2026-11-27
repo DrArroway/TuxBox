@@ -330,6 +330,7 @@ unsafe fn create_pipeline_x_inner(
             bytes,
             translated,
             root.map(|p| &p.state),
+            reflected.as_ref().map(|t| &t.layout),
             desc.NodeMask,
         ) {
             Ok(root) => root,

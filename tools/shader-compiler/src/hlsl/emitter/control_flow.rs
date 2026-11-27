@@ -103,7 +103,7 @@ impl<'a> Emitter<'a> {
 
         let insns = self.insns.clone();
         let view_cull = self.view_cull;
-        let probe_trace = insns.iter().any(|op| matches!(op.mnemonic.as_str(),"tb_radiance_query" | "tb_reflection_far_query"));
+        let probe_trace = insns.iter().any(|op| matches!(op.mnemonic.as_str(),"tb_radiance_query" | "tb_reflection_far_query" | super::super::scarlett_rays::MNEMONIC));
         if view_cull.is_some() { self.line("uint cull_view = 0u; bool cull_candidate = false; uint3 cull_record = 0;"); }
         if insns.iter().any(|op| op.mnemonic == "tb_view_occluded") {
             self.line("bool hidden = false; uint hidden_id = 0u, hidden_view = 0u;");

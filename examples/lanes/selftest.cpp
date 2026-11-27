@@ -2792,6 +2792,157 @@ void bindless_texture_store(ID3D12Device* device) {
     }
 }
 
+// A guest texture of 64x64 words over title memory filled with one word.
+struct GuestWords {
+    static constexpr UINT side = 64;
+    static constexpr size_t words = 4 * 65536 / sizeof(UINT);
+    Memory memory{4 * 65536};
+    ComPtr<ID3D12Resource> texture;
+    GuestWords(ID3D12Device* device, DXGI_FORMAT format, UINT word) {
+        fill(word);
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = side;
+        desc.Height = side;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Format = format;
+        desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        check(method<Place>(device, device_place)(device, memory.address(), &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, IID_PPV_ARGS(&texture)), "place guest texture of words");
+    }
+    UINT* guest() const { return reinterpret_cast<UINT*>(memory.base); }
+    void fill(UINT word) { std::fill_n(guest(), words, word); }
+    size_t count(UINT word) const { return std::count(guest(), guest() + words, word); }
+};
+
+// A program under a root that allows direct heap indexing stores one word to
+// the texture at slot 1 of its descriptor table, and uses nothing else. The
+// provider must publish that texture to title memory, and must leave alone a
+// second texture whose UAV sits elsewhere in the heap: the dispatch waits for
+// a label while the title rewrites the second texture's pages, and a
+// write-back after the dispatch would replace the title's new words.
+void bindless_table_store(ID3D12Device* device) {
+    constexpr UINT side = GuestWords::side, pitch = side * sizeof(UINT), before = 0x11111111, after = 0x22222222;
+    constexpr UINT table_start = 70, elsewhere = 100;
+    constexpr UINT64 bytes = UINT64(pitch) * side;
+    // The root names the table's four views u0-u3, as the program's records
+    // do, so the provider keeps the title's root and serves it through the
+    // resource index map. The provider reflects version 1.1 roots only.
+    D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0,
+                                  D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+    D3D12_ROOT_PARAMETER1 table{};
+    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    table.DescriptorTable = {1, &range};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr),
+          "serialize direct-indexed table root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create direct-indexed table root");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {bindless_table_store_shader, sizeof(bindless_table_store_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+          IID_PPV_ARGS(&pipeline)), "create translated table store pipeline");
+
+    GuestWords stored(device, DXGI_FORMAT_R32_FLOAT, before), other(device, DXGI_FORMAT_R32_FLOAT, before);
+    Memory label(65536);
+    // A title's allocator hands out memory it has not cleared. Leave some of
+    // the size of this heap's descriptors behind, so that the table's unwritten
+    // slots start with leftover bytes, as they can in a title.
+    {
+        constexpr size_t heap_bytes = 128 * 32;
+        void* blocks[8];
+        for (auto& block : blocks) {
+            block = HeapAlloc(GetProcessHeap(), 0, heap_bytes);
+            if (block) std::memset(block, 0xA5, heap_bytes);
+        }
+        for (void* block : blocks)
+            if (block) HeapFree(GetProcessHeap(), 0, block);
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create table store view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get());
+    const UINT64 gpu_base = method<GpuHandle>(heap.Get(), 10)(heap.Get());
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    view.Format = DXGI_FORMAT_R32_FLOAT;
+    device->CreateUnorderedAccessView(stored.texture.Get(), nullptr, &view,
+                                     {cpu_base + SIZE_T(table_start + bindless_table_slot) * stride});
+    device->CreateUnorderedAccessView(other.texture.Get(), nullptr, &view, {cpu_base + SIZE_T(elsewhere) * stride});
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    auto list = direct.list.Get();
+    direct.wait64(label.address(), 1);
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    method<SetTable>(list, slot_compute_table)(list, 0, {gpu_base + UINT64(table_start) * stride});
+    list->SetPipelineState(pipeline.Get());
+    list->Dispatch(1, 1, 1);
+    direct.submit();
+    // The dispatch is held. The title now owns the second texture's pages again.
+    other.fill(after);
+    compute.write64(label.address(), 1);
+    compute.submit();
+    compute.finish("compute queue releasing the table store");
+    direct.finish("table store under a direct-indexed root");
+    const size_t published = stored.count(bindless_table_expected), untouched = stored.count(before);
+    const size_t kept = other.count(after);
+
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION image{}, linear{};
+    image.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    image.pResource = stored.texture.Get();
+    linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    linear.pResource = readback.Get();
+    linear.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, side, side, 1, pitch};
+    direct.reopen();
+    method<frame_abi::Copy>(direct.list.Get(), slot_copy_texture)(
+        direct.list.Get(), &linear, 0, 0, 0, &image, nullptr, 0);
+    direct.submit();
+    direct.finish("reading the table-stored texture");
+    D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map table-stored texture");
+    std::vector<UINT> texels(size_t(side) * side);
+    std::memcpy(texels.data(), mapped, size_t(bytes));
+    readback->Unmap(0, &empty);
+    char message[200];
+    for (UINT y = 0; y < side; ++y)
+        for (UINT x = 0; x < side; ++x) {
+            const UINT expected = x == bindless_store_x && y == bindless_store_y ? bindless_table_expected : before;
+            if (const UINT found = texels[size_t(y) * side + x]; found != expected) {
+                std::snprintf(message, sizeof(message), "texel (%u, %u): expected %#x, found %#x%s", x, y, expected,
+                              found, expected != before && found == before ? " (a stand-in or a skipped dispatch)" : "");
+                throw std::runtime_error(message);
+            }
+        }
+    if (published != 1 || untouched != GuestWords::words - 1) {
+        std::snprintf(message, sizeof(message),
+                      "title memory holds the stored word %zu times and its old word %zu times of %zu: "
+                      "the table store was not published exactly", published, untouched, GuestWords::words);
+        throw std::runtime_error(message);
+    }
+    if (kept != GuestWords::words) {
+        std::snprintf(message, sizeof(message),
+                      "the provider wrote back a texture the program cannot reach: %zu of %zu title words replaced",
+                      GuestWords::words - kept, GuestWords::words);
+        throw std::runtime_error(message);
+    }
+}
+
 struct Scenario {
     const wchar_t* name;
     void (*run)(ID3D12Device*);
@@ -2828,6 +2979,7 @@ constexpr Scenario scenarios[] = {
     {L"bindless-sampler", bindless_sampler},
     {L"bindless-heap-read", bindless_heap_read},
     {L"bindless-texture-store", bindless_texture_store},
+    {L"bindless-table-store", bindless_table_store},
     {L"bindless-table-compute", bindless_table_compute},
 };
 
@@ -2886,7 +3038,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
                                              L"compute-root-recovery", L"bindless-compute",
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
-                                             L"bindless-table-compute"};
+                                             L"bindless-table-store", L"bindless-table-compute"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

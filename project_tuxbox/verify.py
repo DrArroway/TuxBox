@@ -490,7 +490,7 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
     """
     from functools import partial
     from examples.lanes.shader_fixture import (bindless_compute_shader, bindless_sampler_shader,
-                                               bindless_texture_store_shader)
+                                               bindless_table_store_shader, bindless_texture_store_shader)
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
@@ -504,6 +504,7 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
                                           ("bindless-sampler", bindless_sampler_shader),
                                           ("bindless-heap-read", bindless_compute_shader),
                                           ("bindless-texture-store", bindless_texture_store_shader),
+                                          ("bindless-table-store", bindless_table_store_shader),
                                           ("bindless-table-compute", partial(bindless_compute_shader, table=True)))
                   for kind, limit in (("wide", "1000000"), ("constrained", "64"))]
         for scenario, original, kind, limit in trials:
@@ -1187,6 +1188,8 @@ GATE_LABELS = {
     "lanes-bindless-heap-read-constrained": "The same with fewer resident descriptors than the indices in use",
     "lanes-bindless-texture-store-wide": "A direct-indexed store to a heap UAV texture, published to title memory",
     "lanes-bindless-texture-store-constrained": "The same with fewer resident descriptors than the index it uses",
+    "lanes-bindless-table-store-wide": "A table store under a direct-indexed root published alone, leaving another heap UAV texture's title memory alone",
+    "lanes-bindless-table-store-constrained": "The same with fewer resident descriptors than the indices in use",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

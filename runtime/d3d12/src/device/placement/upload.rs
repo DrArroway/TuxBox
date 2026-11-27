@@ -88,6 +88,7 @@ impl Transfer {
             }
         }
         let upload = Upload::record(device, &changes)?;
+        let mut reader_waits = Vec::new();
         for mips in changes.chunk_by(|a, b| Arc::ptr_eq(&a.texture, &b.texture)) {
             // A guest may use a different queue on each submission. Order
             // replacement writes after every outstanding reader of this texture.
@@ -96,12 +97,13 @@ impl Transfer {
                 if unsafe { fence.GetCompletedValue() } < *value
                     && !super::held::blocked(fence, *value)
                 {
-                    unsafe {
-                        self.queue.Wait(fence, *value)?;
-                        crate::commands::queue_trace::waited(&self.queue, "upload waits for texture reads", fence, *value);
-                    }
+                    super::waits::include(&mut reader_waits, fence, *value);
                 }
             }
+        }
+        for (fence, value) in reader_waits {
+            unsafe { self.queue.Wait(&fence, value)? };
+            crate::commands::queue_trace::waited(&self.queue, "upload waits for texture reads", &fence, value);
         }
         let tick = self.tick()?;
         self.pending.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;

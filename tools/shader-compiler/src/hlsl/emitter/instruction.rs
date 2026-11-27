@@ -66,6 +66,14 @@ impl<'a> Emitter<'a> {
                 self.ws(&d.ok_or("missing lane-read destination")?, &format!("readlane{idx}"))?;
                 return Ok(());
             }
+            mixed_lane::WRITE_LANE => {
+                // The selected physical lane is written even when guest EXEC disables it.
+                let value = r(&s[0])?;
+                let lane = r(&s[1])?;
+                let dst = d.ok_or("missing mixed lane destination")?;
+                self.ws(&dst, &format!("(WaveGetLaneIndex() == (({lane}) & 31u)) ? {value} : {}", r(&dst)?))?;
+                return Ok(());
+            }
             indexed_lane::WAVE32_READ_LANE => {
                 if self.dispatched {
                     return Err("wave32 lane read in a block-dispatched program".into());

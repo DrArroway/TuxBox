@@ -168,7 +168,11 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     };
     let mut insns = disassemble(&ex.isa);
     if lone_lane::on() { lone_lane::prepare(&mut insns)?; }
-    let resolve_wave32 = !lone_lane::on() && ray_resolve::wave32(ex, &insns)?;
+    // Mixed lane storage uses the full-mask emitter after structural validation.
+    let mixed_lane_wave32 = !lone_lane::on()
+        && mixed_lane::prepare(ex, &mut insns).inspect_err(|_| *lane_read_failed = true)?;
+    *lane_read_failed |= mixed_lane_wave32;
+    let resolve_wave32 = mixed_lane_wave32 || !lone_lane::on() && ray_resolve::wave32(ex, &insns)?;
     let probe = radiance_probe::identify(ex);
     let probe_trace = probe.is_some();
     if let Some(probe) = probe { radiance_probe::prepare(probe, &mut insns); }
@@ -299,7 +303,9 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         // Complete-wave compute groups can exchange unproven dynamic SGPR lane reads
         // through group memory with wave-width masking (`& 31u` or `& 63u`).
         if ex.stage == Stage::Pixel { lower_first_lane_reads(&mut insns); }
-        lower_lane_spills(&mut insns, resolve_wave32, has_group_read_fallback)?;
+        if !mixed_lane_wave32 {
+            lower_lane_spills(&mut insns, resolve_wave32, has_group_read_fallback)?;
+        }
         if let Some(width) = read_plan.group_read_width {
             for ins in insns.iter_mut().filter(|i| i.mnemonic == GROUP_READ) {
                 ins.aux.imm = i64::from(width - 1);
@@ -476,6 +482,10 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         let threads = compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul).ok_or("invalid group size")?;
         if bytes == 0 || bytes + 4*threads > 32768 { return Err("guest LDS and exchange exceed the group shared budget".into()); }
         em.reflected_lds_words = Some(bytes/4);
+    }
+    // Mixed lane storage requires uniform host participation even without reductions.
+    if mixed_lane_wave32 && !wave_loops::uniform_dispatch(&em) {
+        return Err("mixed lane Wave32 requires proven whole-wave scalar dispatch".into());
     }
     if let Some(width) = required_wave_size {
         match wave_sum::check_control_flow(&em.insns, width) {

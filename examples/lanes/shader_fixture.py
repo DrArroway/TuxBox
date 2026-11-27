@@ -59,6 +59,38 @@ def wave_expected():
     return [n + sum(range(n & ~63, (n & ~63) + 64)) for n in range(WAVE_THREADS)]
 
 
+# A gfx1030 Wave32 program with a vector register that is also used by
+# WRITELANE. Lane 12 is the first with EXEC set, so its v5 selects lane 9.
+# WRITELANE and READLANE must both reach lane 9 with its EXEC bit clear.
+LANE_WRITE_WORD = 0x7F15CAFE
+LANE_CODE = (
+    0xF4080402, 0xFA000000,     # s_load_dwordx4 s[16:19], s[4:5], 0
+    0x3A120093,                 # v_xor_b32 v9, 19, v0
+    0xD5260005, 0x02010700,     # v_sub_nc_u32 v5, v0, 3
+    0xD4C6000B, 0x02011900,     # v_cmp_ge_u32 s11, v0, 12
+    0xBE8A3C0B,                 # s_and_saveexec_b32 s10, s11
+    0xBE8803FF, LANE_WRITE_WORD, # s_mov_b32 s8, LANE_WRITE_WORD
+    0xD7610009, 0x02011208,     # v_writelane_b32 v9, s8, 9
+    0x7E0E0505,                 # v_readfirstlane_b32 s7, v5
+    0xD7600007, 0x02000F09,     # v_readlane_b32 s7, v9, s7
+    0xBEFE030A,                 # s_mov_b32 exec_lo, s10
+    0x3A0C1207,                 # v_xor_b32 v6, s7, v9
+    0x34100082,                 # v_lshlrev_b32 v8, 2, v0
+    0xBF8CC07F,                 # s_waitcnt lgkmcnt(0)
+    0xE0701000, 0x80040608,     # buffer_store_dword v6, v8, s[16:19], 0 offen
+    0xBF810000,                 # s_endpgm
+)
+
+
+def lane_shader():
+    return uav_shader(list(LANE_CODE), width=32)
+
+
+def lane_expected():
+    """Every lane combines the broadcast with its own retained VGPR value."""
+    return [0 if lane == 9 else LANE_WRITE_WORD ^ (lane ^ 19) for lane in range(32)]
+
+
 # The `compute-root` programs, checked with `llvm-mc -mcpu=gfx1030 -show-encoding`.
 # Each stores ROOT_EXPECTED through the descriptor at a byte offset of table 1,
 # whose pointer arrives in s5. Their FSSM record and PSV binding name it a raw
@@ -192,9 +224,12 @@ def declaration(name, data):
 
 def header():
     words = ",".join(f"{word}u" for word in wave_expected())
+    lane_words = ",".join(f"{word}u" for word in lane_expected())
     return ("// Generated from shader_fixture.py.\n"
             + declaration("xbox_shader", shader()) + declaration("wave_shader", wave_shader())
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n"
+            + declaration("lane_shader", lane_shader())
+            + f"constexpr unsigned lane_shader_expected[] = {{{lane_words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
             + declaration("bindless_compute_shader", bindless_compute_shader())
             + declaration("bindless_table_compute_shader", bindless_compute_shader(table=True))

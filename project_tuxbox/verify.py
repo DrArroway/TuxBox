@@ -156,40 +156,35 @@ def lanes_wave_shader(host, check, gpu_args, pci, memory_symbols):
                 host.env[name] = value
 
 
-def lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work):
-    """Translate the wave32 masked DPP shader and verify the provider loads it.
-
-    The wave-alloc scenario creates a pipeline from a console shader whose wave32
-    masked DPP exclusive prefix the translator must lower to `WavePrefixSum`.
-    Without the wave-alloc lowering the compiler rejects the shader, so the
-    provider never loads a translation and this gate fails.
-    """
+def lanes_live_wave_shaders(host, check, gpu_args, pci, memory_symbols):
+    """Translate Wave32 programs live and verify the provider loads each result."""
     from .runtime_shaders import shader_session
+    from examples.lanes.shader_fixture import lane_shader
     from examples.lanes.wave_alloc_fixture import shader as wave_alloc_shader
-
-    lanes = LanesShader(host, wave_alloc_shader())
-    key, root, forget = lanes.key, lanes.root, lanes.forget
 
     saved = {name: host.env.get(name) for name in ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")}
     host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
     host.env.pop("TUXBOX_SHADER_SESSION", None)
-    loaded = f"prepared compute shader loaded, source SHA-256 {key}"
 
-    def expect_loaded(output):
+    def expect_loaded(output, key):
+        loaded = f"prepared compute shader loaded, source SHA-256 {key}"
         return None if loaded in output else "the provider did not load the translated shader"
 
-    def launch(name, log_check):
-        return check(name, "lanes/lanes.exe", ["--selftest", "wave-alloc", *gpu_args, "--report"],
-                     rf"lanes-selftest PASS pci={pci} scenario=wave-alloc passed=1",
-                     providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
-                                "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
-                     config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=log_check)
-
     try:
-        forget()
-        with shader_session(root, host.env, lambda line: None):
-            launch("lanes-shader-cache-wave-alloc", expect_loaded)
-        forget()
+        for scenario, data in (("wave-alloc", wave_alloc_shader()), ("mixed-lane", lane_shader())):
+            shader = LanesShader(host, data)
+            shader.forget()
+            try:
+                with shader_session(shader.root, host.env, lambda line: None):
+                    check(f"lanes-shader-cache-{scenario}", "lanes/lanes.exe",
+                          ["--selftest", scenario, *gpu_args, "--report"],
+                          rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
+                          providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                     "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                          config="lanes/MicrosoftGame.config", device_factory="xbox",
+                          log_check=lambda output, key=shader.key: expect_loaded(output, key))
+            finally:
+                shader.forget()
     finally:
         for name, value in saved.items():
             if value is None:
@@ -1045,7 +1040,7 @@ def verify(host, output, adapter, selected=None, samples=1):
         if "lanes-shader-cache" in selected and host.backend == "proton":
             lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work)
             lanes_wave_shader(host, check, gpu_args, pci, memory_symbols)
-            lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work)
+            lanes_live_wave_shaders(host, check, gpu_args, pci, memory_symbols)
         if "lanes-raster-tables" in selected and host.backend == "proton":
             lanes_raster_tables(host, check, gpu_args, pci, memory_symbols)
         if "lanes-compute-root" in selected and host.backend == "proton":
@@ -1167,6 +1162,7 @@ GATE_LABELS = {
     "lanes-wave-shader-host": "A 64-lane console shader with the translation this graphics card needs",
     "lanes-raster-tables": "Console raster programs drawn under the root reflected from their two descriptor tables",
     "lanes-shader-cache-wave-alloc": "A wave32 masked DPP exclusive prefix lowered to WavePrefixSum and loaded by the provider",
+    "lanes-shader-cache-mixed-lane": "An EXEC-independent lane write and a dynamic lane read in a Wave32 compute shader",
     "lanes-lane-spill-interp": "A console pixel program with a lane-spill area and an f16 interpolator selector of the same number",
     "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
     "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",

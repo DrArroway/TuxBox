@@ -366,7 +366,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
             let g = match self.packed.as_ref().map(|p| &p.abi) {
-                None if self.resolve_wave32 || lone_lane::on() && ray_resolve::applies(ex) => ray_resolve::group_x_register(ex)
+                None if (self.resolve_wave32 || lone_lane::on()) && ray_resolve::applies(ex) => ray_resolve::group_x_register(ex)
                     .ok_or("unverified resolve compute user-data layout")?,
                 Some(RootAbi::RegisterWave32 | RootAbi::RegisterWave64) => 6 + 2 * (nparams - 2), // two tables followed by root CBV pairs
                 Some(RootAbi::ArgumentBlock) => 4,
@@ -417,10 +417,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 writeln!(h, "    uint tb_wave_tid = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
-            if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp {
+            let remap_wave = self.resolve_wave32 && [tx, ty_, tz] != [32, 1, 1];
+            if !remap_wave && (self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp) {
                 writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
-            if self.resolve_wave32 {
+            if remap_wave {
+                // A full wave uses its immutable physical lane to reconstruct guest XYZ.
+                writeln!(h, "    uint tb_lane = WaveGetLaneIndex(); uint tb_lane_bit = 1u << tb_lane;").unwrap();
+                writeln!(h, "    v0 = tb_lane % {tx}u; v1 = (tb_lane / {tx}u) % {ty_}u; v2 = tb_lane / ({tx}u * {ty_}u);").unwrap();
+            } else if self.resolve_wave32 {
                 writeln!(h, "    v0 = WaveGetLaneIndex(); v1 = gtid.y; v2 = gtid.z; uint tb_lane_bit = 1u << v0;").unwrap();
             } else {
                 writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;").unwrap();

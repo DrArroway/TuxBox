@@ -329,6 +329,27 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     return validated_dxil(dxv, output, stage)
 
 
+def stride_table_retry(xshader, cooked, flags, hlsl, profile):
+    """Mirror the runtime's heap-stride retry: translate the embedded root with the
+    stride table appended. Returns the variant's digest, or None on failure.
+
+    The runtime retries a heap-indexed IDXEN access on the same root with the
+    stride table appended (see the compute_table merge). The embedded root is
+    the only root available before launch, so the variant is built from it.
+    """
+    try:
+        result = subprocess.run(
+            [xshader, cooked, *flags, "--stride-table", "--hlsl-out", hlsl, "--profile-out", profile],
+            capture_output=True, text=True, errors="replace", timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"^stride-digest=([0-9a-f]{64})$", result.stdout, re.M)
+    return match.group(1) if match else None
+
+
 def compile_request(source, key, tools, cache, session, *, remember=None, persistent=None):
     linked = source.suffix == ".link"
     xshader, dxc, dxv = tools
@@ -399,24 +420,51 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             # The first process may have published while we waited.
             if reuse():
                 return False
+            original_dest = dest
+            original_refusal = refusal
             hlsl, output, profile = (work / name for name in ("shader.hlsl", "out.cso", "profile"))
             if linked:
                 run_tool([dxv, order], timeout=10)
             try:
                 run_tool([xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile], timeout=30)
+                variant_digest = None
             except ToolFailure as error:
                 # xshader reserves this status for the in-process HLSL emitter. DXC, DXV,
                 # input parsing, tool startup and filesystem failures remain retryable.
                 if error.returncode != XSHADER_UNSUPPORTED_HLSL:
                     raise
-                # Publish the reason first: a visible marker may already be read.
-                reason = work / "reason"
-                reason.write_bytes(refusal_line(str(error)).encode("utf-8")[:REASON_BYTES])
-                os.replace(reason, dest.with_suffix(".reason"))
+                reason = refusal_line(str(error))
+                variant_digest = None
+                if session is None and "raw buffer IDXEN" in reason and not any(
+                        flag.startswith("--link-pixel") or flag == "--stencil-target" for flag in flags):
+                    # The runtime retries a heap-indexed IDXEN access on the same
+                    # root with the stride table appended (see compute_table).
+                    # Mirror the retry offline: the embedded root is the only root
+                    # available before launch. A successful variant is published
+                    # under its own digest; the refusal markers for the original
+                    # key stay in place so the runtime's own retry can see them.
+                    variant_digest = stride_table_retry(xshader, cooked, flags, hlsl, profile)
+                if variant_digest is None:
+                    # Publish the reason first: a visible marker may already be read.
+                    reason_path = work / "reason"
+                    reason_path.write_bytes(reason.encode("utf-8")[:REASON_BYTES])
+                    os.replace(reason_path, dest.with_suffix(".reason"))
+                    marker = work / "unsupported"
+                    marker.write_text(key, encoding="ascii")
+                    os.replace(marker, refusal)
+                    raise ShaderRefused(str(error), cached=False) from error
+                # Keep the original refusal markers: the runtime's own retry
+                # reads them to know this translation refused only for the
+                # missing heap stride table.
+                reason_path = work / "reason"
+                reason_path.write_bytes(reason.encode("utf-8")[:REASON_BYTES])
+                os.replace(reason_path, original_dest.with_suffix(".reason"))
                 marker = work / "unsupported"
                 marker.write_text(key, encoding="ascii")
-                os.replace(marker, refusal)
-                raise ShaderRefused(str(error), cached=False) from error
+                os.replace(marker, original_refusal)
+                dest = cache / (variant_digest + ".cso")
+                checksum = dest.with_suffix(".sha256")
+                refusal = dest.with_suffix(".unsupported")
             target = profile.read_text().strip()
             # Mesh and amplification stages start at shader model 6.5. Linked
             # requests currently repack the outputs of vertex and geometry shaders.

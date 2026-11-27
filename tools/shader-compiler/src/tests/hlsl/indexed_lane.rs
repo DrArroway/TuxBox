@@ -226,9 +226,9 @@ fn wave32_masked_exec_readlane_stages_through_groupshared_and_ignores_exec() {
         tr.hlsl
     );
     assert!(!tr.hlsl.contains("WaveReadLaneAt("), "{}", tr.hlsl);
-    // Staging must be hoisted BEFORE the skip guard `if (!(j...))`.
+    // Staging must be hoisted BEFORE the skip guard `if (tb_skip < ...)`.
     let stage_pos = tr.hlsl.find("tb_swizzle[tb_lane] = v1;").unwrap();
-    let guard_pos = tr.hlsl.find("if (!(j").unwrap();
+    let guard_pos = tr.hlsl.find("if (tb_skip < ").unwrap();
     assert!(stage_pos < guard_pos, "staging must precede skip guard:\n{}", tr.hlsl);
 }
 
@@ -673,7 +673,7 @@ fn f5_indexed_lane_preserves_exec_ballot_for_v_mbcnt_lo() {
 #[test]
 fn f6_hoisted_indexed_read_guards_load_against_oob_on_partial_groups() {
     // [7, 3, 1] -> tb_swizzle[21]. Lane 0 sets s24 = 30 and skips past s24 = 5 + readlane.
-    // The hoisted load MUST guard tb_swizzle[...] on `!j...` while keeping both barriers unconditional.
+    // The hoisted load MUST guard tb_swizzle[...] on `tb_skip` while keeping both barriers unconditional.
     let [rs0, rs1] = readlane_sgpr(7, 1, 24);
     let words = [
         0xbe98_039e, // s_mov_b32 s24, 30
@@ -687,7 +687,7 @@ fn f6_hoisted_indexed_read_guards_load_against_oob_on_partial_groups() {
         .expect("partial group guarded hoisted readlane");
     assert!(tr.hlsl.contains("#define TB_SWIZZLE_WORDS 21u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];"), "{}", tr.hlsl);
     assert!(
-        tr.hlsl.contains("(!j5) ? tb_swizzle_read((tb_lane & ~31u) | (s24 & 31u)) : 0u;"),
+        tr.hlsl.contains("((tb_skip < 5u)) ? tb_swizzle_read((tb_lane & ~31u) | (s24 & 31u)) : 0u;"),
         "{}",
         tr.hlsl
     );
@@ -843,7 +843,7 @@ fn unproven_swizzle_fallback_refuses_partial_groups_and_preserves_skipped_lanes(
         tr.hlsl
     );
     assert!(
-        !tr.hlsl.contains("tb_swizzle[tb_lane] = (!j"),
+        !tr.hlsl.contains("tb_swizzle[tb_lane] = (tb_skip"),
         "GROUP_READ must not zero branch-skipped lanes:\n{}",
         tr.hlsl
     );

@@ -51,16 +51,7 @@ impl<'a> Emitter<'a> {
                     let c = if self.paired || self.resolve_wave32 || self.lockstep.is_some() {
                         wave_cull::branch_condition(self, ins, &c)
                     } else { c };
-                    // The condition is evaluated either way. Or-ing it in keeps
-                    // the branch out of an unoptimised compute program's control
-                    // flow (see `flag_or`).
-                    if self.ex.stage != Stage::Compute {
-                        self.line(&format!("if ({c}) j{t} = true;"));
-                    } else if c == "true" {
-                        self.line(&format!("j{t} = true;"));
-                    } else {
-                        self.line(&format!("j{t} = j{t} | ({c});"));
-                    }
+                    self.skip_to(t, (c != "true").then_some(c.as_str()));
                 }
                 Ok(())
             }

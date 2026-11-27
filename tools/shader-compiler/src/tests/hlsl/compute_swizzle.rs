@@ -115,7 +115,10 @@ fn countdown_loop_with_early_exit_translates() {
         .expect("countdown loop with per-thread exit translates");
     assert!(hlsl.contains("tb_swizzle"), "{hlsl}");
     assert!(hlsl.contains("WaveActiveAnyTrue(tb_c"), "{hlsl}");
-    assert!(hlsl.contains("!j7"), "{hlsl}"); // masked publish
+    assert!(hlsl.contains("(tb_skip < 7u)"), "{hlsl}"); // masked publish
+    // One variable holds every pending forward branch.
+    assert_eq!(hlsl.matches("uint tb_skip = 0u;").count(), 1, "{hlsl}");
+    assert!(!hlsl.contains("bool j"), "{hlsl}");
     assert!(hlsl.contains("GroupMemoryBarrierWithGroupSync()"), "{hlsl}");
 }
 

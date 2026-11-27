@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 
 mod driver;
 mod emitter;
+use emitter::not_skipping;
 mod rewrite;
 mod text;
 pub use driver::*;

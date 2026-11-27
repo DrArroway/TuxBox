@@ -287,7 +287,7 @@ pub(super) fn translate(
     }
     h.push_str(&em.heap_handle_decls());
     em.heap_sampler_locals(&mut h);
-    h.push_str(&em.body);
+    h.push_str(&super::exec_group::select_writes(&em.body));
     h.push_str("    return result;\n}\n");
     h.push_str(
         r#"

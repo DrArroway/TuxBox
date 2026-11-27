@@ -279,7 +279,8 @@ fn full_mask_program(em: &Emitter<'_>) -> bool {
         && !em.indexed_lane
         && em.vote_uses.is_empty()
         && !em.insns.iter().any(|op| {
-            (op.mnemonic.starts_with("tb_") && op.mnemonic != ray_resolve::READ_LANE)
+            (op.mnemonic.starts_with("tb_")
+                && !matches!(op.mnemonic.as_str(), ray_resolve::READ_LANE | super::mixed_lane::WRITE_LANE))
                 || op.enc == Enc::Ds
                 || matches!(
                     op.mnemonic.as_str(),

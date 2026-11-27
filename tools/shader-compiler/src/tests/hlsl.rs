@@ -904,3 +904,51 @@ fn floating_max_masked_prologue_rejects_immediate_select_identity() {
     insns[3].src[0] = Opnd::ConstInt(f32::NEG_INFINITY.to_bits() as i64);
     assert!(lower_wave_reductions(&mut insns).is_err());
 }
+
+fn mixed_lane_compute(group: [u32; 3], words: &[u32]) -> Result<Translated, String> {
+    let mut ex = pixel_wave_test_extract();
+    ex.stage = Stage::Compute;
+    ex.psv_threads = Some(group);
+    ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    translate(&ex)
+}
+
+#[test]
+fn mixed_lane_wave32_preserves_width_and_encoding_guards() {
+    let words = [
+        0xd4c2_000b, 0x0201_0100, // v_cmp_eq_u32 s11, v0, 0
+        0xbe84_3c0b,             // s_and_saveexec_b32 s4, s11
+        0xd761_0001, 0x0201_1608, // v_writelane_b32 v1, s8, 11
+        0x7e0a_0504,             // v_readfirstlane_b32 s5, v4
+        0xd760_0007, 0x0200_0b01, // v_readlane_b32 s7, v1, s5
+        0xbf81_0000,             // s_endpgm
+    ];
+    assert_eq!(mixed_lane_compute([32, 1, 1], &words).unwrap().required_wave_size, Some(32));
+    assert!(mixed_lane_compute([16, 1, 1], &words).is_err());
+    assert!(mixed_lane_compute([32, 1, 1], &words[2..]).is_err());
+
+    let mut control = words;
+    control[2] = 0xbe84_246a; // s_and_saveexec_b64 s[4:5], vcc
+    assert!(mixed_lane_compute([32, 1, 1], &control).is_err());
+    control[2] = words[2];
+    control[4] = 0x0200_0a08; // v_writelane_b32 v1, s8, s5 (dynamic write)
+    assert!(mixed_lane_compute([32, 1, 1], &control).err().unwrap().contains("unsupported v_writelane_b32 encoding"));
+    control[4] = words[4];
+    control[7] |= 0x0800_0000; // VOP3 modifier
+    assert!(mixed_lane_compute([32, 1, 1], &control).err().unwrap().contains("unsupported v_readlane_b32 encoding"));
+}
+
+#[test]
+fn mixed_lane_wave32_refuses_unverified_control_flow() {
+    let words = [
+        0xd4c2_000b, 0x0201_0100, // v_cmp_eq_u32 s11, v0, 0
+        0xbe84_3c0b,             // s_and_saveexec_b32 s4, s11
+        0xbf82_0001,             // s_branch into the second word of WRITELANE
+        0xd761_0001, 0x0201_1608, // v_writelane_b32 v1, s8, 11
+        0x7e0a_0504,             // v_readfirstlane_b32 s5, v4
+        0xd760_0007, 0x0200_0b01, // v_readlane_b32 s7, v1, s5
+        0xbf81_0000,             // s_endpgm
+    ];
+    let error = mixed_lane_compute([32, 1, 1], &words).err().unwrap();
+    assert!(error.contains("whole-wave scalar dispatch"), "{error}");
+}

@@ -60,6 +60,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `bindless-table-store` | A program under a direct-indexed root that stores through one descriptor table slot: that texture is published, and another UAV texture elsewhere in the heap keeps the title's memory ([compute roots](#compute-roots)); not part of `all` |
 | `bindless-heap-read`, `bindless-texture-store` | A guest texture with a UAV in the heap of a direct-indexed program. A program with no image write must leave the texture's title memory alone, and a store to it must be published ([compute roots](#compute-roots)); not part of `all` |
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
+| `mixed-lane` | A first-active-lane selector reads a value written to an EXEC-masked lane, then readback verifies that the VGPR still holds the other lanes’ values. Requires the live shader compiler and runs separately from `all`. |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |

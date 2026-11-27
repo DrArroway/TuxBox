@@ -424,11 +424,10 @@ void xbox_shader_scenario(ID3D12Device* device) {
     expect_value(memory, 0, 3, "write after the dispatch");
 }
 
-// A console program that sums across its 64-lane waves. A host without such
-// waves needs the translation made for 32 lanes; without either translation the
-// provider substitutes an empty pipeline and nothing is written.
-void wave64_shader_scenario(ID3D12Device* device) {
-    constexpr UINT words = static_cast<UINT>(std::size(wave_shader_expected));
+// Dispatch a console wave fixture with a single raw UAV and check each word.
+template <size_t Words>
+void check_wave_shader(ID3D12Device* device, D3D12_SHADER_BYTECODE bytecode, const UINT (&expected)[Words]) {
+    constexpr UINT words = static_cast<UINT>(Words);
     constexpr UINT64 bytes = words * sizeof(UINT);
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER table{};
@@ -443,11 +442,11 @@ void wave64_shader_scenario(ID3D12Device* device) {
                                       IID_PPV_ARGS(&root)), "create wave root signature");
     D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
     shader.pRootSignature = root.Get();
-    shader.CS = {wave_shader, sizeof(wave_shader)};
+    shader.CS = bytecode;
     ComPtr<ID3D12PipelineState> pipeline;
     check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
                                                                        IID_PPV_ARGS(&pipeline)),
-          "create pipeline from a wave64 console shader");
+          "create pipeline from a console wave shader");
 
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -484,7 +483,7 @@ void wave64_shader_scenario(ID3D12Device* device) {
                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
     direct.submit();
-    direct.finish("dispatch of the wave64 console shader");
+    direct.finish("dispatch of the console wave shader");
 
     D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
     void* mapped = nullptr;
@@ -493,13 +492,23 @@ void wave64_shader_scenario(ID3D12Device* device) {
     std::memcpy(got.data(), mapped, size_t(bytes));
     readback->Unmap(0, &empty);
     for (UINT i = 0; i < words; ++i) {
-        if (got[i] != wave_shader_expected[i]) {
+        if (got[i] != expected[i]) {
             char message[128];
-            std::snprintf(message, sizeof(message), "wave sum mismatch at thread %u: expected %u, found %u",
-                          i, wave_shader_expected[i], got[i]);
+            std::snprintf(message, sizeof(message), "wave result mismatch at thread %u: expected %u, found %u",
+                          i, expected[i], got[i]);
             throw std::runtime_error(message);
         }
     }
+}
+
+// A console program that sums across its 64-lane waves. A host without such
+// waves needs the translation made for 32 lanes.
+void wave64_shader_scenario(ID3D12Device* device) {
+    check_wave_shader(device, {wave_shader, sizeof(wave_shader)}, wave_shader_expected);
+}
+
+void mixed_lane_scenario(ID3D12Device* device) {
+    check_wave_shader(device, {lane_shader, sizeof(lane_shader)}, lane_shader_expected);
 }
 
 // A root with two SRV tables (t0, space0; t0 to t3, space1) and one root
@@ -3093,6 +3102,7 @@ constexpr Scenario scenarios[] = {
     {L"unwritten-descriptors", unwritten_descriptors},
     {L"xbox-shader", xbox_shader_scenario},
     {L"wave64-shader", wave64_shader_scenario},
+    {L"mixed-lane", mixed_lane_scenario},
     {L"raster-tables", raster_tables},
     {L"lane-spill-interp", lane_spill_interp},
     {L"wave-alloc", wave_alloc_scenario},
@@ -3160,7 +3170,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"dispatch-wait", L"texture-readback", L"texture-publication",
                                              L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim", L"unwritten-descriptors",
-                                             L"xbox-shader", L"wave64-shader",
+                                             L"xbox-shader", L"wave64-shader", L"mixed-lane",
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
                                              L"compute-root-recovery", L"bindless-compute",
@@ -3177,7 +3187,8 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its mesh program's translation prepared first.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
+        // mixed-lane also needs the live compiler.
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
             continue;
         const auto name = narrow(scenario.name);
         try {

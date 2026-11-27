@@ -598,27 +598,30 @@ impl Recording {
                 return;
             }
             if let Some(binding) = table.index_map {
-                // These PSOs have one descriptor table followed by one root
-                // constants parameter. The native ISA selects its scalar
-                // buffer with a word (and optional mask) from that parameter.
-                let descriptor = self
-                    .bindings
-                    .graphics_constant(1, binding.scalar_word)
-                    .and_then(|word| {
-                        self.resource_heap.as_ref()?.scalar_descriptor(
-                            word & binding.scalar_mask,
-                            self.descriptor_arena.as_deref(),
-                        )
-                    });
-                let Some(descriptor) = descriptor else {
-                    Self::skip("draw: no scalar descriptor for the indexed load", E_INVALIDARG);
-                    return;
-                };
-                if self.scalar_descriptors.try_reserve(1).is_err() {
-                    self.error = E_OUTOFMEMORY;
-                    return;
+                // When `scalar_mask != 0`, the native ISA selects its scalar
+                // buffer with a word from graphics root constants slot 1.
+                // General direct-indexed roots (`scalar_mask == 0`) only need
+                // the paged index map and arena retention.
+                if binding.scalar_mask != 0 {
+                    let descriptor = self
+                        .bindings
+                        .graphics_constant(1, binding.scalar_word)
+                        .and_then(|word| {
+                            self.resource_heap.as_ref()?.scalar_descriptor(
+                                word & binding.scalar_mask,
+                                self.descriptor_arena.as_deref(),
+                            )
+                        });
+                    let Some(descriptor) = descriptor else {
+                        Self::skip("draw: no scalar descriptor for the indexed load", E_INVALIDARG);
+                        return;
+                    };
+                    if self.scalar_descriptors.try_reserve(1).is_err() {
+                        self.error = E_OUTOFMEMORY;
+                        return;
+                    }
+                    self.scalar_descriptors.insert(descriptor);
                 }
-                self.scalar_descriptors.insert(descriptor);
                 if let Some(arena) = &self.descriptor_arena
                     && !self
                         .indexed_arenas

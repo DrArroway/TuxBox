@@ -167,6 +167,10 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
+    // A console ray walk is replaced before any lane analysis: its shared
+    // stack and cross-lane traffic leave with it.
+    let scarlett_walk = scarlett_rays::identify(ex);
+    if let Some(walk) = scarlett_walk { scarlett_rays::prepare(walk, &mut insns); }
     if lone_lane::on() { lone_lane::prepare(&mut insns)?; }
     // Mixed lane storage uses the full-mask emitter after structural validation.
     let mixed_lane_wave32 = !lone_lane::on()
@@ -174,10 +178,8 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     *lane_read_failed |= mixed_lane_wave32;
     let resolve_wave32 = mixed_lane_wave32 || !lone_lane::on() && ray_resolve::wave32(ex, &insns)?;
     let probe = radiance_probe::identify(ex);
-    let scarlett_walk = scarlett_rays::identify(ex);
     let probe_trace = probe.is_some() || scarlett_walk.is_some();
     if let Some(probe) = probe { radiance_probe::prepare(probe, &mut insns); }
-    if let Some(walk) = scarlett_walk { scarlett_rays::prepare(walk, &mut insns); }
     // Slot 80 explicitly selects a wave width. Only opt in straight-line
     // loads, stores and lane-local arithmetic with ordinary operands.
     let portable_compute_group = (ex.stage == Stage::Compute && insns.iter().all(|ins| {

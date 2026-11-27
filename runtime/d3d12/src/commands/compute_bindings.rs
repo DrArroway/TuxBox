@@ -69,7 +69,8 @@ impl SceneCheck {
 }
 
 pub(super) enum Pipeline {
-    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>),
+    /// The last field is `PipelineData::no_image_writes`.
+    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>, bool),
     Ray(ID3D12StateObject),
 }
 
@@ -109,7 +110,7 @@ pub(super) enum Argument {
 
 impl From<&GuestPipeline> for Pipeline {
     fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone())
+        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone(), p.state.no_image_writes)
     }
 }
 
@@ -249,16 +250,22 @@ impl Bindings {
 
     pub(super) fn compute_threads(&self) -> Option<[u32; 3]> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(_, _, _, _, threads, _)) => *threads,
+            Some(Pipeline::Regular(_, _, _, _, threads, ..)) => *threads,
             _ => None,
         }
     }
 
     pub(super) fn reflected_table<const COMPUTE: bool>(&self) -> Option<&ComputeTable> {
         match &self.pipeline {
-            Some(Pipeline::Regular(_, _, compute, raster, _, _)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
+            Some(Pipeline::Regular(_, _, compute, raster, ..)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
             _ => None,
         }
+    }
+
+    /// Whether the bound pipeline can write a texture it picks from the whole
+    /// resource heap. Only a pipeline known to have no image write cannot.
+    fn writes_heap_images(&self) -> bool {
+        !matches!(&self.pipeline, Some(Pipeline::Regular(.., true)))
     }
 
     pub(super) fn with_reflected_table<const COMPUTE: bool>(
@@ -266,6 +273,7 @@ impl Bindings {
         arena: Option<&Arc<crate::device::descriptor_paging::Arena>>,
         leases: &mut crate::device::descriptor_paging::DescriptorLeases,
         heap: Option<&super::descriptors::ResourceHeap>, reads: &mut Vec<std::ops::Range<usize>>,
+        heap_reads: &mut Vec<std::ops::Range<usize>>,
         resources: &crate::device::MediaResources, dispatch: impl FnOnce(),
     ) -> Result<()> {
         let layout = if COMPUTE { &self.layout } else { &self.graphics_layout };
@@ -286,14 +294,18 @@ impl Bindings {
             });
         }
         let heap = heap.ok_or(E_INVALIDARG)?;
+        // A program that picks views from the whole heap can write any
+        // writable texture in it, unless it has no image write at all. Then
+        // the heap's textures are only read, and none needs publishing.
+        let whole_heap = if self.writes_heap_images() { &mut *reads } else { heap_reads };
         let index_map = if let Some(binding) = table.index_map {
             // Global indices originate in shader data. Any resident SRV can
             // sample placed textures and needs the usual pre-submit upload.
-            super::descriptors::include_range(reads, heap.cpu.clone());
+            super::descriptors::include_range(whole_heap, heap.cpu.clone());
             Some((binding.slot, heap.index_map(guest, arena.map(Arc::as_ref), resources)?))
         } else {
             if table.layout.direct_resources {
-                super::descriptors::include_range(reads, heap.cpu.clone());
+                super::descriptors::include_range(whole_heap, heap.cpu.clone());
             }
             for (slot, range) in &table.accessed_views {
                 let base = bases[*slot].ok_or(E_INVALIDARG)?;
@@ -360,7 +372,7 @@ impl Bindings {
 
     pub(super) fn scene_root(&self) -> Option<&SceneRoot> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(_, root, _, _, _, _)) => root.as_ref(),
+            Some(Pipeline::Regular(_, root, ..)) => root.as_ref(),
             _ => None,
         }
     }
@@ -515,7 +527,7 @@ impl Bindings {
 
     pub(super) fn sampler_root(&self) -> Option<&ID3D12RootSignature> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(.., root)) => root.as_ref(),
+            Some(Pipeline::Regular(.., root, _)) => root.as_ref(),
             _ => None,
         }
     }

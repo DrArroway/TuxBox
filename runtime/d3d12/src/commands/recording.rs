@@ -469,6 +469,7 @@ impl Recording {
                 &mut self.descriptor_leases,
                 self.resource_heap.as_ref(),
                 &mut self.sampled_heaps,
+                &mut self.read_heaps,
                 &self.resources,
                 dispatch,
             ) {
@@ -640,6 +641,7 @@ impl Recording {
                 &mut self.descriptor_leases,
                 self.resource_heap.as_ref(),
                 &mut self.sampled_heaps,
+                &mut self.read_heaps,
                 &self.resources,
                 draw,
             ) {

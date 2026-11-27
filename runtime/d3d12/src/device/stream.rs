@@ -222,6 +222,11 @@ unsafe fn create(
         at += bytes;
     }
 
+    // Decided from the title's own stages, before any of them is replaced.
+    pipeline.no_image_writes = original
+        .iter()
+        .flatten()
+        .all(|(code, _)| !tuxbox_dxbc::image_writes::may_write_images(code));
     if let (Some((mesh, _)), Some(root), Some(field)) = (original[7], guest_root, root_record)
         && original[2..7].iter().all(Option::is_none)
         && original[0].is_none()

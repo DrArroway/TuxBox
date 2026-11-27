@@ -44,6 +44,24 @@ The copy has known limits:
 
 A way for RADV to read the game's pages directly would replace it ([#191](https://github.com/brcly/TuxBox/issues/191)).
 
+## Performance overlay
+
+Add `--overlay` before the game path to draw TuxBox's own panel over the game. It works through TuxBox's graphics provider, so it needs no other software.
+
+| Shows | Notes |
+| --- | --- |
+| Frame rate, 1% low, frame times and their graph | Measured between presented frames. The panel freezes when the game stops presenting. |
+| Processor use, the whole system and the game | |
+| Graphics card load, temperature, clock and power | From NVIDIA's management library, or the Linux kernel's sensor files. AMD and Intel cards on Windows show `-`. |
+| Game memory, system memory, swap and video memory | |
+| Shaders being translated, pipelines being built and empty stand-ins | |
+
+```sh
+python tuxbox.py run --overlay --app-id Lanes build/lanes
+```
+
+`TUXBOX_OVERLAY_POS` sets the corner (top left by default), and `TUXBOX_FRAME_LOG` writes every frame time to a CSV file. [Environment variables](ENVIRONMENT.md) has both. The overlay's own cost and its behaviour on Windows haven't been measured.
+
 ## Game logs
 
 `tuxbox.py run` shows game output in the terminal as it arrives. It saves no copy unless you pass `--log-file` before the game path. Each run appends to that file.

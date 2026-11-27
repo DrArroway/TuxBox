@@ -61,11 +61,13 @@ The game also imports Windows core API sets for services such as files, timing a
 | `bindless-heap-read`, `bindless-texture-store` | A guest texture with a UAV in the heap of a direct-indexed program. A program with no image write must leave the texture's title memory alone, and a store to it must be published ([compute roots](#compute-roots)); not part of `all` |
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `mixed-lane` | A first-active-lane selector reads a value written to an EXEC-masked lane, then readback verifies that the VGPR still holds the other lanes’ values. Requires the live shader compiler and runs separately from `all`. |
+| `wave-alloc` | A console shader's masked 32-lane exclusive prefix, translated to a wave prefix sum; every lane's word is checked. Needs the live shader compiler. |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |
 | `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
 | `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
+| `mesh-sampler-single` | The one-sampler pixel program in a mesh pipeline whose root's `s0` is point-filtered ([raster tables](#raster-tables)); not part of `all` |
 | `mesh-sampler-rootless` | The literal sampler programs in mesh pipelines whose root has no static samplers ([raster tables](#raster-tables)); not part of `all` |
 
 ```sh
@@ -163,8 +165,8 @@ It runs on the Proton backend and removes only these programs' cache entries fro
 ```sh
 python tuxbox.py run --app-id Lanes build/lanes --replay --report replay.txt
 ```
-With `--overlay` before the package path, add `--panel` after `--replay` to fail unless TuxBox's performance panel is on screen. The `present` checks run this as `lanes-overlay`.
 
+With `--overlay` before the package path, add `--panel` after `--replay` to fail unless TuxBox's [performance panel](../../docs/USAGE.md#performance-overlay) is on screen. The `present` checks run this as `lanes-overlay`.
 
 The replay checks all 16 GPU-generated rows, a win, a missed coin and a collision. It uploads two 520 × 640 boards through the Xbox command list, reads both textures back, and checks every pixel plus the lane and player colors. The replay runs without opening a window. During interactive play, the same textures are presented through the Xbox command queue.
 

@@ -138,7 +138,15 @@ On November 26, 2026, preparation compiled 36,653 of 41,064 recorded requests an
 | Image sample from an unordered-access table the root doesn't describe (`u7`) | 236 |
 | Lane operation with a non-constant lane | 203 |
 
+Translator changes since then have removed many of these. On November 27 the translator alone, without DXC, translated 38,263 of 42,672 recorded requests.
+
 The counts are per recorded request, so they overstate what a live run loses: a request recorded without its root signature can't be translated offline. Rank failures by the pipelines a run lost with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
+
+### ProjectScarlett shadow rays
+
+The game traces rays in its own compute programs, as loops over the console's raw acceleration structure nodes, which the translator can't run. Four shadow programs have those loops replaced with native ray queries: the two irradiance cache shadow traces, the sun shadows and the spot lamp shadows ([lowering](../tools/shader-compiler/src/hlsl/scarlett_rays.rs)). Each is matched by name and exact code. A [replay of recorded requests](../tools/check_scarlett_rays.py) matched the expected geometry on an RTX 4070 Ti SUPER and a Radeon iGPU.
+
+In the game these dispatches still do nothing, because its ray tracing scenes aren't built yet. The native query counts every triangle, where the console's sun walk ignores a hit on an object marked with a zero word.
 
 ### Block dispatcher
 

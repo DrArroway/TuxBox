@@ -15,6 +15,8 @@ Place options before the game path. Anything after the path goes to the game.
 | `--offline` | off, always on for ProjectScarlett | Launch without network access (Linux) |
 | `--log-file PATH` | off | Also append the game log to this file |
 | `--mangohud` | off | Show and record frame times (Linux) |
+| `--overlay` | off | Show TuxBox's [performance panel](USAGE.md#performance-overlay) |
+| `--require-current-provider` | off | Refuse to launch unless the staged D3D12 DLL matches the built one |
 | `--profile-pipelines` | off | Record pipeline creation times |
 | `--prepare-only` | off | Prepare shader caches and exit |
 | `--no-shader-prep` | off | Skip launch-time shader preparation |
@@ -52,9 +54,10 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
 | `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display |
 | `TUXBOX_CHECK_JOBS` | half the CPU threads, at most 8 | GPU checks run at once: the translator, the D3D12 controls and most Lanes and fixture gates |
-| `TUXBOX_OVERLAY` | off | `1` shows frame rate, frame times, processor, graphics card and memory use (`run --overlay`) |
+| `TUXBOX_OVERLAY` | off | `1` shows the [performance panel](USAGE.md#performance-overlay) (`run --overlay`) |
 | `TUXBOX_OVERLAY_POS` | `tl` | `tl`, `tr`, `bl` or `br` |
 | `TUXBOX_FRAME_LOG` | off | File to write each frame's time to, as CSV; the game must be able to write it |
+| `TUXBOX_KEEP_TITLE_WATCHDOG` | off | `1` leaves ProjectScarlett's hang watchdog running while TuxBox holds a title thread |
 | `TUXBOX_KEYBOARD_GAMEPAD` | on | `0` leaves only physical XInput controllers |
 | `TUXBOX_STORAGE_THREADS` | CPU cores, at most 8 | Storage request threads |
 | `TUXBOX_MANGOHUD_PCI` | chosen automatically | PCI address of the GPU MangoHud reports |

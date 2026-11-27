@@ -1,6 +1,6 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on GE-Proton. The furthest recorded run got into the story intro, where GPU queues stalled. The game isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on GE-Proton. The game reaches the prologue cutscene and then crashes; it isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
@@ -21,11 +21,11 @@ python -m pip install -r requirements.txt
 python build.py
 ```
 
-To build only what ProjectScarlett loads, run `python build.py <target>` for each of `xmem`, `d3d12`, `xg`, `xapu`, `acphal`, `xcrdapi`, `gameinput` and `xgameruntime`. Some Linux distributions currently need the build workarounds described in [issue #4](https://github.com/brcly/TuxBox/issues/4).
+To build only what ProjectScarlett loads, run `python build.py <target>` for each of `xmem`, `d3d12`, `bvh`, `xg`, `xapu`, `acphal`, `xcrdapi`, `gameinput` and `xgameruntime`. Some Linux distributions currently need the build workarounds described in [issue #4](https://github.com/brcly/TuxBox/issues/4).
 
 ## Stage a working copy
 
-Keep the original package unchanged and launch a copy. The package doesn't contain any of the provider DLL names, so TuxBox's copies are added beside the game files rather than replacing them.
+Keep the original package unchanged and launch a copy. The package has its own `XboxBvhBuilder.dll`, which TuxBox's replaces in that copy. The other providers are added beside the game files.
 
 ```sh
 cp -a --reflink=auto /path/to/GTA6.Xbox.v1.0.2.1 /path/to/scarlett-run
@@ -38,15 +38,19 @@ cp build/xmem-smoke/{xmem,tuxbox_xhttp}.dll \
    build/gameinput/GameInput.dll \
    build/xgameruntime/xgameruntime.dll \
    /path/to/scarlett-run/
+# Replaces the package's file. --remove-destination keeps a hard-linked
+# original from being written through.
+cp --remove-destination build/bvh/XboxBvhBuilder.dll /path/to/scarlett-run/
 ```
 
 On a copy-on-write filesystem such as Btrfs or XFS, `--reflink=auto` copies the package almost instantly without using more disk space. If you use a hard-link copy (`cp -al`) to save space, never write into the linked game files. Writing to one also changes the original package.
 
 | Provider | Build output | Loaded by |
 | --- | --- | --- |
-| `xmem.dll` | `build/xmem-smoke/` | the executable, `Bink2Scarlett.dll`, `XboxBvhBuilder.dll`, `amd_fidelityfx_upscaler_xbox.dll` |
+| `xmem.dll` | `build/xmem-smoke/` | the executable, `Bink2Scarlett.dll`, `amd_fidelityfx_upscaler_xbox.dll` |
 | `tuxbox_xhttp.dll` | `build/xmem-smoke/` | `xmem.dll`, which forwards `XMemSetWinHttpHooks` to it |
-| `d3d12_xs.dll` | `build/d3d12-smoke/` | the executable, `XboxBvhBuilder.dll`, `amd_fidelityfx_upscaler_xbox.dll` |
+| `d3d12_xs.dll` | `build/d3d12-smoke/` | the executable, `amd_fidelityfx_upscaler_xbox.dll` |
+| `XboxBvhBuilder.dll` | `build/bvh/` | the executable |
 | `xg_xs.dll` | `build/xg-provider/` | the executable |
 | `xapu.dll`, `chad.dll` | `build/xapu/` | the executable |
 | `AcpHal.dll` | `build/acphal/` | the executable |
@@ -63,6 +67,8 @@ compiler. The runtime reports an actual compiler load failure separately
 from other pipeline errors. This is not a confirmed fix for the black-screen
 report in #39.
 
+The package's `XboxBvhBuilder.dll` runs its own console compute programs, and vkd3d-proton can't compile them: the log shows `Function 'xbox.…' is declared but has no definition` and failed compute pipelines. TuxBox's builder passes acceleration structure builds to the graphics driver instead. This removes those failures, but the title's ray tracing scenes still aren't built, so it doesn't make ray tracing work.
+
 Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`. With it, the launcher also adds `force_raw_va_cbv` to `VKD3D_CONFIG`, so constant buffers bound by address are read from the guest's 16-byte offsets.
 
 ## Launch
@@ -75,7 +81,7 @@ The game installs a Breakpad crash handler that uploads minidumps to an online c
 
 An offline launch also stops umu-run from updating the Steam Runtime. If the runtime isn't installed yet, run another program through TuxBox once first, such as `python tuxbox.py check`.
 
-The game log goes to the terminal only. Add `--log-file build/scarlett.log` to keep it, and `--mangohud` to record frame times, both before the package path. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
+The game log goes to the terminal only. Add `--log-file build/scarlett.log` to keep it, `--overlay` to see frame times and memory use over the game, and `--mangohud` to record frame times with MangoHud, all before the package path. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
 
 ## Shader preparation
 
@@ -249,6 +255,9 @@ python tuxbox.py run --prepare-only --backend proton --prefix PREFIX /path/to/sc
 
 ## What to expect
 
+The game currently gets as far as the prologue cutscene, which appears, and then
+crashes. The runs described below are earlier ones with saved records or reports.
+
 The two shader and memory paths added on November 26, 2026 have passed TuxBox's
 checks. The [memory copy](USAGE.md#memory-copy) on AMD's Linux driver hasn't
 been tried in this game yet; please report how far it gets. The [32-lane
@@ -269,7 +278,8 @@ On November 25, 2026, an offline run on a GeForce RTX 4070 Ti SUPER got into the
 story intro. The game's own crash report records the state `Game Running`, frame
 32,534 and the story intro script after 18 minutes 11 seconds. GPU queues stalled
 on fence waits there. The run ended on a game assert (exit code 3) after a command
-list ran out of descriptor memory. The prologue cutscene did not appear.
+list ran out of descriptor memory. The prologue cutscene did not appear in that
+run.
 [Run record](../evidence/projectscarlett-gameplay.json)
 
 - **Fence stalls.** TuxBox now records the game's fence value writes, keeps a
@@ -281,17 +291,22 @@ list ran out of descriptor memory. The prologue cutscene did not appear.
 - **Descriptor memory.** Since #172, shader-visible descriptor slots are reused
   once the GPU has finished the work that referenced them, and the oldest are
   evicted when the heap fills. The [Lanes self-test](../examples/lanes/README.md#self-test)
-  checks this, but no long game run has confirmed it yet. Compute dispatches
-  whose root has no descriptor tables and indexes the resource heap directly
-  are still skipped on paged layouts
-  ([#232](https://github.com/brcly/TuxBox/issues/232); draft fix in
-  [#235](https://github.com/brcly/TuxBox/pull/235)).
+  checks this, but no long game run has confirmed it yet. Dispatches and draws
+  that index the resource heap directly were skipped on paged layouts
+  ([#232](https://github.com/brcly/TuxBox/issues/232));
+  [#235](https://github.com/brcly/TuxBox/pull/235),
+  [#294](https://github.com/brcly/TuxBox/pull/294) and
+  [#295](https://github.com/brcly/TuxBox/pull/295) added their descriptor maps,
+  which no long game run has confirmed either.
 - **Missing effects.** Many shaders are still unsupported, and large compute
   pipelines can receive empty stand-ins. Expect missing or wrong rendering.
   Image correctness hasn't been checked. [Shader coverage](SHADERS.md#projectscarlett-refusals)
-- **Long loads.** The driver takes minutes, and sometimes most of an hour, to
-  compile the largest translated compute shaders.
-- **Memory.** A long run needs about 15 GB of RAM plus swap. On a machine whose
+- **Long loads.** Shaders the game hasn't requested before are translated while
+  it runs, and the driver takes minutes to compile the largest ones. Earlier
+  runs on another Proton build saw single compiles of most of an hour.
+- **Memory.** A run needs far more than the console's. On November 27 one used
+  28.5 GB of RAM and swap within a few minutes, so a 32 GB machine needs disk
+  swap as well. [Where to improve](FOCUS.md#memory). On a machine whose
   `/tmp` is held in memory, clear large temporary files before launching.
 - **Not yet verified:** input and audio during play, frame times, and any other
   GPU or Windows.

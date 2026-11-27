@@ -384,6 +384,15 @@ impl Bindings {
                         list.SetGraphicsRootDescriptorTable(host, base);
                     }
                 }
+                if let Some((slot, address)) = strides {
+                    list.SetGraphicsRootShaderResourceView(slot, address);
+                    static STRIDES_IDENTITY: std::sync::Once = std::sync::Once::new();
+                    static STRIDES_PAGED: std::sync::Once = std::sync::Once::new();
+                    let (site, kind) = if arena.is_some() { (&STRIDES_PAGED, "paged") } else { (&STRIDES_IDENTITY, "identity") };
+                    crate::diagnostics::log_once(site, || {
+                        format!("bound {kind} resource descriptor stride table at graphics root slot {slot}")
+                    });
+                }
                 if let Some((slot, address)) = index_map {
                     list.SetGraphicsRootShaderResourceView(slot, address);
                     static IDENTITY: std::sync::Once = std::sync::Once::new();

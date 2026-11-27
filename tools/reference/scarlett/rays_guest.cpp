@@ -1,0 +1,403 @@
+// Replays ProjectScarlett's irradiance-cache shadow programs through the Xbox
+// provider. The translator replaces each inlined console BVH walk with a
+// native ray query; this guest builds native scenes, fills the program's
+// inputs and compares every lane's result with the geometry.
+//
+// Inputs, as the guest program reads them (CS_IrradianceCache_ShadowTrace*):
+// - root constant 0: list index. t379[index] is the number of cache texels.
+// - t339 (table 1, slot 0): texel words, cascade << 29 | texel.
+// - t12 (table 0, slot 20): byte 1420 holds the grid size (b and c axes, then
+//   a axis); byte 1428 + 16 * cascade the cascade centre xyz and half extent,
+//   byte 1520 + 16 * cascade the half extent of the a axis, and byte 1992 the
+//   near radius / 0.7 (WithFar only).
+// - t10 (table 1, slot 1): byte 272 holds L. Shadow rays run along -L.
+// - b3 (table 1, slot 7): byte 20 is the output stride per cascade, byte 68
+//   the maximum distance.
+// - t355 (slot 4) is the near scene, t356 (slot 3) the far scene.
+// - u52 (slot 6): each texel gets 0.5 when unoccluded and 0 when occluded.
+// Texel i with a 4x4 grid sits at x = -0.75 + 0.5 * (i / 16), y = -0.75 +
+// 0.5 * ((i / 4) % 4) and z = -0.75 + 0.5 * (i % 4).
+#include "frame_abi.h"
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <vector>
+
+using frame_abi::check;
+using frame_abi::ComPtr;
+using frame_abi::method;
+using Inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS;
+using Sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO;
+using Build = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC;
+
+static ComPtr<ID3D12Resource> buffer(ID3D12Device* dev, UINT64 bytes, D3D12_HEAP_TYPE heap,
+                                     D3D12_RESOURCE_STATES state, bool uav = false) {
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type = heap;
+    props.CreationNodeMask = props.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (uav) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> res;
+    check(dev->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&res)),
+          "create buffer");
+    return res;
+}
+
+static ComPtr<ID3D12Resource> upload(ID3D12Device* dev, const void* data, size_t bytes) {
+    auto res = buffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    D3D12_RANGE empty{}, written{0, bytes};
+    void* dest{};
+    check(res->Map(0, &empty, &dest), "map upload");
+    std::memcpy(dest, data, bytes);
+    res->Unmap(0, &written);
+    return res;
+}
+
+static ComPtr<ID3D12GraphicsCommandList> guest_list(ID3D12Device* guest, ID3D12CommandAllocator* allocator) {
+    const UINT params[]{0, 0, 1, 0};
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(method<frame_abi::CreateList>(guest, 73)(guest, params, allocator, nullptr, IID_PPV_ARGS(&list)),
+          "create Xbox list");
+    return list;
+}
+
+static void submit(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) {
+    check(list->Close(), "close list");
+    ID3D12CommandList* lists[] = {list};
+    ComPtr<ID3D12Fence> fence;
+    check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create fence");
+    queue->ExecuteCommandLists(1, lists);
+    check(queue->Signal(fence.Get(), 1), "signal fence");
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) throw std::runtime_error("create event");
+    HRESULT hr = fence->SetEventOnCompletion(1, event);
+    DWORD wait = SUCCEEDED(hr) ? WaitForSingleObject(event, 30000) : WAIT_FAILED;
+    CloseHandle(event);
+    check(hr, "fence event");
+    if (wait != WAIT_OBJECT_0 || fence->GetCompletedValue() != 1) throw std::runtime_error("GPU fence did not complete");
+}
+
+static std::vector<char> read_file(const wchar_t* path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open shader");
+    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+// An opaque axis-aligned rectangle at height z facing the rays.
+struct Quad {
+    float z, x0, x1, y0, y1;
+};
+
+struct Scene {
+    ComPtr<ID3D12Resource> bottom, top, vertices, records;
+};
+
+struct Fixture {
+    ComPtr<ID3D12Device> dev;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+
+    explicit Fixture(const wchar_t* shader) {
+        HMODULE module = LoadLibraryExW(L"d3d12_xs.dll", nullptr,
+                                        LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        using Factory = HRESULT(WINAPI*)(IUnknown*, const void*, REFIID, void**);
+        auto factory = module ? reinterpret_cast<Factory>(GetProcAddress(module, "D3D12XboxCreateDevice")) : nullptr;
+        if (!factory) throw std::runtime_error("missing Xbox device factory");
+        const std::array<UINT, 18> profile{0x20004, 0, ~0u, 0, 0, 0, ~0u, ~0u, 0, 1};
+        check(factory(nullptr, profile.data(), IID_PPV_ARGS(&dev)), "create Xbox device");
+        D3D12_COMMAND_QUEUE_DESC q{};
+        check(dev->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)), "Xbox queue");
+        const auto bytes = read_file(shader);
+        check(dev->CreateRootSignature(0, bytes.data(), bytes.size(), IID_PPV_ARGS(&root)), "title root");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+        pso.pRootSignature = root.Get();
+        pso.CS = {bytes.data(), bytes.size()};
+        using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, UINT, const void*,
+                                        REFIID, void**);
+        check(method<Create>(dev.Get(), 62)(dev.Get(), &pso, 0, nullptr, IID_PPV_ARGS(&pipeline)), "title pipeline");
+    }
+
+    ComPtr<ID3D12Resource> build(const Inputs& in) {
+        Sizes sizes{};
+        using Prebuild = void(WINAPI*)(ID3D12Device*, const Inputs*, Sizes*);
+        method<Prebuild>(dev.Get(), 102)(dev.Get(), &in, &sizes);
+        auto dest = buffer(dev.Get(), sizes.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                           D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+        auto scratch = buffer(dev.Get(), sizes.ScratchDataSizeInBytes ? sizes.ScratchDataSizeInBytes : 256,
+                              D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        ComPtr<ID3D12CommandAllocator> alloc;
+        check(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "AS allocator");
+        auto list = guest_list(dev.Get(), alloc.Get());
+        ComPtr<ID3D12GraphicsCommandList4> list4;
+        check(list.As(&list4), "Xbox List4");
+        Build b{};
+        b.Inputs = in;
+        b.DestAccelerationStructureData = dest->GetGPUVirtualAddress();
+        b.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        using Single = void(WINAPI*)(ID3D12GraphicsCommandList4*, const Build*, UINT,
+                                     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*);
+        method<Single>(list4.Get(), 117)(list4.Get(), &b, 0, nullptr);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        list->ResourceBarrier(1, &barrier);
+        submit(dev.Get(), queue.Get(), list.Get());
+        return dest;
+    }
+
+    // One BLAS holding every quad, one instance of it; no instance at all for
+    // an empty scene.
+    Scene scene(const std::vector<Quad>& quads) {
+        Scene s;
+        std::vector<float> v;
+        for (const auto& q : quads) {
+            const float corners[6][3] = {{q.x0, q.y0, q.z}, {q.x1, q.y0, q.z}, {q.x1, q.y1, q.z},
+                                         {q.x0, q.y0, q.z}, {q.x1, q.y1, q.z}, {q.x0, q.y1, q.z}};
+            for (const auto& c : corners) v.insert(v.end(), c, c + 3);
+        }
+        Inputs top{};
+        top.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        if (!quads.empty()) {
+            s.vertices = upload(dev.Get(), v.data(), v.size() * sizeof(float));
+            D3D12_RAYTRACING_GEOMETRY_DESC geom{};
+            geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+            geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            geom.Triangles.VertexCount = UINT(v.size() / 3);
+            geom.Triangles.VertexBuffer = {s.vertices->GetGPUVirtualAddress(), 3 * sizeof(float)};
+            Inputs bottom{};
+            bottom.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            bottom.NumDescs = 1;
+            bottom.pGeometryDescs = &geom;
+            s.bottom = build(bottom);
+            D3D12_RAYTRACING_INSTANCE_DESC inst{};
+            for (UINT axis = 0; axis < 3; ++axis) inst.Transform[axis][axis] = 1.f;
+            inst.InstanceMask = 0xff;
+            inst.AccelerationStructure = s.bottom->GetGPUVirtualAddress();
+            s.records = upload(dev.Get(), &inst, sizeof(inst));
+            top.NumDescs = 1;
+            top.InstanceDescs = s.records->GetGPUVirtualAddress();
+        }
+        s.top = build(top);
+        return s;
+    }
+};
+
+struct Scenario {
+    const char* name;
+    float tmax, radius;
+    std::vector<Quad> near_quads, far_quads;
+};
+
+constexpr UINT lanes = 32;
+
+static void origin(UINT i, float p[3]) {
+    p[0] = -0.75f + 0.5f * float(i / 16);
+    p[1] = -0.75f + 0.5f * float((i / 4) % 4);
+    p[2] = -0.75f + 0.5f * float(i % 4);
+}
+
+// Rays run along +z. A quad is hit at t = z - origin.z when the origin lies
+// inside it and minimum <= t < maximum.
+static bool hits(const std::vector<Quad>& quads, const float p[3], float start, float maximum) {
+    for (const auto& q : quads) {
+        const float t = q.z - (p[2] + start);
+        if (t >= 0 && t < maximum && p[0] > q.x0 && p[0] < q.x1 && p[1] > q.y0 && p[1] < q.y1) return true;
+    }
+    return false;
+}
+
+// What the guest program computes after its walks. The far walk runs only
+// when the near walk missed and the ray still has length after leaving the
+// near sphere; it starts where the ray leaves that sphere.
+static bool occluded(const Scenario& s, UINT i, bool with_far) {
+    float p[3];
+    origin(i, p);
+    if (hits(s.near_quads, p, 0, s.tmax)) return true;
+    if (!with_far) return false;
+    const float length2 = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
+    const float r2 = (0.7f * s.radius) * (0.7f * s.radius);
+    const float exit = length2 < r2 ? std::fmax(0.f, std::sqrt(r2 - length2 + p[2] * p[2]) - p[2]) : 0.f;
+    return s.tmax - exit > 0 && hits(s.far_quads, p, exit, s.tmax - exit);
+}
+
+static UINT bits(float x) {
+    UINT u;
+    std::memcpy(&u, &x, 4);
+    return u;
+}
+
+static bool run(Fixture& f, const Scenario& s, bool with_far, FILE* receipt, const char* label) {
+    auto dev = f.dev.Get();
+    const auto near_scene = f.scene(s.near_quads);
+    const auto far_scene = f.scene(s.far_quads);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "view descriptors");
+    const auto step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    using Gpu = UINT64(WINAPI*)(ID3D12DescriptorHeap*);
+    auto cpu = [&](UINT i) {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get()) + i * step};
+    };
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{method<Gpu>(heap.Get(), 10)(heap.Get()) + i * step}; };
+    auto typed = [&](UINT slot, ID3D12Resource* res, UINT count) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_UINT;
+        view.Buffer.NumElements = count;
+        dev->CreateShaderResourceView(res, &view, cpu(slot));
+    };
+    auto structured = [&](UINT slot, ID3D12Resource* res, UINT stride) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Buffer.StructureByteStride = stride;
+        view.Buffer.NumElements = 1;
+        dev->CreateShaderResourceView(res, &view, cpu(slot));
+    };
+    auto scene_view = [&](UINT slot, ID3D12Resource* res) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        view.Buffer.NumElements = 32;
+        dev->CreateShaderResourceView(res, &view, cpu(slot));
+    };
+    // Table 0 starts at 0, table 1 at 64.
+    std::vector<UINT> grid(511);
+    grid[1420 / 4] = 4;
+    grid[1424 / 4] = 4;
+    grid[1428 / 4 + 3] = bits(1.f);
+    grid[1520 / 4] = bits(1.f);
+    grid[1992 / 4] = bits(s.radius);
+    auto grid_buffer = upload(dev, grid.data(), grid.size() * 4);
+    structured(20, grid_buffer.Get(), 2044);
+    std::vector<UINT> texels(lanes);
+    for (UINT i = 0; i < lanes; ++i) texels[i] = i;
+    auto texel_buffer = upload(dev, texels.data(), texels.size() * 4);
+    typed(64, texel_buffer.Get(), lanes);
+    std::vector<UINT> light(85);
+    light[272 / 4 + 2] = bits(-1.f);
+    auto light_buffer = upload(dev, light.data(), light.size() * 4);
+    structured(65, light_buffer.Get(), 340);
+    const UINT count[4]{lanes, 0, 0, 0};
+    auto count_buffer = upload(dev, count, sizeof(count));
+    typed(66, count_buffer.Get(), 4);
+    scene_view(67, far_scene.top.Get());
+    scene_view(68, near_scene.top.Get());
+    typed(69, count_buffer.Get(), 4);
+    std::vector<float> seed(4 * 64, 7.f);
+    auto out = buffer(dev, seed.size() * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, true);
+    auto read = buffer(dev, seed.size() * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto seed_buffer = upload(dev, seed.data(), seed.size() * 4);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    uav.Buffer.NumElements = 64;
+    dev->CreateUnorderedAccessView(out.Get(), nullptr, &uav, cpu(70));
+    std::vector<UINT> constants(64);
+    constants[5] = lanes;
+    constants[17] = bits(s.tmax);
+    auto cb = upload(dev, constants.data(), constants.size() * 4);
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{cb->GetGPUVirtualAddress(), 256};
+    dev->CreateConstantBufferView(&cbv, cpu(71));
+
+    ComPtr<ID3D12CommandAllocator> alloc;
+    check(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "allocator");
+    auto list = guest_list(dev, alloc.Get());
+    list->CopyBufferRegion(out.Get(), 0, seed_buffer.Get(), 0, seed.size() * 4);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {out.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    list->ResourceBarrier(1, &barrier);
+    list->SetPipelineState(f.pipeline.Get());
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    using Heaps = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
+    using Root = void(WINAPI*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+    using Table = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+    using Constants = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
+    method<Heaps>(list.Get(), 32)(list.Get(), 1, heaps);
+    method<Root>(list.Get(), 33)(list.Get(), f.root.Get());
+    method<Table>(list.Get(), 35)(list.Get(), 0, gpu(0));
+    method<Table>(list.Get(), 35)(list.Get(), 1, gpu(64));
+    const UINT index[4]{0, 0, 0, 0};
+    method<Constants>(list.Get(), 39)(list.Get(), 2, 4, index, 0);
+    list->Dispatch(1, 1, 1);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(read.Get(), 0, out.Get(), 0, seed.size() * 4);
+    submit(dev, f.queue.Get(), list.Get());
+    D3D12_RANGE range{0, seed.size() * 4}, none{};
+    void* data{};
+    check(read->Map(0, &range, &data), "map result");
+    const float* got = static_cast<const float*>(data);
+    UINT expected_mask = 0, observed_mask = 0, bad = 0;
+    for (UINT i = 0; i < lanes; ++i) {
+        const bool hit = occluded(s, i, with_far);
+        const float want = hit ? 0.f : 0.5f;
+        expected_mask |= UINT(hit) << i;
+        observed_mask |= UINT(got[4 * i] == 0.f) << i;
+        for (UINT c = 0; c < 4; ++c) bad += got[4 * i + c] != want;
+    }
+    for (UINT i = lanes; i < 64; ++i)
+        for (UINT c = 0; c < 4; ++c) bad += got[4 * i + c] != 7.f;
+    read->Unmap(0, &none);
+    std::fprintf(receipt, "%s_%s=expected %08x observed %08x mismatches %u\n", label, s.name, expected_mask,
+                 observed_mask, bad);
+    std::fflush(receipt);
+    return bad == 0;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    if (argc != 4 || (wcscmp(argv[2], L"near") && wcscmp(argv[2], L"far"))) return 2;
+    FILE* receipt{};
+    if (_wfopen_s(&receipt, argv[3], L"wb")) return 2;
+    const bool with_far = !wcscmp(argv[2], L"far");
+    const char* label = with_far ? "shadow_far" : "shadow";
+    int failed = 0;
+    try {
+        Fixture f(argv[1]);
+        LUID luid = f.dev->GetAdapterLuid();
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+            SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))))
+            adapter->GetDesc1(&desc);
+        std::fprintf(receipt, "adapter=%04x:%04x\n", desc.VendorId, desc.DeviceId);
+        const Quad wall{5.f, -100, 100, -100, 100}, behind{-5.f, -100, 100, -100, 100};
+        const Quad lower{5.f, -100, 100, -100, 0}, inside{2.f, -100, 100, -100, 100};
+        std::vector<Scenario> scenarios{
+            {"occluder", 10.f, 0.f, {wall}, {}},
+            {"behind", 10.f, 0.f, {behind}, {}},
+            {"beyond_maximum", 3.f, 0.f, {wall}, {}},
+            {"empty", 10.f, 0.f, {}, {}},
+            {"half_occluder", 10.f, 0.f, {lower}, {}},
+        };
+        if (with_far) {
+            scenarios.push_back({"far_occluder", 10.f, 0.f, {}, {wall}});
+            scenarios.push_back({"far_behind", 10.f, 0.f, {}, {behind}});
+            scenarios.push_back({"far_half", 10.f, 0.f, {}, {lower}});
+            // Near radius 3: the far walk starts about 3 along the ray and
+            // skips far geometry inside the sphere, but reaches beyond it.
+            scenarios.push_back({"far_inside_near_sphere", 10.f, 3.f / 0.7f, {}, {inside}});
+            scenarios.push_back({"far_beyond_near_sphere", 10.f, 3.f / 0.7f, {}, {wall}});
+            scenarios.push_back({"near_inside_sphere", 10.f, 3.f / 0.7f, {inside}, {}});
+            scenarios.push_back({"far_past_shortened_maximum", 5.5f, 3.f / 0.7f, {}, {wall}});
+        }
+        for (const auto& s : scenarios) failed += !run(f, s, with_far, receipt, label);
+    } catch (const std::exception& e) {
+        std::fprintf(receipt, "error=%s\n", e.what());
+        failed = 100;
+    }
+    std::fprintf(receipt, "failed=%d\n", failed);
+    std::fclose(receipt);
+    return failed ? 1 : 0;
+}

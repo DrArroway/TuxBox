@@ -519,7 +519,7 @@ impl<'a> Emitter<'a> {
             if setreg {
                 continue;
             }
-            for high in float64::pair_source_highs(ins) {
+            for high in float64::pair_source_highs(ins).into_iter().chain(quad_sad::source_highs(ins)) {
                 if !written.contains(&format!("v{high}")) {
                     live.insert((1, high));
                 }
@@ -546,6 +546,7 @@ impl<'a> Emitter<'a> {
                     Self::mubuf_dwords(&ins.mnemonic).unwrap_or(1) - 1,
                 _ if wide_bit_result(&ins.mnemonic) => 1,
                 _ if float64::pair_result(&ins.mnemonic) => 1,
+                _ if quad_sad::handles(&ins.mnemonic) => quad_sad::result_extra(&ins.mnemonic),
                 _ => 0,
             };
             for o in &ins.dst {

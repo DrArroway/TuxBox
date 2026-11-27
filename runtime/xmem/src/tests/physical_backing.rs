@@ -332,6 +332,7 @@ fn copy_page_mappings_can_unmap_and_remap_inside_contiguous_private_span() {
     let batch_remap = Batch { destination: gpu.addr() + PAGE, count: 1, ranges: &remap_mid };
     assert_eq!(unsafe { copy_page_mappings(1, &batch_remap, cpu.addr(), 3) }, 0);
     assert_eq!(query(gpu.addr() + PAGE).State, M_COMMIT);
+    assert_eq!(unsafe { gpu.cast::<u8>().add(PAGE).cast::<u32>().read() }, 0xcccc_3333);
     let (mut remapped_backing, mut remapped_hold) = (0u64, 0u64);
     assert_eq!(
         unsafe { acquire_physical_backing((gpu.addr() + PAGE) as u64, PAGE as u64, &mut remapped_backing, &mut remapped_hold) },
@@ -682,8 +683,8 @@ fn is_physical_backed_does_not_allocate_private_arena_for_unbacked_gpu_alias() {
     let range = PageRange { mode: 0, source: 0, count: 1 };
     let batch = Batch { destination: gpu.addr(), count: 1, ranges: &range };
     assert_eq!(unsafe { copy_page_mappings(1, &batch, initial.addr(), 1) }, 0);
-    // Copying a GPU alias must not dirty its alias page with the source contents.
-    assert_eq!(unsafe { gpu.cast::<u32>().read() }, 0);
+    // Copying a GPU alias preserves its alias contents for D3D12 CPU reads (`buffer-remap`).
+    assert_eq!(unsafe { gpu.cast::<u32>().read() }, 0x1234_5678);
 
     // Unmapping `initial` leaves `token` Unbacked while `gpu` remains mapped.
     assert_eq!(unsafe { map(initial, 1, ptr::null()) }, initial);

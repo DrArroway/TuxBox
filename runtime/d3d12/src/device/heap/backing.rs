@@ -32,8 +32,8 @@
 //! failure fails the import.
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{
-    E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
-    ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, GetLastError,
+    E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_ADDRESS,
+    ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, GetLastError,
 };
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -370,23 +370,52 @@ pub(in super::super) fn read_guest_bytes(address: u64, dst: &mut [u8]) -> bool {
     res.is_ok() && got == dst.len()
 }
 
+fn write_host_slice(host_addr: u64, slice: &[u8]) -> Result<()> {
+    let mut written = 0usize;
+    unsafe {
+        WriteProcessMemory(
+            GetCurrentProcess(),
+            host_addr as *const _,
+            slice.as_ptr().cast(),
+            slice.len(),
+            Some(&mut written),
+        )
+    }?;
+    if written != slice.len() {
+        return Err(E_FAIL.into());
+    }
+    Ok(())
+}
+
 pub(in super::super) fn try_write_xmem_bytes(address: u64, src: &[u8]) -> Option<Result<()>> {
-    visit_xmem_runs(address, src.len(), |host_addr, buf_off, len| {
-        let mut written = 0usize;
-        unsafe {
-            WriteProcessMemory(
-                GetCurrentProcess(),
-                host_addr as *const _,
-                src[buf_off..buf_off + len].as_ptr().cast(),
-                len,
-                Some(&mut written),
-            )
-        }?;
-        if written != len {
-            return Err(E_FAIL.into());
+    match visit_xmem_runs(address, src.len(), |host_addr, buf_off, len| {
+        write_host_slice(host_addr, &src[buf_off..buf_off + len])
+    }) {
+        Some(Err(err)) if err.code() == HRESULT::from_win32(ERROR_INVALID_ADDRESS.0) => {
+            let end = address.checked_add(src.len() as u64)?;
+            let page_start = address & !0xffff;
+            let page_end = end.checked_next_multiple_of(65536)?;
+            for page in (page_start..page_end).step_by(65536) {
+                let copy_lo = page.max(address);
+                let copy_hi = (page + 65536).min(end);
+                let slice = &src[(copy_lo - address) as usize..(copy_hi - address) as usize];
+                match acquired_runs(page, 65536) {
+                    Ok(Some((runs, _hold))) => {
+                        if let Some(run) = runs.first()
+                            && let Err(err) = write_host_slice(run.address + (copy_lo - page), slice)
+                        {
+                            return Some(Err(err));
+                        }
+                    }
+                    Err(e) if e.code() == HRESULT::from_win32(ERROR_INVALID_ADDRESS.0) => continue,
+                    Ok(None) => continue,
+                    Err(other) => return Some(Err(other)),
+                }
+            }
+            Some(Ok(()))
         }
-        Ok(())
-    })
+        other => other,
+    }
 }
 
 #[cfg(test)]

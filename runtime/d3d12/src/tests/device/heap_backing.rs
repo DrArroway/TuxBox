@@ -4,8 +4,8 @@ use crate::commands::page_mapping::GPU_APERTURE;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_NOTIMPL, ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, SetLastError,
-    WAIT_OBJECT_0,
+    E_INVALIDARG, E_NOTIMPL, ERROR_INVALID_ADDRESS, ERROR_MORE_DATA, ERROR_NOT_FOUND,
+    ERROR_NOT_SUPPORTED, SetLastError, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -760,6 +760,41 @@ fn scattered_imports_reuse_cached_piece_heaps() {
     assert_eq!(seen, &[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
 
     drop((readback, res_ac, heap_ac));
+    assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
+    drop(xmem);
+}
+
+#[test]
+fn try_write_xmem_bytes_skips_unmapped_xmem_pages_without_failing() {
+    let guest = Region::reserved((2 * PAGE) as usize);
+    let backing = Region::private(PAGE as usize);
+    let xmem = FakeXmem::install(&[(guest.address(), backing.address())]);
+    unsafe extern "system" fn partial_acquire(
+        address: u64,
+        bytes: u64,
+        out_backing: *mut u64,
+        hold: *mut u64,
+    ) -> i32 {
+        let map = MAP.lock().unwrap();
+        if bytes == PAGE
+            && let Some(&(_, start)) = map.iter().find(|(g, _)| *g == address)
+        {
+            let cookie = ACQUIRED.fetch_add(1, Ordering::AcqRel) + 1;
+            unsafe {
+                out_backing.write(start);
+                hold.write(cookie);
+            }
+            return 1;
+        }
+        unsafe { SetLastError(ERROR_INVALID_ADDRESS) };
+        0
+    }
+    *TEST_EXPORTS.lock().unwrap() = Some(Exports::new(partial_acquire, fake_release));
+
+    let mut payload = vec![0x11u8; (2 * PAGE) as usize];
+    payload[PAGE as usize..].fill(0x22);
+    assert!(matches!(try_write_xmem_bytes(guest.address(), &payload), Some(Ok(()))));
+    assert!(backing.words((PAGE as usize) / 4).iter().all(|&w| w == 0x1111_1111));
     assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
     drop(xmem);
 }

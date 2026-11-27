@@ -177,32 +177,35 @@ impl Pool {
         live_runs.extend(self.collect_live_runs(at + PAGE, span.end));
         let mut snapshots = Vec::new();
         for &(r_lo, r_hi) in &live_runs {
-            let mut preserved: Vec<(usize, Vec<u8>)> = Vec::new();
+            let sub_len = r_hi - r_lo;
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(sub_len)
+                .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+            buf.resize(sub_len, 0);
             let mut masked = Vec::new();
-            for va in (r_lo..r_hi).step_by(PAGE) {
+            for (i, va) in (r_lo..r_hi).step_by(PAGE).enumerate() {
                 if self.secondary_aliases.contains(&va) {
                     masked.push(va);
-                } else if !self.gpu_aliases.contains(&va) {
-                    let mut buf = Vec::new();
-                    buf.try_reserve_exact(PAGE)
-                        .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
-                    buf.resize(PAGE, 0);
-                    unsafe { ptr::copy_nonoverlapping(va as *const u8, buf.as_mut_ptr(), PAGE) };
-                    preserved.push((va, buf));
+                } else {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            va as *const u8,
+                            buf.as_mut_ptr().add(i * PAGE),
+                            PAGE,
+                        )
+                    };
                 }
             }
-            snapshots.push((r_lo, r_hi, preserved, masked));
+            snapshots.push((r_lo, r_hi, buf, masked));
         }
         shared_pages::unmap_private_range(lo, span.end - lo)?;
         self.private_views.remove(&lo);
         let mut restored_pages = 0usize;
-        for (sub_lo, sub_hi, preserved, mut masked) in snapshots {
+        for (sub_lo, sub_hi, buf, mut masked) in snapshots {
             let sub_len = sub_hi - sub_lo;
             shared_pages::isolate_range(sub_lo, sub_len, &shared_pages::region(sub_lo)?)?;
             shared_pages::map_private_range(sub_lo, sub_len)?;
-            for (va, buf) in preserved {
-                unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), va as *mut u8, PAGE) };
-            }
+            unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), sub_lo as *mut u8, sub_len) };
             protect_runs(&mut masked, PAGE_NOACCESS)?;
             let count = sub_len / PAGE;
             self.private_views.insert(
@@ -354,14 +357,14 @@ impl Pool {
             }
             if matches!(self.deferred_unmaps.get(&at), Some(DeferredKind::PrivatePlaceholder)) {
                 shared_pages::protect_private_range(at, PAGE, protect)?;
-                if !matches!(role, SlotRole::SecondaryAlias | SlotRole::GpuAlias) {
+                if !matches!(role, SlotRole::SecondaryAlias) {
                     self.populate_page_bytes(token, at as *mut u8, true)?;
                 }
                 self.deferred_unmaps.remove(&at);
                 span.deferred -= 1;
             } else {
                 shared_pages::commit_private_range_protect(at, PAGE, protect)?;
-                if !matches!(role, SlotRole::SecondaryAlias | SlotRole::GpuAlias)
+                if !matches!(role, SlotRole::SecondaryAlias)
                     && let Err(e) = self.populate_page_bytes(token, at as *mut u8, false)
                 {
                     let _ = shared_pages::decommit_private_range(at, PAGE);
@@ -408,7 +411,7 @@ impl Pool {
             shared_pages::coalesce(base, extent)?;
             return Err(e);
         }
-        if !matches!(role, SlotRole::SecondaryAlias | SlotRole::GpuAlias)
+        if !matches!(role, SlotRole::SecondaryAlias)
             && let Err(e) = self.populate_page_bytes(token, at as *mut u8, false)
         {
             let _ = shared_pages::unmap_private_range(at, PAGE);
@@ -528,7 +531,7 @@ impl Pool {
                 let mut def_copy = deferred_vas.clone();
                 protect_runs(&mut def_copy, base_protect)?;
             }
-            if !gpu_alias && !all_secondary {
+            if !all_secondary {
                 for (i, &token) in tokens.iter().enumerate() {
                     if matches!(roles[i], SlotRole::SecondaryAlias) {
                         continue;
@@ -594,7 +597,7 @@ impl Pool {
             }
             return Err(e);
         }
-        if !gpu_alias && !all_secondary {
+        if !all_secondary {
             for (i, &token) in tokens.iter().enumerate() {
                 if matches!(roles[i], SlotRole::SecondaryAlias) {
                     continue;

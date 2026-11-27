@@ -374,8 +374,10 @@ class RuntimeShaderLinks(unittest.TestCase):
         source.write_bytes(program)
         dxil = portable_program(0, b"pixel")
         store = Mock()
-        store.key.return_value = "content"
-        store.fetch.return_value = False
+        store.key_file.return_value = "c" * 64
+        store.root = self.cache / "content"
+        store.root.mkdir()
+        store.fetch.return_value = None
         store.is_slow.side_effect = lambda request, target: target == "ps_6_6"
 
         def run(args, *, timeout):

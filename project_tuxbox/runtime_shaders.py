@@ -19,10 +19,10 @@ from .dxil_store import COMPUTE_FLAGS, VARIANTS, DxilStore, write_identity
 from .inspect import digest
 from .persistent_dxc import PersistentDxc
 from .shader_diagnostics import refusal_line
+from .shader_blob import MAX_SHADER_BYTES, bounded_shader, exact_marker
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 
 
-MAX_SHADER_BYTES = 64 << 20
 XSHADER_UNSUPPORTED_HLSL = 65
 # The emitter's one-line refusal reason kept beside an .unsupported marker.
 REASON_BYTES = 512
@@ -45,21 +45,6 @@ class ShaderRefused(ValueError):
     @property
     def reason_known(self):
         return not self.cached or self.remembered
-
-
-def bounded_shader(path):
-    """Snapshot a regular file without following links or blocking on FIFOs."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    with os.fdopen(os.open(path, flags), "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError(f"{path.name} is not a regular shader file")
-        if info.st_size > MAX_SHADER_BYTES:
-            raise ValueError("shader exceeds the 64 MiB runtime limit")
-        data = stream.read(MAX_SHADER_BYTES + 1)
-    if len(data) > MAX_SHADER_BYTES:
-        raise ValueError("shader exceeds the 64 MiB runtime limit")
-    return data
 
 
 def verified_input(path, expected):
@@ -115,18 +100,6 @@ def container_stage(data, *, portable):
 
 def portable_stage(data):
     return container_stage(data, portable=True)
-
-
-def exact_marker(path, expected):
-    """Read a tiny regular marker, without following links or blocking."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        with os.fdopen(os.open(path, flags), "rb") as stream:
-            info = os.fstat(stream.fileno())
-            return (stat.S_ISREG(info.st_mode) and info.st_size == len(expected)
-                    and stream.read(len(expected) + 1) == expected)
-    except OSError:
-        return False
 
 
 def remembered_reason(path):
@@ -430,23 +403,38 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             # validated equivalent output, including the candidate and -O0 paths;
             # compiler policy changes deliberately leave warm cache entries valid.
             store = DxilStore.for_cache(cache)
-            content = store.key(hlsl.read_bytes(), target) if store else None
-            data = bounded_shader(output) if store and store.fetch(content, output) else None
-            if data is None or portable_stage(data) != target_stage:
+            content = store.key_file(hlsl, target) if store else None
+            def reuse_content():
+                data = store.fetch(content, output, accept=lambda blob: portable_stage(blob) == target_stage) if store else None
+                if data is not None and portable_stage(data) == target_stage:
+                    return data
                 output.unlink(missing_ok=True)
-                data = None
-                if (persistent is not None and target == "cs_6_0"
-                        and not (store and store.is_slow(key, target))
-                        and persistent.compile(dxc, hlsl, output)):
-                    try:
-                        data = validated_dxil(dxv, output, target_stage)
-                    except (OSError, ValueError, subprocess.SubprocessError) as error:
-                        persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
-                        output.unlink(missing_ok=True)
-                if data is None:
-                    data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
-                if store:
-                    store.save(content, output)
+                return None
+
+            data = reuse_content()
+            if data is None:
+                # The exact-source lock above cannot deduplicate different
+                # requests (or translator builds) that emit identical HLSL.
+                # Acquire the shared toolchain/content lock only after a miss.
+                # Always acquire source before content; never the reverse.
+                # Allow time for the optimised attempt, fallback and validation.
+                lock = (compile_lock(store.root, content, timeout=O0_TIMEOUT_MAX + COMPUTE_TIMEOUT + 60)
+                        if store else nullcontext())
+                with lock:
+                    data = reuse_content() if store else None
+                    if data is None:
+                        if (persistent is not None and target == "cs_6_0"
+                                and not (store and store.is_slow(key, target))
+                                and persistent.compile(dxc, hlsl, output)):
+                            try:
+                                data = validated_dxil(dxv, output, target_stage)
+                            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                                persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
+                                output.unlink(missing_ok=True)
+                        if data is None:
+                            data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
+                        if store:
+                            store.save(content, data)
             stamp = work / "sha256"
             stamp.write_text(hashlib.sha256(data).hexdigest())
             if session is not None:

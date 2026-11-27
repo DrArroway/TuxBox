@@ -163,6 +163,8 @@ It runs on the Proton backend and removes only these programs' cache entries fro
 ```sh
 python tuxbox.py run --app-id Lanes build/lanes --replay --report replay.txt
 ```
+With `--overlay` before the package path, add `--panel` after `--replay` to fail unless TuxBox's performance panel is on screen. The `present` checks run this as `lanes-overlay`.
+
 
 The replay checks all 16 GPU-generated rows, a win, a missed coin and a collision. It uploads two 520 × 640 boards through the Xbox command list, reads both textures back, and checks every pixel plus the lane and player colors. The replay runs without opening a window. During interactive play, the same textures are presented through the Xbox command queue.
 

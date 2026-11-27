@@ -125,3 +125,13 @@ fn a_container_that_is_not_console_code_is_unknown() {
     assert_eq!(table_image_writes(&[]), None);
     assert_eq!(table_image_writes(b"DXBC not a container"), None);
 }
+
+#[test]
+fn setting_a_hardware_register_leaves_the_descriptor_alone() {
+    // s_setreg_imm32_b32 with 9 in its scalar field, then its literal: the
+    // field names no scalar the instruction writes.
+    let setreg = [0xba89_0001, 0x0000_0003];
+    let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &setreg, &STORE, &[ENDPGM]]);
+    assert_eq!(mnemonics_of(&code)[3], "s_setreg_imm32_b32");
+    assert_eq!(isa_table_image_writes(&code, &TABLES), Some(vec![(1, 3)]));
+}

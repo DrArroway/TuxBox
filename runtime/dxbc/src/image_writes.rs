@@ -153,7 +153,12 @@ pub fn isa_table_image_writes(isa: &[u8], tables: &[(u8, u32)]) -> Option<Vec<Ta
         };
         let next = (name != "s_branch" && name != "s_endpgm").then_some(index + 1).filter(|next| *next < ops.len());
         successors.push((next, target));
-        clobbers.push((0..REGISTERS as u8).filter(|&register| rdna2::clobbers_scalar(op, register)).collect::<Vec<_>>());
+        // s_setreg writes a hardware register; the scalar it names is its source.
+        clobbers.push(if name.starts_with("s_setreg") {
+            Vec::new()
+        } else {
+            (0..REGISTERS as u8).filter(|&register| rdna2::clobbers_scalar(op, register)).collect::<Vec<_>>()
+        });
     }
     let mut sites: Vec<TableSlot> = Vec::new();
     let mut entry: Vec<Option<Box<[Value; REGISTERS]>>> = vec![None; ops.len()];

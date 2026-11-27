@@ -78,6 +78,7 @@ mod int16;
 mod int32;
 mod float64;
 mod quad_sad;
+mod half_exact;
 mod indexed_lane;
 mod particle_sort;
 mod persistent;

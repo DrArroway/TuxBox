@@ -66,7 +66,10 @@ uint2 tb_field64(uint lo, uint hi, uint control, bool sign) {
 }
 "#);
         }
-        if self.insns.iter().any(|i| normalized_half_to_integer(&i.mnemonic)) {
+        if self.insns.iter().any(|i| half_exact::needs_helpers(&i.mnemonic)) {
+            h.push_str(half_exact::HELPERS);
+        }
+        if self.insns.iter().any(|i| normalized_half_to_integer(&i.mnemonic) || half_exact::uses_normalized_half(&i.mnemonic)) {
             h.push_str(include_str!("../../normalized_half.hlsl"));
         }
         let uses_half_unary = self.insns.iter().any(|i| half_unary_op(&i.mnemonic).is_some());

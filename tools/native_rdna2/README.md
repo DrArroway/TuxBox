@@ -19,3 +19,11 @@ python tools/native_rdna2/check_sad.py --work build/native-rdna2-sad --output bu
 ```
 
 [Example receipt](../../evidence/native-rdna2-byte-sad.json)
+
+`half.hip` and `check_half.py` do the same for the f16 frexp and ldexp forms and the normalized 16-bit packs, against the model of `tools/check_half_exact_gpu.py`:
+
+```
+python tools/native_rdna2/check_half.py --work build/native-rdna2-half --output build/native-rdna2-half.json
+```
+
+[Example receipt](../../evidence/native-rdna2-half.json)

@@ -30,6 +30,11 @@ pub(crate) struct PipelineData {
     /// The guest root with the literal samplers the program needs and the root
     /// leaves out; set around each dispatch (see `compute_table::sampler_root`).
     pub(crate) sampler_root: Option<ID3D12RootSignature>,
+    /// The table descriptors (root parameter, slot) the pipeline's stages can
+    /// write an image through, when every stage is console code whose image
+    /// stores all trace to such descriptors. `None` when that is not known:
+    /// the pipeline may then write any texture it can reach.
+    pub(crate) image_writes: Option<std::sync::Arc<[tuxbox_dxbc::image_writes::TableSlot]>>,
 }
 
 const _: () = assert!(
@@ -439,6 +444,7 @@ unsafe fn create_pipeline_x_inner(
                 reflected,
                 compute_threads,
                 sampler_root,
+                image_writes: tuxbox_dxbc::image_writes::table_image_writes(bytes).map(Into::into),
                 ..Default::default()
             },
             out,

@@ -98,6 +98,9 @@ struct Recording {
     indexed_arenas: Vec<Arc<device::descriptor_paging::Arena>>,
     scalar_descriptors: std::collections::HashSet<descriptors::ScalarDescriptor>,
     sampled_heaps: Vec<Range<usize>>,
+    /// Shader-visible ranges whose placed textures are read and never written,
+    /// whatever kind of view names them.
+    read_heaps: Vec<Range<usize>>,
     phase: ListState,
     error: HRESULT,
     /// `RecordingGuard` has logged the current error.
@@ -286,6 +289,7 @@ unsafe extern "system" fn reset(
         state.indexed_arenas.clear();
         state.scalar_descriptors.clear();
         state.sampled_heaps.clear();
+        state.read_heaps.clear();
         state.error = S_OK;
     }
     hr
@@ -805,6 +809,7 @@ pub(crate) unsafe fn wrap_command_list(
             indexed_arenas: Vec::new(),
             scalar_descriptors: Default::default(),
             sampled_heaps: Vec::new(),
+            read_heaps: Vec::new(),
             media: compact.then(|| media::Recording::new(allocator)),
             phase: ListState::Fresh(allocator.native.clone(), initial.map(|p| p.native.clone())),
             error: S_OK,

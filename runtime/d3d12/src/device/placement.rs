@@ -616,6 +616,13 @@ fn unique(textures: &mut Vec<Arc<Texture>>) {
     textures.dedup_by(|a, b| Arc::ptr_eq(a, b));
 }
 
+/// Add the placed textures viewed in `heaps` to a batch's reads. The batch
+/// cannot write through these ranges, so a writable view there is a read too.
+pub(crate) unsafe fn gather_reads(device: *mut c_void, heaps: &[Range<usize>], textures: &mut Vec<Arc<Texture>>) {
+    let device = unsafe { &*device.cast::<Device>() };
+    device.state.placements.views.gather_reads(heaps, textures);
+}
+
 // Descriptor contents may change after command-list Close. Resolve SRVs in the
 // shader-visible heaps that actually participated in a draw or dispatch.
 pub(crate) unsafe fn submit(

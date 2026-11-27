@@ -222,6 +222,19 @@ unsafe fn create(
         at += bytes;
     }
 
+    // Decided from the title's own stages, before any of them is replaced.
+    pipeline.image_writes = original
+        .iter()
+        .flatten()
+        .try_fold(Vec::new(), |mut slots, (code, _)| {
+            for slot in tuxbox_dxbc::image_writes::table_image_writes(code)? {
+                if !slots.contains(&slot) {
+                    slots.push(slot);
+                }
+            }
+            Some(slots)
+        })
+        .map(Into::into);
     if let (Some((mesh, _)), Some(root), Some(field)) = (original[7], guest_root, root_record)
         && original[2..7].iter().all(Option::is_none)
         && original[0].is_none()

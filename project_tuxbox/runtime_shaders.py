@@ -2,6 +2,7 @@
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 import errno
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -232,6 +233,21 @@ COMPUTE_TIMEOUT = 60
 DISPATCHER = b"while (tb_pc != "
 
 
+# Promotes each function's locals before inlining it, which saves DXC about a
+# third of its time on large generated programs. DXC calls the option experimental.
+INLINING_FLAG = "-fnew-inlining-behavior"
+
+
+@lru_cache(maxsize=None)
+def inlining_flags(dxc):
+    """The flag for a `dxc` that lists it; older releases reject unknown options."""
+    try:
+        listed = subprocess.run([dxc, "-help"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    return (INLINING_FLAG,) if INLINING_FLAG.encode("ascii") in listed.stdout else ()
+
+
 def validated_dxil(dxv, output, stage):
     """Return bounded, stage-correct output bytes after DXV accepts the file."""
     run_tool([dxv, output], timeout=10)
@@ -262,7 +278,8 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
             run_tool(unoptimised, timeout=o0_timeout(hlsl))
             return validated_dxil(dxv, output, stage)
         try:
-            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
+            faster = () if target == "lib_6_3" else inlining_flags(dxc)
+            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers", *faster,
                       "-Fo", output, hlsl], timeout=15)
             if not output.exists():
                 raise ValueError("compiler returned no DXIL output")
@@ -284,16 +301,21 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     # See `COMPUTE_FLAGS`. -O0 remains the fallback: the largest programs still
     # compile that way when the optimiser fails or runs out of time.
     if target == "cs_6_6":
-        try:
-            run_tool([dxc, "-T", target, *entry, *COMPUTE_FLAGS, "-Fo", output, hlsl], timeout=COMPUTE_TIMEOUT)
-            if not output.exists():
-                raise ValueError("compiler returned no DXIL output")
-            return validated_dxil(dxv, output, stage)
-        except subprocess.TimeoutExpired:
-            if store:
-                store.mark_slow(request, target)
-        except ValueError:
-            pass
+        faster = inlining_flags(dxc)
+        # Output that fails with the experimental option is compiled without it.
+        for extra in (faster, ()) if faster else ((),):
+            try:
+                run_tool([dxc, "-T", target, *entry, *COMPUTE_FLAGS, *extra, "-Fo", output, hlsl],
+                         timeout=COMPUTE_TIMEOUT)
+                if not output.exists():
+                    raise ValueError("compiler returned no DXIL output")
+                return validated_dxil(dxv, output, stage)
+            except subprocess.TimeoutExpired:
+                if store:
+                    store.mark_slow(request, target)
+                break
+            except ValueError:
+                output.unlink(missing_ok=True)
         output.unlink(missing_ok=True)
         run_tool(unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)

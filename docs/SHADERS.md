@@ -144,7 +144,7 @@ The counts are per recorded request, so they overstate what a live run loses: a 
 
 When a program's loops can't be nested, the translator puts its basic blocks into one loop in which each thread runs the block it is at. The blocks are tested in program order on the thread's current block, so one pass follows every forward jump and only a jump back needs another. One test skips 24 blocks.
 
-All programs are first compiled without DXC's lifetime markers, with which DXC can spend most of a large compile in Jump Threading. `cs_6_6` uses `-O1` and falls back to `-O0`. Other targets use the default level; one that runs out of time falls back to `-O0`, and output that is rejected is compiled again with the markers. Dispatcher programs never keep the markers: they fall back to `-O0`. At the default level with the markers, RADV (Mesa 26.1.8) spent 130 seconds and 20 GB on one ProjectScarlett pixel program. Without them it took 0.1 seconds.
+All programs are first compiled without DXC's lifetime markers, with which DXC can spend most of a large compile in Jump Threading. A DXC that lists `-fnew-inlining-behavior` also gets it for every target but `lib_6_3`. `cs_6_6` uses `-O1` and falls back to `-O0`. Other targets use the default level; one that runs out of time falls back to `-O0`, and output that is rejected is compiled again with the markers. Dispatcher programs never keep the markers: they fall back to `-O0`. At the default level with the markers, RADV (Mesa 26.1.8) spent 130 seconds and 20 GB on one ProjectScarlett pixel program. Without them it took 0.1 seconds.
 
 ### Whole-wave branches
 

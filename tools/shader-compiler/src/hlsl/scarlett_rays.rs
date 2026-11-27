@@ -11,6 +11,9 @@ pub(crate) enum Walk {
     /// CS_IrradianceCache_ShadowTrace_WithFar: the same ray against the near
     /// scene, then, if nothing was hit, its remainder against the far scene.
     IrradianceShadowFar,
+    /// CS_RaytraceShadows_Mixed: a sun shadow ray per pixel against the near
+    /// scene and, if nothing was hit, against the far scene.
+    RaytraceShadows,
 }
 
 pub(crate) fn identify(ex: &ShaderExtract) -> Option<Walk> {
@@ -27,6 +30,11 @@ pub(crate) fn identify(ex: &ShaderExtract) -> Option<Walk> {
             if matches_program(&ex.isa, 4992, 0x41caa1a510538f9d) =>
         {
             Some(Walk::IrradianceShadowFar)
+        }
+        "CS_RaytraceShadows_Mixed_22f3acbc_Wrapped"
+            if matches_program(&ex.isa, 7728, 0x49e8da1f58f8e753) =>
+        {
+            Some(Walk::RaytraceShadows)
         }
         _ => None,
     }
@@ -101,10 +109,50 @@ const IRRADIANCE_SHADOW_FAR: &[Loop] = &[
     },
 ];
 
+// Every walk traces origin v4, v5, v6 and direction v9, v10, v11 between v7
+// and v8. The far scene is traced by one of two copies of the walk; the copy
+// at 0x1658 is entered by the branch at 0x0e8c, which jumps to 0x1660.
+const RAYTRACE_SHADOWS: &[Loop] = &[
+    Loop {
+        scratch: [0x06b0, 0x0678],
+        first: 0x06d4,
+        last: 0x0ddc,
+        at: 0x06d8,
+        ray: [4, 5, 6, 9, 10, 11, 8],
+        min: Some(7),
+        hit: 15,
+        table: 5,
+        scene: 128,
+    },
+    Loop {
+        scratch: [0x0ec0, 0x0f14],
+        first: 0x0f24,
+        last: 0x162c,
+        at: 0x0f28,
+        ray: [4, 5, 6, 9, 10, 11, 8],
+        min: Some(7),
+        hit: 14,
+        table: 5,
+        scene: 32,
+    },
+    Loop {
+        scratch: [0x0e30, 0x0e7c],
+        first: 0x1658,
+        last: 0x1d6c,
+        at: 0x1660,
+        ray: [4, 5, 6, 9, 10, 11, 8],
+        min: Some(7),
+        hit: 14,
+        table: 5,
+        scene: 32,
+    },
+];
+
 fn loops(walk: Walk) -> &'static [Loop] {
     match walk {
         Walk::IrradianceShadow => IRRADIANCE_SHADOW,
         Walk::IrradianceShadowFar => IRRADIANCE_SHADOW_FAR,
+        Walk::RaytraceShadows => RAYTRACE_SHADOWS,
     }
 }
 

@@ -648,7 +648,9 @@ class RuntimeShaderLinks(unittest.TestCase):
                     elif optimised and failure == "dxv":
                         raise ToolFailure("dxv", 1, "invalid DXIL")
 
-                with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
+                # No experimental option here; that path is test_rejected_compute_output_is_compiled_again_without_new_inlining.
+                with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler, \
+                        patch("project_tuxbox.runtime_shaders.inlining_flags", return_value=()):
                     self.assertEqual(compile_dxil("dxc", "dxv", "cs_6_6", hlsl, output, store, "request", 5), dxil)
                 compiles = [call for call in compiler.call_args_list if call.args[0][0] == "dxc"]
                 self.assertEqual(len(compiles), 1 if failure == "slow" else 2)

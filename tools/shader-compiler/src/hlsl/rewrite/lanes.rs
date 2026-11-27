@@ -182,6 +182,21 @@ fn dead_after(
     true
 }
 
+/// Active source operands of `ins`, excluding unused `Sgpr(0)` padding slots
+/// that the generic VOP3 decoder emits for 1- and 2-operand VOP1/VOP2/VOPC forms.
+fn active_srcs(ins: &Insn) -> &[Opnd] {
+    if ins.enc != Enc::Vop3 {
+        return &ins.src;
+    }
+    if (0x180..0x200).contains(&ins.op) {
+        &ins.src[..ins.src.len().min(1)]
+    } else if ins.op < 0x180 && !matches!(ins.op, 0x101 | 0x128 | 0x129 | 0x12a) {
+        &ins.src[..ins.src.len().min(2)]
+    } else {
+        &ins.src
+    }
+}
+
 /// A pixel is a wave of its own, so the first lane of a mask that covers it is its own.
 /// `s_ff1` names that lane for `v_readlane`; anything else that uses the lane is left alone.
 pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
@@ -194,7 +209,7 @@ pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
         if !insns[first].mnemonic.starts_with("s_ff1_i32_b") { continue; }
         // The destination field names an SGPR (decoded generically as a VGPR).
         let Some(&(Opnd::Vgpr(result) | Opnd::Sgpr(result))) = insns[i].dst.first() else { continue };
-        let reads = |j: usize| j != i && insns[j].src.contains(&Opnd::Sgpr(lane));
+        let reads = |j: usize| j != i && active_srcs(&insns[j]).contains(&Opnd::Sgpr(lane));
         if (first + 1..i).any(reads) { continue; }
         if result != lane {
             let end = (i + 1..insns.len()).find(|&j| insns[j].dst.contains(&Opnd::Sgpr(lane)) || insns[j].mnemonic.contains("branch"));

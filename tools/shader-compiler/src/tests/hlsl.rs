@@ -863,6 +863,31 @@ fn sgpr_lane_readlane_refused_on_spill_area() {
 }
 
 #[test]
+fn lower_first_lane_reads_ignores_unused_vop3_s0_padding() {
+    let ff1 = Insn {
+        offset: 0, enc: Enc::Sop1, op: 0x14, mnemonic: "s_ff1_i32_b64".into(),
+        dst: vec![Opnd::Sgpr(0)], src: vec![Opnd::Sgpr(0)], aux: Default::default(), dwords: 1, raw: vec![0],
+    };
+    // VOP3-encoded VOP1 (op 0x1ab = v_rcp_iflag_f32) pads unused src[1]/src[2] with Sgpr(0).
+    let rcp = Insn {
+        offset: 4, enc: Enc::Vop3, op: 0x1ab, mnemonic: "v_rcp_iflag_f32".into(),
+        dst: vec![Opnd::Vgpr(40)], src: vec![Opnd::Vgpr(40), Opnd::Sgpr(0), Opnd::Sgpr(0)],
+        aux: Default::default(), dwords: 2, raw: vec![0, 0],
+    };
+    let read = sgpr_lane_readlane(39, 0, 4);
+    let clobber = Insn {
+        offset: 16, enc: Enc::Sop2, op: 0x0e, mnemonic: "s_and_b64".into(),
+        dst: vec![Opnd::Sgpr(0)], src: vec![Opnd::Sgpr(72), Opnd::ExecLo],
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    };
+    let mut insns = vec![ff1, rcp, read, clobber];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[2].mnemonic, "v_readfirstlane_b32");
+    assert_eq!(insns[2].dst, vec![Opnd::Sgpr(4)]);
+    assert_eq!(insns[2].src, vec![Opnd::Vgpr(39)]);
+}
+
+#[test]
 fn const_lane_readlane_still_group_read_when_group_reads() {
     let mut insns = vec![const_lane_readlane(4, 3, 7)];
     lower_lane_spills(&mut insns, false, true).expect("group read");

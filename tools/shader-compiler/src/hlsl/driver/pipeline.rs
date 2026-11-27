@@ -7,6 +7,51 @@ pub(in crate::hlsl) fn compute_group(ex: &ShaderExtract) -> [u32; 3] {
     [x.max(1), y.max(1), z.max(1)]
 }
 
+/// Decide whether the loop closing at the backward branch `index` keeps a shared
+/// exchange safe.
+///
+/// Every invocation in the group must execute the loop the same number of times,
+/// or the group would dead-lock at the exchange's barriers (or observe half-written
+/// shared memory). That holds for a single 32-lane host wave with a uniform
+/// back-edge (unconditional or SCC) and no other branch in the loop body:
+/// SCC is then identical for every thread in the wave, and no per-invocation
+/// exit exists.
+///
+/// Refusals kept for everything else:
+/// - VCC branches (per-lane exit) and EXEC branches (per-thread bit in this emitter),
+/// - inverted conditions (s_cbranch_execz / s_cbranch_vccz): the console takes the
+///   branch only when the whole wave's mask is zero, but a vote over a per-lane
+///   condition repeats while any single lane's bit is clear, so it needs a
+///   uniform condition rather than a vote it cannot keep in step,
+/// - multi-wave groups (independent SCC per host wave),
+/// - any other branch inside the body (forward rejoins, continues, nested loops),
+///   since any of those can skip the exchange or a barrier on a per-invocation basis.
+fn exchange_loop_safe(insns: &[crate::rdna2::Insn], count: u32, branch_index: usize, head: i64) -> bool {
+    if count > 32 {
+        return false;
+    }
+    let branch = &insns[branch_index];
+    // Unconditional (2) and SCC branches (4, 5) are uniform for the wave. Anything
+    // else - per-lane VCC/EXEC, or the inverted (taken-when-zero) polarities - is refused.
+    if !matches!(branch.op, 2 | 4 | 5) {
+        return false;
+    }
+    let back = branch.offset as i64;
+    for (index, ins) in insns.iter().enumerate() {
+        if index == branch_index {
+            continue;
+        }
+        let from = ins.offset as i64;
+        if from < head || from > back {
+            continue;
+        }
+        if ins.enc == Enc::Sopp && (Emitter::branch_cond(ins.op).is_some() || ins.op == 1) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     translate_linked(ex, None)
 }
@@ -409,12 +454,20 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         }
         // Moving a shared exchange out of a forward guest branch is safe once every
         // invocation rejoins. A backward branch could execute it different numbers of times.
-        for branch in em.insns.iter().filter(|i| i.enc == Enc::Sopp && Emitter::branch_cond(i.op).is_some() && i.aux.imm < 0) {
+        // Only the loops proven safe here keep a whole-wave vote in the emitter; every
+        // other loop emits the per-thread condition it always has.
+        let mut accepted_swizzle_loops = std::collections::BTreeSet::new();
+        for (index, branch) in em.insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp && Emitter::branch_cond(i.op).is_some() && i.aux.imm < 0) {
             let head = branch.offset as i64 + 4 + 4 * branch.aux.imm;
+            if exchange_loop_safe(&em.insns, count, index, head) {
+                accepted_swizzle_loops.insert(index);
+                continue;
+            }
             if em.insns.iter().any(|i| exchanges(i) && (head..=branch.offset as i64).contains(&(i.offset as i64))) {
                 return Err("compute swizzle inside a loop".into());
             }
         }
+        em.accepted_swizzle_loops = accepted_swizzle_loops;
     }
     if (em.compute_swizzle || em.indexed_lane) && wave_cull::lds_words(&em).is_none()
         && em.insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32") {

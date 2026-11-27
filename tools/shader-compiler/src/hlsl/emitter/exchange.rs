@@ -50,8 +50,17 @@ impl<'a> Emitter<'a> {
             }
             // READLANE ignores EXEC. Publish each lane's actual VGPR even when
             // that lane skipped the guest branch, then guard only the load on
-            // active skip flags and mask the selector to 0..width-1.
-            self.line(&format!("tb_swizzle[tb_lane] = {};", r(&ins.src[0])?));
+            // active skip flags and mask the selector to 0..width-1. Inside an
+            // accepted loop the lane was kept in the loop but already finished:
+            // mask the publish too, so the remaining lanes read a zero.
+            let value = r(&ins.src[0])?;
+            let value = if self.in_accepted_swizzle_loop() && !active.is_empty() {
+                let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+                format!("({}) ? {value} : 0u", guard.join(" && "))
+            } else {
+                value
+            };
+            self.line(&format!("tb_swizzle[tb_lane] = {value};"));
             self.line("GroupMemoryBarrierWithGroupSync();");
             let load = format!("tb_swizzle_read((tb_lane & ~{mask}u) | ({} & {mask}u))", r(&ins.src[1])?);
             if active.is_empty() {

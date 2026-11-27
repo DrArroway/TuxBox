@@ -22,6 +22,8 @@ impl<'a> Emitter<'a> {
             lds_tile: lds_tile::LdsTile::recognize(ex, &insns),
             packed: None,
             loop_depth: 0,
+            accepted_swizzle_loops: BTreeSet::new(),
+            in_accepted_swizzle_loop_stack: Vec::new(),
             ex,
             insns,
             res: HashMap::new(),

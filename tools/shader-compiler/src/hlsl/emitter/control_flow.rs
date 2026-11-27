@@ -150,6 +150,7 @@ impl<'a> Emitter<'a> {
                 // The back edge can store the index after a use. Bind again inside the loop.
                 self.drop_heap_handles();
                 self.loop_depth += 1;
+                self.in_accepted_swizzle_loop_stack.push(self.accepted_swizzle_loops.contains(&b));
                 self.line(&format!("tb_c{b} = false;"));
             }
             let mut active: Vec<usize> =
@@ -333,6 +334,29 @@ impl<'a> Emitter<'a> {
                 cur.clear();
             }
             if back.contains_key(&i) {
+                let head = back[&i];
+                // A loop whose body holds any group rendezvous must keep every lane
+                // together until the last one is done: a per-thread exit that leaves
+                // the loop early makes the lane stop hitting the barriers the other
+                // lanes wait on. Only the loops the pipeline proved safe for a shared
+                // exchange get the whole-wave vote: other loops keep their per-thread
+                // condition, exactly as they emitted before this feature existed.
+                let vote = self.accepted_swizzle_loops.contains(&i) && self.insns[head..=i].iter().enumerate().any(|(j, ins2)| {
+                    let idx = head + j;
+                    exchanges(ins2)
+                        || ins2.mnemonic == "s_barrier"
+                        || ins2.mnemonic == "tb_first_exec_lane"
+                        || ins2.mnemonic == "tb_indexed_readlane"
+                        || (self.single_wave32 && ins2.enc == Enc::Ds)
+                        || lds_waits.contains(&idx)
+                        || restored_waits.contains(&idx)
+                });
+                if vote {
+                    // Evaluate the back-edge condition unconditionally: the while
+                    // condition below votes over it, which must not be guarded.
+                    self.end_guard(&mut open);
+                    cur.clear();
+                }
                 // Evaluate the back-edge condition inside the guard (a skipped branch is not taken).
                 let cond = wave_cull::branch_condition(self, ins, Self::branch_cond(ins.op).unwrap_or("false"));
                 self.line(&format!("tb_c{i} = ({cond});"));
@@ -343,12 +367,10 @@ impl<'a> Emitter<'a> {
                 self.end_guard(&mut open);
                 cur.clear();
                 // Clear the flags of labels inside this loop body for the next iteration.
-                let head = back[&i];
                 for t in labels.iter().filter(|&&t| t > head && t <= i) {
                     self.line(&format!("j{t} = false;"));
                 }
                 let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
-                let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
                 let guard = if self.wave_cull || self.light_grid || probe_trace
                     || self.wave_bounded_latches.contains(&i)
                     || self.packed.as_ref().is_some_and(|p| p.copy_backedges.contains(&i) || p.bounded_backedges.contains(&i))
@@ -361,10 +383,17 @@ impl<'a> Emitter<'a> {
                     // The guest iterates cb0[12] views. Retired lanes must
                     // participate in the barriers for each remaining view.
                     self.line("} while (++cull_view < cb0[3].x);");
+                } else if vote {
+                    // Keep the whole wave in the loop while any lane still needs to
+                    // run; finished lanes stay in the loop, masked, and still hit the barriers.
+                    let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
+                    self.line(&format!("}} while (WaveActiveAnyTrue(tb_c{i}{exit}){guard});"));
                 } else {
+                    let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
                     self.line(&format!("}} while (tb_c{i}{exit}{guard});"));
                 }
                 self.loop_depth = self.loop_depth.saturating_sub(1);
+                self.in_accepted_swizzle_loop_stack.pop();
                 self.drop_heap_handles();
             }
         }

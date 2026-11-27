@@ -9,7 +9,17 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 
-from project_tuxbox.runtime_shaders import COMPUTE_TIMEOUT, O0_TIMEOUT, O0_TIMEOUT_MAX, ShaderRefused, archive_request, compile_dxil, compile_request, o0_timeout, serve, snapshot_compiler_cache
+from project_tuxbox.runtime_shaders import (COMPUTE_TIMEOUT,
+                                            O0_TIMEOUT,
+                                            O0_TIMEOUT_MAX,
+                                            ShaderRefused,
+                                            archive_request,
+                                            compile_dxil,
+                                            compile_request,
+                                            o0_timeout,
+                                            serve,
+                                            snapshot_compiler_cache,
+                                            inlining_flags)
 from project_tuxbox.scarlett_prep import scarlett_requests
 from project_tuxbox.shader_prep import SOURCE_CACHE, ToolFailure, prepare_for_launch
 
@@ -468,6 +478,49 @@ class RuntimeShaderLinks(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 compile_dxil("dxc", "dxv", "ps_6_6", hlsl, output, None, "request", 0)
         self.assertEqual(compiler.call_count, 1)
+
+    def test_new_inlining_is_used_only_where_dxc_lists_it(self):
+        for listed, flags in ((b"  -fnew-inlining-behavior Experimental", ("-fnew-inlining-behavior",)),
+                              (b"  -O0 Disable optimizations", ())):
+            inlining_flags.cache_clear()
+            with patch("project_tuxbox.runtime_shaders.subprocess.run", return_value=Mock(stdout=listed)):
+                self.assertEqual(inlining_flags("dxc"), flags)
+        inlining_flags.cache_clear()
+        with patch("project_tuxbox.runtime_shaders.subprocess.run", side_effect=OSError):
+            self.assertEqual(inlining_flags("dxc"), ())
+        inlining_flags.cache_clear()
+
+    def test_new_inlining_applies_to_every_target_but_libraries(self):
+        hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
+        hlsl.write_bytes(b"small program")
+        for target, stage in (("ps_6_6", 0), ("cs_6_0", 5), ("cs_6_6", 5), ("lib_6_3", 6)):
+            with self.subTest(target=target):
+                def run(args, *, timeout):
+                    if args[0] == "dxc":
+                        self.assertEqual("-fnew-inlining-behavior" in args, target != "lib_6_3")
+                        output.write_bytes(portable_program(stage, b"inlined"))
+                with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run), \
+                        patch("project_tuxbox.runtime_shaders.inlining_flags",
+                              return_value=("-fnew-inlining-behavior",)):
+                    compile_dxil("dxc", "dxv", target, hlsl, output, None, "request", stage)
+
+    def test_rejected_compute_output_is_compiled_again_without_new_inlining(self):
+        hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
+        hlsl.write_bytes(b"small program")
+        dxil = portable_program(5, b"plain")
+        seen = []
+        def run(args, *, timeout):
+            if args[0] == "dxc":
+                seen.append("-fnew-inlining-behavior" in args)
+                self.assertNotIn("-O0", args)
+                if seen[-1]:
+                    raise ToolFailure("dxc", 1, "internal compiler error")
+                output.write_bytes(dxil)
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run), \
+                patch("project_tuxbox.runtime_shaders.inlining_flags",
+                      return_value=("-fnew-inlining-behavior",)):
+            self.assertEqual(compile_dxil("dxc", "dxv", "cs_6_6", hlsl, output, None, "request", 5), dxil)
+        self.assertEqual(seen, [True, False])
 
     def test_every_profile_compiles_without_lifetime_markers(self):
         """The default optimisation level is kept, except for cs_6_6."""

@@ -44,6 +44,7 @@ mod depth;
 mod enhanced;
 mod descriptors;
 mod graphics;
+mod indirect_order;
 mod copy_memory;
 pub(crate) mod list_memory;
 pub(crate) mod queue_trace;
@@ -529,6 +530,10 @@ unsafe extern "system" fn execute_indirect(
     // Ray shader records can carry local descriptor tables.
     if signature.state.kind == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS {
         state.sample_heap();
+    }
+    let patched = signature.state.kind == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH && count.is_some();
+    if max_count != 0 && state.active.indirect.needs_barrier(patched) {
+        barriers::order_indirect_reads(&mut state);
     }
     if signature.state.kind == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH {
         state.compute_dispatch(list, execute);

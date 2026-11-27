@@ -29,7 +29,7 @@ OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.d
 SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
-                   "indirect-dispatch", "gpu-indirect-dispatch",
+                   "indirect-dispatch", "gpu-indirect-dispatch", "gpu-indirect-order",
                    "dispatch-wait", "direct-copy-wait", "texture-readback", "texture-publication",
                    "ray-tracing-builder", "thread-dimensions",
                    "descriptor-reclaim")
@@ -1153,6 +1153,7 @@ GATE_LABELS = {
     "lanes-selftest-indirect-dispatch": "ExecuteIndirect matching a direct dispatch",
     "lanes-selftest-direct-copy-wait": "A direct queue waiting before and after a buffer copy",
     "lanes-selftest-gpu-indirect-dispatch": "GPU-written arguments controlling an indirect dispatch",
+    "lanes-selftest-gpu-indirect-order": "Indirect arguments and counts read after the dispatch that wrote them",
     "lanes-selftest-dispatch-wait": "A memory wait before and after a compute dispatch",
     "lanes-selftest-texture-readback": "A guest texture copied back to title memory",
     "lanes-selftest-texture-publication": "GPU texture writes published to title memory, leaving padding, closed pages and memory past the texture alone",

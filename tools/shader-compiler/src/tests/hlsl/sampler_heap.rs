@@ -401,6 +401,44 @@ fn a_literal_sampler_takes_the_private_static_the_runtime_appends() {
 }
 
 #[test]
+fn a_missing_literal_sampler_binds_the_private_register() {
+    // A compute program whose literal sampler state the root does not hold.
+    // The runtime appends the state after every sampler register the root
+    // uses; the translator must bind the same private register.
+    let mut words = SAMPLE[..4].to_vec();
+    words.extend([0xb0140092, 0xbe9503ff, 0x00c00000, 0xbe9603ff, 0x18500000, 0xbe970380]);
+    words.extend(&SAMPLE[6..]);
+    let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut ex = super::super::mesh::heap_extract(&[], 0x400, &isa);
+    ex.stage = Stage::Compute;
+    ex.shader_model = (6, 6);
+    ex.required_features = Some(3 << 25);
+    ex.fssm = fssm(&[CONSTANTS, RESOURCE_HEAP, SAMPLER_HEAP], &[USED]);
+    ex.resources = vec![
+        PsvResource { res_type: 2, space: 0, lower: 500, upper: 500 },
+        PsvResource { res_type: 1, space: 1, lower: 5, upper: 5 },
+    ];
+    let mut point = [0u32; 13];
+    point[1..4].fill(3); // clamp
+    point[9] = 12.0_f32.to_bits();
+    point[10] = 5;
+    point[11] = 1;
+    point[12] = 0;
+    ex.root_sig = Some(crate::meta::RootSig {
+        version: 2,
+        flags: 0x400,
+        params: Vec::new(),
+        num_static_samplers: 1,
+        static_samplers: vec![point],
+    });
+    ex.has_root_sig = true;
+    let insns = crate::rdna2::disassemble(&ex.isa);
+    let em = super::super::Emitter::new(&ex, insns.clone());
+    assert_eq!(em.private_samplers.len(), 1);
+    assert!(em.private_samplers.values().all(|&r| r == 6), "{:?}", em.private_samplers);
+}
+
+#[test]
 fn cube_sample_with_lod_clamp_lowers_without_an_offset() {
     // The sample instruction with dim=3 (cube) and modi=1 (clamp).
     // v[4:6] coordinates, v7 clamp, v8 result.

@@ -66,6 +66,10 @@ impl<'a> Emitter<'a> {
                     let recovered = tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 })?;
                     (recovered.descriptors == r.static_samplers).then_some(recovered.sites)
                 })
+                // A root-sig program whose literal sampler states the root does
+                // not hold take the private registers the runtime appends
+                // (space 32765); the states the root holds are matched as usual.
+                .or_else(|| sampler_heap::missing_private_samplers(ex))
                 // Root-less programs that declare several samplers: the literal words cannot
                 // be matched to the title's registers here, so use the private slots that
                 // inline_sampler::sites derives from the ISA alone (space 32765). The runtime

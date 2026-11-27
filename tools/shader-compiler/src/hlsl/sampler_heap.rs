@@ -306,6 +306,68 @@ pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: boo
         .or_else(|| samplers.iter().find_map(state))
 }
 
+/// The register after every sampler register the root uses, static or in a table.
+/// Missing literal states take registers from here (the same rule the runtime
+/// applies when it appends them to the guest root).
+pub(super) fn private_sampler_base(root: &tuxbox_dxbc::rootsig::RootSig) -> Option<u32> {
+    let mut first = 0u32;
+    for s in &root.static_samplers {
+        first = first.max(s[10].checked_add(1)?);
+    }
+    for param in &root.params {
+        if let RootParamKind::Table(ranges) = &param.kind {
+            for r in ranges.iter().filter(|r| r.range_type == 3) {
+                first = first.max(r.base_register.checked_add(r.num)?);
+            }
+        }
+    }
+    Some(first)
+}
+
+/// Map each mimg site whose literal sampler state is missing from the guest
+/// root to the private register the runtime will append for it. The states are
+/// recovered from the ISA, exactly as the runtime's `unmatched` does: a state
+/// the root holds (with a visibility the stage sees) stays bound to that sampler.
+pub(super) fn missing_private_samplers(ex: &ShaderExtract) -> Option<std::collections::BTreeMap<usize, u32>> {
+    let root = ex.root_sig.as_ref()?;
+    // Pixel programs take a register assignment from the runtime's own recovery
+    // path, so keep the raster path refusing here.
+    if ex.stage != Stage::Compute {
+        return None;
+    }
+    if !ex.required_features.is_some_and(|flags| flags & (3 << 25) == 0 || ex.stage == Stage::Compute) {
+        return None;
+    }
+    // A root with private samplers was built by its own recovery path.
+    if root.static_samplers.is_empty()
+        || root.static_samplers.iter().any(|s| s[11] == 32765)
+    {
+        return None;
+    }
+    let visibility = if ex.stage == Stage::Pixel { 5 } else { 0 };
+    let sites = tuxbox_dxbc::inline_sampler::literal_sites(&ex.isa, visibility)?;
+    let visible = |s: &&[u32; 13]| s[12] == 0 || s[12] == visibility;
+    let first = private_sampler_base(root)?;
+    let missing: Vec<usize> = sites.descriptors.iter().enumerate()
+        .filter(|(_, desc)| !root.static_samplers.iter().filter(visible).any(|s| s[..10] == desc[..10]))
+        .map(|(i, _)| i)
+        .collect();
+    if missing.is_empty() || first.checked_add(missing.len() as u32).is_none() {
+        return None;
+    }
+    let mut register_of = std::collections::HashMap::new();
+    for (n, &i) in missing.iter().enumerate() {
+        register_of.insert(i, first + n as u32);
+    }
+    let mut sites_by_site = std::collections::BTreeMap::new();
+    for (site, &desc) in &sites.sites {
+        if let Some(reg) = register_of.get(&(desc as usize)) {
+            sites_by_site.insert(*site, *reg);
+        }
+    }
+    Some(sites_by_site)
+}
+
 /// An empty EXEC branch can skip inline sampler initialization only when the
 /// immediately following image instruction is also inactive. In a full
 /// compute wave ANDing EXEC with the preserved launch mask changes no bits.

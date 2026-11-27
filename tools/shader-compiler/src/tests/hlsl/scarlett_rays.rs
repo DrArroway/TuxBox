@@ -51,6 +51,8 @@ fn only_the_fingerprinted_programs_are_lowered() {
     assert_eq!(identify(&other_stage), None);
     let shadows = extract("CS_RaytraceShadows_Mixed_22f3acbc_Wrapped", vec![0; 7728], Vec::new());
     assert_eq!(identify(&shadows), None);
+    let laser = extract("CS_LaserLightShadowRaytracing_c3ab3042_Wrapped", vec![0; 3332], Vec::new());
+    assert_eq!(identify(&laser), None);
 }
 
 #[test]

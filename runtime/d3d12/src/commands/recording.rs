@@ -502,15 +502,14 @@ impl Recording {
             .bindings
             .scene_resource(list)
             .and_then(|scene| {
-                if let Some([instances, normals]) = &scene.geometry {
-                    raytracing::retain(self, &[&scene.scene.0, &instances.0, &normals.0])?;
-                } else {
-                    raytracing::retain(self, &[&scene.scene.0])?;
-                }
+                let mut held: Vec<&ID3D12Resource> = scene.scenes.iter().map(|s| &s.0).collect();
+                held.extend(scene.geometry.iter().flatten().map(|g| &g.0));
+                raytracing::retain(self, &held)?;
                 Ok(scene)
             })
             .and_then(|scene| {
-                let va = scene.scene.1;
+                let vas: Vec<u64> = scene.scenes.iter().map(|s| s.1).collect();
+                let va = vas[0];
                 let geometry = scene
                     .geometry
                     .as_ref()
@@ -529,7 +528,7 @@ impl Recording {
                 }
                 unsafe {
                     self.bindings
-                        .dispatch_scene(&self.active.native, root, va, geometry, dispatch)
+                        .dispatch_scene(&self.active.native, root, &vas, geometry, dispatch)
                 };
                 crate::diagnostics::log_once(&root.program.first_dispatch, || {
                     format!(

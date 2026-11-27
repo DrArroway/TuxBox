@@ -1,10 +1,14 @@
 //! Present one RGBA8 or RGB10A2 guest texture through a double-buffered DXGI swap chain.
 
 mod overlay;
+mod splash;
 mod window;
 use crate::performance::Monitor;
 use overlay::{Overlay, PerformancePanel};
 use window::OutputWindow;
+
+#[cfg(not(test))]
+pub(crate) use splash::install as install_splash;
 
 use std::mem::{ManuallyDrop, swap};
 use std::sync::Mutex;
@@ -55,11 +59,23 @@ impl Presentation {
         }
 
         let mut session = self.session.lock().map_err(|_| E_FAIL)?;
+        let created = session.is_none();
         let chain = match session.as_mut() {
             Some(chain) => chain,
+            // The package splash stays up until the title presents steadily.
+            // Frames until then complete without reaching the screen.
+            None if splash::hold() => {
+                crate::diagnostics::presented(desc.Width, desc.Height);
+                return Ok(S_OK);
+            }
             None => session.insert(SwapChain::new(queue, &device, &desc)?),
         };
-        let status = chain.present(queue, source, &desc)?;
+        let status = chain.present(queue, source, &desc);
+        if created {
+            // The title's window replaces the splash with its first frame.
+            splash::reveal();
+        }
+        let status = status?;
         if status == S_OK {
             crate::diagnostics::presented(desc.Width, desc.Height);
         }

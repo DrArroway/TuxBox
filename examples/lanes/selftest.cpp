@@ -853,6 +853,19 @@ void mesh_sampler_single(ID3D12Device* device) {
                        {mesh_sampler_mesh, sizeof(mesh_sampler_mesh)});
 }
 
+// Two pixel programs in mesh pipelines under a root with no static samplers,
+// as a title leaves out the samplers the console compiles into its programs.
+// The translation against such a root reads the literal state from a private
+// sampler, so the provider must add each program's samplers to the mesh root it
+// builds: the declared s0 for the program with one sampler, a private register
+// for the one that declares two. Without them the host rejects the pipeline,
+// which becomes a stand-in, and the target keeps its clear value.
+void mesh_sampler_rootless(ID3D12Device* device) {
+    auto root = two_table_root(device, nullptr);
+    for (const D3D12_SHADER_BYTECODE pixel : {D3D12_SHADER_BYTECODE{raster_sampler_pixel, sizeof(raster_sampler_pixel)},
+                                              D3D12_SHADER_BYTECODE{mesh_rootless_pixel, sizeof(mesh_rootless_pixel)}})
+        draw_linear_sample(device, root.Get(), pixel, {mesh_sampler_mesh, sizeof(mesh_sampler_mesh)});
+}
 
 // A console shader whose wave32 masked DPP exclusive prefix the translator must
 // lower to `WavePrefixSum`. The old translator rejects it with "unrecognized
@@ -2319,6 +2332,7 @@ constexpr Scenario scenarios[] = {
     {L"compute-root", compute_root},
     {L"mesh-samplers", mesh_samplers},
     {L"mesh-sampler-single", mesh_sampler_single},
+    {L"mesh-sampler-rootless", mesh_sampler_rootless},
     {L"compute-root-recovery", compute_root_recovery},
     {L"bindless-compute", bindless_compute},
     {L"bindless-sampler", bindless_sampler},
@@ -2375,7 +2389,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
-                                             L"mesh-samplers", L"mesh-sampler-single",
+                                             L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
                                              L"compute-root-recovery", L"bindless-compute",
                                              L"bindless-sampler"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));

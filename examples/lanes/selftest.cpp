@@ -1379,6 +1379,197 @@ void gpu_indirect_dispatch(ID3D12Device* device) {
     }
 }
 
+// Two adjacent allocations of title memory: ordinary read-write pages, then
+// pages that record CPU writes for GetWriteWatch.
+struct WatchedPair {
+    static constexpr size_t granule = 65536;
+    BYTE* base{};
+    WatchedPair() {
+        // The address of a released reservation can be taken by another thread
+        // before it is allocated again in two parts, so try more than once.
+        for (int attempt = 0; attempt < 16 && !base; ++attempt) {
+            auto* probe = static_cast<BYTE*>(VirtualAlloc(nullptr, 2 * granule, MEM_RESERVE, PAGE_NOACCESS));
+            if (!probe) break;
+            VirtualFree(probe, 0, MEM_RELEASE);
+            void* plain = VirtualAlloc(probe, granule, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            void* watched = plain ? VirtualAlloc(probe + granule, granule,
+                                                 MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE)
+                                  : nullptr;
+            if (plain && watched) base = probe;
+            else if (plain) VirtualFree(plain, 0, MEM_RELEASE);
+        }
+        if (!base) throw std::runtime_error("allocate adjacent plain and write-watch title memory");
+    }
+    ~WatchedPair() {
+        VirtualFree(base, 0, MEM_RELEASE);
+        VirtualFree(base + granule, 0, MEM_RELEASE);
+    }
+    WatchedPair(const WatchedPair&) = delete;
+    WatchedPair& operator=(const WatchedPair&) = delete;
+    BYTE* watched() const { return base + granule; }
+    // Pages of the write-watch half that record a write and lie at or past
+    // `offset` bytes into it.
+    ULONG_PTR written_from(size_t offset) const {
+        void* pages[16];
+        ULONG_PTR count = std::size(pages);
+        DWORD granularity = 0;
+        if (GetWriteWatch(0, watched(), granule, pages, &count, &granularity))
+            throw std::runtime_error("query the write watch");
+        return std::count_if(pages, pages + count, [&](void* written) {
+            return static_cast<BYTE*>(written) >= watched() + offset;
+        });
+    }
+};
+
+// The GPU writes a guest texture whose tiled layout has padding between its
+// texels, several times, while a compute queue waits for a label the last
+// write sets. The provider publishes each write to the title's pages. It must
+// put every texel where the console keeps it and change nothing else: not the
+// padding, which can hold other title data, and not a page the title has
+// closed. Whether a published write shows in the title's write watch depends
+// on the host (Proton's kernel-tracked watch records it), so only pages past
+// the texture must stay unrecorded.
+void texture_publication(ID3D12Device* device) {
+    constexpr UINT width = 100, height = 60, pitch = 512, batches = 4;
+    constexpr size_t page = 4096, texture_bytes = 8 * page, words = texture_bytes / 4;
+    constexpr size_t rows_bytes = size_t(pitch) * height;
+    // The texture spans both allocations, and the title closes its third page.
+    constexpr size_t start = WatchedPair::granule - 4 * page, closed = 2 * page;
+    WatchedPair memory;
+    Memory label(65536);
+    auto* guest = reinterpret_cast<UINT*>(memory.base + start);
+    // Every word names its own place, so a read of the texture shows where the
+    // console keeps each texel, and no word equals a texel written below.
+    auto initial = [](size_t word) { return 0x80000000u | static_cast<UINT>(word); };
+    for (size_t word = 0; word < words; ++word) guest[word] = initial(word);
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    ComPtr<ID3D12Resource> texture;
+    check(method<Place>(device, device_place)(device, reinterpret_cast<UINT64>(guest), &desc,
+                                              D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture)),
+          "place guest texture");
+    D3D12_TEXTURE_COPY_LOCATION image{}, linear{};
+    image.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    image.pResource = texture.Get();
+    linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    linear.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, pitch};
+
+    // Where each texel lives: read the texture as the title's bytes define it.
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, rows_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    linear.pResource = readback.Get();
+    method<frame_abi::Copy>(direct.list.Get(), slot_copy_texture)(
+        direct.list.Get(), &linear, 0, 0, 0, &image, nullptr, 0);
+    direct.submit();
+    direct.finish("reading the guest texture");
+    std::vector<size_t> home(size_t(width) * height);
+    std::vector<bool> texel(words, false);
+    {
+        D3D12_RANGE range{0, rows_bytes}, empty{};
+        void* mapped{};
+        check(readback->Map(0, &range, &mapped), "map texture readback");
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x) {
+                UINT value;
+                std::memcpy(&value, static_cast<const BYTE*>(mapped) + size_t(y) * pitch + size_t(x) * 4, 4);
+                const size_t word = value & 0x7fffffffu;
+                if (!(value & 0x80000000u) || word >= words || texel[word]) {
+                    readback->Unmap(0, &empty);
+                    throw std::runtime_error("the texture did not read each texel from its own guest word");
+                }
+                texel[word] = true;
+                home[size_t(y) * width + x] = word;
+            }
+        readback->Unmap(0, &empty);
+    }
+    if (std::count(texel.begin(), texel.end(), false) == 0)
+        throw std::runtime_error("the texture layout has no padding to protect");
+
+    // From here on the title makes no CPU write to the watched pages, and one
+    // page of the texture is closed to every access. The watched pages past the
+    // texture carry a sentinel that must survive.
+    constexpr size_t watched_texture = start + texture_bytes - WatchedPair::granule;
+    std::memset(memory.watched() + watched_texture, 0xa5, WatchedPair::granule - watched_texture);
+    if (ResetWriteWatch(memory.watched(), WatchedPair::granule))
+        throw std::runtime_error("reset the write watch");
+    DWORD old{};
+    if (!VirtualProtect(memory.base + start + closed, page, PAGE_NOACCESS, &old))
+        throw std::runtime_error("close a page of the texture");
+
+    auto written = [](UINT batch, UINT x, UINT y) { return 0x40000000u | batch << 16 | y << 8 | x; };
+    Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    compute.wait64(label.address(), batches);
+    compute.write64(label.address(8), 1);
+    compute.submit();
+    std::vector<ComPtr<ID3D12Resource>> uploads;
+    std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
+    std::vector<ComPtr<ID3D12GraphicsCommandList>> lists;
+    for (UINT batch = 1; batch <= batches; ++batch) {
+        std::vector<BYTE> rows(rows_bytes);
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x) {
+                const UINT value = written(batch, x, y);
+                std::memcpy(rows.data() + size_t(y) * pitch + size_t(x) * 4, &value, 4);
+            }
+        uploads.push_back(buffer(device, D3D12_HEAP_TYPE_UPLOAD, rows_bytes, D3D12_RESOURCE_STATE_GENERIC_READ));
+        compute_fixture::upload(uploads.back().Get(), rows.data(), rows_bytes);
+        allocators.emplace_back();
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators.back())),
+              "create batch allocator");
+        lists.push_back(open_list(device, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators.back().Get()));
+        auto* list = lists.back().Get();
+        linear.pResource = uploads.back().Get();
+        method<frame_abi::Copy>(list, slot_copy_texture)(list, &image, 0, 0, 0, &linear, nullptr, 0);
+        if (batch == batches) method<Write64>(list, slot_write64)(list, label.address(), batches, 0, 0);
+        check(list->Close(), "close batch list");
+        ID3D12CommandList* one[]{list};
+        direct.queue->ExecuteCommandLists(1, one);
+        direct.signal();
+    }
+    direct.finish("direct queue writing the guest texture");
+    compute.finish("compute queue waiting for the last texture write");
+    expect_value(label, 8, 1, "compute queue released by the last texture write");
+
+    const ULONG_PTR watched = memory.written_from(watched_texture);
+    if (!VirtualProtect(memory.base + start + closed, page, old, &old))
+        throw std::runtime_error("reopen the closed page");
+    char message[200];
+    for (UINT y = 0; y < height; ++y)
+        for (UINT x = 0; x < width; ++x) {
+            const size_t word = home[size_t(y) * width + x];
+            const bool shut = word * 4 >= closed && word * 4 < closed + page;
+            const UINT expected = shut ? initial(word) : written(batches, x, y);
+            if (guest[word] != expected) {
+                std::snprintf(message, sizeof(message),
+                              "texel (%u, %u) at guest word %zu%s: expected %#x, found %#x", x, y, word,
+                              shut ? " in the closed page" : "", expected, guest[word]);
+                throw std::runtime_error(message);
+            }
+        }
+    for (size_t word = 0; word < words; ++word)
+        if (!texel[word] && guest[word] != initial(word)) {
+            std::snprintf(message, sizeof(message), "padding at guest word %zu changed from %#x to %#x", word,
+                          initial(word), guest[word]);
+            throw std::runtime_error(message);
+        }
+    if (watched) {
+        std::snprintf(message, sizeof(message),
+                      "publishing the texture recorded writes to %llu write-watch pages past the texture",
+                      static_cast<unsigned long long>(watched));
+        throw std::runtime_error(message);
+    }
+    for (size_t at = watched_texture; at < WatchedPair::granule; ++at)
+        if (memory.watched()[at] != 0xa5) throw std::runtime_error("title memory past the texture changed");
+}
+
 // CopyMemoryToMemoryX reads a guest texture back into title memory, as linear
 // rows at the copyable footprint's pitch.
 void texture_readback(ID3D12Device* device) {
@@ -2307,6 +2498,7 @@ constexpr Scenario scenarios[] = {
     {L"gpu-indirect-dispatch", gpu_indirect_dispatch},
     {L"dispatch-wait", dispatch_wait},
     {L"texture-readback", texture_readback},
+    {L"texture-publication", texture_publication},
     {L"ray-tracing-builder", ray_tracing_builder},
     {L"thread-dimensions", thread_dimensions},
     {L"descriptor-reclaim", descriptor_reclaim},
@@ -2371,7 +2563,8 @@ std::string narrow(const wchar_t* text) {
 const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
                                              L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
                                              L"indirect-dispatch", L"gpu-indirect-dispatch",
-                                             L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
+                                             L"dispatch-wait", L"texture-readback", L"texture-publication",
+                                             L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",

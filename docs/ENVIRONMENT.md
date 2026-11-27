@@ -50,7 +50,8 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
-| `TUXBOX_CHECK_JOBS` | half the CPU threads, at most 8 | GPU checks of the translator and D3D12 controls run at once |
+| `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display |
+| `TUXBOX_CHECK_JOBS` | half the CPU threads, at most 8 | GPU checks run at once: the translator, the D3D12 controls and most Lanes and fixture gates |
 | `TUXBOX_OVERLAY` | off | `1` shows frame rate, frame times, processor, graphics card and memory use (`run --overlay`) |
 | `TUXBOX_OVERLAY_POS` | `tl` | `tl`, `tr`, `bl` or `br` |
 | `TUXBOX_FRAME_LOG` | off | File to write each frame's time to, as CSV; the game must be able to write it |

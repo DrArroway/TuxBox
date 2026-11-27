@@ -2,6 +2,7 @@
 from contextlib import contextmanager, nullcontext
 import ctypes
 import ctypes.util
+import copy
 import hashlib
 from datetime import datetime, timezone
 import json
@@ -17,6 +18,8 @@ import sys
 import subprocess
 import tempfile
 
+from .jobs import check_jobs
+from .prefix_pool import PrefixPool
 from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -719,6 +722,12 @@ def verify(host, output, adapter, selected=None, samples=1):
     BUILD.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="guest-check-", dir=BUILD) as tmp:
         work = Path(tmp)
+        # Gates that neither share a cache nor measure time or the screen run
+        # side by side, each worker in a copy of the prefix. Proton only: the
+        # other backends were not measured.
+        parallel = host.backend == "proton" and check_jobs() > 1
+        prefixes = PrefixPool(work, check_jobs())
+        waiting, side_by_side = [], [parallel]
 
         def stage(relative, folder):
             src = BUILD / relative
@@ -737,50 +746,73 @@ def verify(host, output, adapter, selected=None, samples=1):
             folder = work / str(len(cases))
             folder.mkdir()
             receipt = folder / "result.txt"
-            try:
-                exe = stage(binary, folder)
-                if providers:
-                    pe = image(exe)
-                    modules = pe["imports"]
+
+            def attempt(runner, timeout):
+                """Run the guest on `runner` and return what to print about it."""
+                nonlocal match
+                shown = []
+                try:
+                    exe = stage(binary, folder)
+                    if providers:
+                        pe = image(exe)
+                        modules = pe["imports"]
+                        if config:
+                            row["guest_import_modules"] = lanes_imports(pe)
+                        if callable(match):
+                            match = match(modules)
+                        if device_factory is not None:
+                            desktop = next((entry["symbols"] for entry in modules
+                                            if entry["module"].lower() == "d3d12.dll"), ())
+                            if device_factory == "xbox" and desktop:
+                                raise ValueError("Frame fixture imports desktop D3D12 directly")
+                            # The Windows SDK import library selects this function by ordinal.
+                            if device_factory == "desktop" and not {"D3D12CreateDevice", "#101"}.intersection(desktop):
+                                raise ValueError("Expected device creation from desktop d3d12.dll")
+                        for dll, symbols in providers.items():
+                            provider = stage(dll, folder)
+                            missing = missing_provider_imports(modules, provider, symbols)
+                            if missing:
+                                raise ValueError(f"Missing static guest imports from {provider.name}: {missing}")
+                    for dependency in dependencies:
+                        stage(dependency, folder)
                     if config:
-                        row["guest_import_modules"] = lanes_imports(pe)
-                    if callable(match):
-                        match = match(modules)
-                    if device_factory is not None:
-                        desktop = next((entry["symbols"] for entry in modules
-                                        if entry["module"].lower() == "d3d12.dll"), ())
-                        if device_factory == "xbox" and desktop:
-                            raise ValueError("Frame fixture imports desktop D3D12 directly")
-                        # The Windows SDK import library selects this function by ordinal.
-                        if device_factory == "desktop" and not {"D3D12CreateDevice", "#101"}.intersection(desktop):
-                            raise ValueError("Expected device creation from desktop d3d12.dll")
-                    for dll, symbols in providers.items():
-                        provider = stage(dll, folder)
-                        missing = missing_provider_imports(modules, provider, symbols)
-                        if missing:
-                            raise ValueError(f"Missing static guest imports from {provider.name}: {missing}")
-                for dependency in dependencies:
-                    stage(dependency, folder)
-                if config:
-                    stage(config, folder)
-                    exe = launch_target(folder, "Lanes")
-                else:
-                    exe = launch_target(exe, None)
-                proc = host.run(exe, [*arguments, receipt.name], timeout=15, capture=True)
-                text = receipt.read_text(encoding="utf-8").rstrip("\r\n") if receipt.is_file() else None
-                row.update(exit_code=proc.returncode, receipt=text)
-                row["passed"] = (proc.returncode == expected_code and
-                                 (text is None if match is None else text is not None and re.fullmatch(match, text) is not None))
-                if row["passed"] and log_check:
-                    problem = log_check(proc.stdout.decode(errors="replace"))
-                    if problem:
-                        row.update(passed=False, error=problem)
-                if not row["passed"]:
-                    print(proc.stdout[-2000:].decode(errors="replace"))
-            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                row["error"] = str(error)
-            print(f"{'PASS' if row['passed'] else 'FAIL'}  {name}", flush=True)
+                        stage(config, folder)
+                        exe = launch_target(folder, "Lanes")
+                    else:
+                        exe = launch_target(exe, None)
+                    proc = runner.run(exe, [*arguments, receipt.name], timeout=timeout, capture=True)
+                    text = receipt.read_text(encoding="utf-8").rstrip("\r\n") if receipt.is_file() else None
+                    row.update(exit_code=proc.returncode, receipt=text)
+                    row["passed"] = (proc.returncode == expected_code and
+                                     (text is None if match is None else text is not None and re.fullmatch(match, text) is not None))
+                    if row["passed"] and log_check:
+                        problem = log_check(proc.stdout.decode(errors="replace"))
+                        if problem:
+                            row.update(passed=False, error=problem)
+                    if not row["passed"]:
+                        shown.append(proc.stdout[-2000:].decode(errors="replace"))
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    row["error"] = str(error)
+                shown.append(f"{'PASS' if row['passed'] else 'FAIL'}  {name}")
+                return "\n".join(shown)
+
+            if side_by_side[0]:
+                # The settings are those in force now; the guest runs later.
+                snapshot = copy.copy(host)
+                snapshot.env = dict(host.env)
+                # Guests starting together take longer to come up.
+                waiting.append((snapshot, lambda runner: attempt(runner, 30)))
+            else:
+                print(attempt(host, 15), flush=True)
             return row
+
+        def run_together(enable=False):
+            """Run the gates waiting to run side by side; `enable` collects more."""
+            if waiting:
+                for shown in prefixes.run(waiting):
+                    print(shown, flush=True)
+                waiting.clear()
+            side_by_side[0] = enable and parallel
 
         def unsampled(name, reason):
             row = {"gate": name, "passed": False, "error": f"screen capture unavailable: {reason}"}
@@ -967,22 +999,25 @@ def verify(host, output, adapter, selected=None, samples=1):
             check("guest-command-errors", "d3d12-smoke/xbox-frame-negative.exe", [*gpu_args, "--report"],
                   rf"xbox-frame-negative PASS pci={pci} foreign-parents=2 copy-errors=2 recovered=1 rejected-batches=3 compute-present-rejected=1",
                   providers=frame_provider, device_factory="xbox")
+        run_together()
         if "present" in selected:
-            # The desktop's rootless XWayland can't be sampled; present into a private rootful
-            # Xwayland instead, and fail fast with the cause if that isn't possible either.
-            capture = screen_capture_problem()
-            server = private_x_server(work, adapter=adapter) if capture else nullcontext()
+            # Sample a private rootful Xwayland, where nothing on the desktop can cover
+            # the frames. `TUXBOX_CHECK_DISPLAY=desktop` uses the current display, which
+            # is also the fallback when no private server can be sampled.
+            desktop = os.environ.get("TUXBOX_CHECK_DISPLAY") == "desktop"
+            server = nullcontext() if desktop else private_x_server(work, adapter=adapter)
             saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG",
                                                       "TUXBOX_OVERLAY")}
             with server as private:
-                if private:
-                    capture = screen_capture_problem(display=private[0], xauthority=private[1])
-                    if capture is None:
-                        host.env.update(DISPLAY=private[0], XAUTHORITY=private[1], **private[2])
-                        present_display = "private rootful Xwayland"
-                        if private[2]:
-                            present_display += " without glamor"
-                        print(f"present: sampling a {present_display} on {private[0]}", flush=True)
+                if private and screen_capture_problem(display=private[0], xauthority=private[1]) is None:
+                    capture = None
+                    host.env.update(DISPLAY=private[0], XAUTHORITY=private[1], **private[2])
+                    present_display = "private rootful Xwayland"
+                    if private[2]:
+                        present_display += " without glamor"
+                    print(f"present: sampling a {present_display} on {private[0]}", flush=True)
+                else:
+                    capture = screen_capture_problem()
                 try:
                     present = check if capture is None else (lambda name, *_args, **_kwargs: unsampled(name, capture))
                     present("guest-present", "d3d12-smoke/xbox-frame.exe", [*gpu_args, "--present", "--report"],
@@ -1009,6 +1044,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                             host.env.pop(key, None)
                         else:
                             host.env[key] = value
+        run_together(enable=True)
         if "lanes" in selected:
             check("lanes-xbox-replay", "lanes/lanes.exe", ["--replay", *gpu_args, "--report"],
                   rf"lanes-replay PASS pci={pci} course=16/16 win=16/16 safe-miss=1 collision=1 frames=2 input=gameinput",
@@ -1033,6 +1069,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                 host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
             else:
                 host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = saved_limit
+        run_together()
         if "lanes-benchmark" in selected:
             # Console shaders are only translated on the Proton backend, so the
             # pipeline readings exist there alone.

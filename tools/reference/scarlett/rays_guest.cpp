@@ -17,6 +17,17 @@
 // - u52 (slot 6): each texel gets 0.5 when unoccluded and 0 when occluded.
 // Texel i with a 4x4 grid sits at x = -0.75 + 0.5 * (i / 16), y = -0.75 +
 // 0.5 * ((i / 4) % 4) and z = -0.75 + 0.5 * (i % 4).
+//
+// CS_LaserLightShadowRaytracing (mode "laser") is recorded without a root
+// signature; the guest declares two tables naming the program's registers
+// (t47; t371, t354, u48 in space 1). Lamp i = 32 * group + thread:
+// - table 1, slot 0: typed words; bit i % 32 of word i / 32 selects the lamp.
+// - table 0, slot 5: 512-byte lamp records. Words 0-2 hold the beam origin,
+//   the high half of word 3 its length (f16), words 5 and 6 its direction as
+//   f16 x, y, z (normalised by the program).
+// - table 1, slot 1: the scene.
+// - table 1, slot 2: 8-byte records; word 0 gets the distance to the nearest
+//   triangle plus 0.04, or FLT_MAX after a miss and for unselected lamps.
 #include "frame_abi.h"
 #include <cmath>
 #include <cstring>
@@ -103,7 +114,9 @@ struct Fixture {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
 
-    explicit Fixture(const wchar_t* shader) {
+    // The title root signature embedded in the program, or two descriptor
+    // tables for a program recorded without one.
+    explicit Fixture(const wchar_t* shader, bool tables = false) {
         HMODULE module = LoadLibraryExW(L"d3d12_xs.dll", nullptr,
                                         LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         using Factory = HRESULT(WINAPI*)(IUnknown*, const void*, REFIID, void**);
@@ -114,7 +127,26 @@ struct Fixture {
         D3D12_COMMAND_QUEUE_DESC q{};
         check(dev->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)), "Xbox queue");
         const auto bytes = read_file(shader);
-        check(dev->CreateRootSignature(0, bytes.data(), bytes.size(), IID_PPV_ARGS(&root)), "title root");
+        if (tables) {
+            // The registers the program declares, at the slots it reads.
+            D3D12_DESCRIPTOR_RANGE first[]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 47, 0, 5}};
+            D3D12_DESCRIPTOR_RANGE second[]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 371, 1, 0},
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 354, 1, 1},
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 48, 1, 2}};
+            D3D12_ROOT_PARAMETER params[2]{};
+            params[0].ParameterType = params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            params[0].DescriptorTable = {1, first};
+            params[1].DescriptorTable = {3, second};
+            D3D12_ROOT_SIGNATURE_DESC desc{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+            ComPtr<ID3DBlob> serialized;
+            check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+                  "serialize tables");
+            check(dev->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                           IID_PPV_ARGS(&root)),
+                  "table root");
+        } else {
+            check(dev->CreateRootSignature(0, bytes.data(), bytes.size(), IID_PPV_ARGS(&root)), "title root");
+        }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
         pso.pRootSignature = root.Get();
         pso.CS = {bytes.data(), bytes.size()};
@@ -355,14 +387,186 @@ static bool run(Fixture& f, const Scenario& s, bool with_far, FILE* receipt, con
     return bad == 0;
 }
 
+// A lamp beam: origin, direction (not normalised), length; selected or not.
+struct Beam {
+    float p[3], d[3], length;
+    bool selected;
+};
+
+struct LaserScenario {
+    const char* name;
+    std::vector<Quad> quads;
+    std::vector<Beam> beams;
+};
+
+static UINT half(float x) {
+    // Exact for the values used here: small integers and halves.
+    if (x == 0.f) return 0;
+    UINT u = bits(x), sign = (u >> 16) & 0x8000u;
+    int e = int((u >> 23) & 0xff) - 127 + 15;
+    return sign | UINT(e) << 10 | ((u >> 13) & 0x3ffu);
+}
+
+// The nearest quad along the beam with 0 <= t < length; quads face z.
+static float nearest(const std::vector<Quad>& quads, const Beam& b) {
+    const float n = std::sqrt(b.d[0] * b.d[0] + b.d[1] * b.d[1] + b.d[2] * b.d[2]);
+    float best = INFINITY;
+    for (const auto& q : quads) {
+        if (b.d[2] == 0.f) continue;
+        const float t = (q.z - b.p[2]) / (b.d[2] / n);
+        const float x = b.p[0] + t * b.d[0] / n, y = b.p[1] + t * b.d[1] / n;
+        if (t >= 0 && t < b.length && x > q.x0 && x < q.x1 && y > q.y0 && y < q.y1) best = std::fmin(best, t);
+    }
+    return best;
+}
+
+static bool run_laser(Fixture& f, const LaserScenario& s, FILE* receipt) {
+    auto dev = f.dev.Get();
+    const auto scene = f.scene(s.quads);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "view descriptors");
+    const auto step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    using Gpu = UINT64(WINAPI*)(ID3D12DescriptorHeap*);
+    auto cpu = [&](UINT i) {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get()) + i * step};
+    };
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{method<Gpu>(heap.Get(), 10)(heap.Get()) + i * step}; };
+    const UINT count = UINT(s.beams.size());
+    std::vector<UINT> records(128 * lanes), mask(1);
+    for (UINT i = 0; i < count; ++i) {
+        const auto& b = s.beams[i];
+        UINT* r = &records[128 * i];
+        for (UINT c = 0; c < 3; ++c) r[c] = bits(b.p[c]);
+        r[3] = half(b.length) << 16;
+        r[5] = half(b.d[0]) | half(b.d[1]) << 16;
+        r[6] = half(b.d[2]);
+        mask[0] |= UINT(b.selected) << i;
+    }
+    auto record_buffer = upload(dev, records.data(), records.size() * 4);
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.Buffer.StructureByteStride = 512;
+    view.Buffer.NumElements = lanes;
+    dev->CreateShaderResourceView(record_buffer.Get(), &view, cpu(5));
+    auto mask_buffer = upload(dev, mask.data(), mask.size() * 4);
+    view.Buffer.StructureByteStride = 0;
+    view.Format = DXGI_FORMAT_R32_UINT;
+    view.Buffer.NumElements = 1;
+    dev->CreateShaderResourceView(mask_buffer.Get(), &view, cpu(64));
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    view.Buffer.NumElements = 32;
+    dev->CreateShaderResourceView(scene.top.Get(), &view, cpu(65));
+    std::vector<UINT> seed(2 * lanes, 7);
+    auto out = buffer(dev, seed.size() * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, true);
+    auto read = buffer(dev, seed.size() * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto seed_buffer = upload(dev, seed.data(), seed.size() * 4);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.StructureByteStride = 8;
+    uav.Buffer.NumElements = lanes;
+    dev->CreateUnorderedAccessView(out.Get(), nullptr, &uav, cpu(66));
+
+    ComPtr<ID3D12CommandAllocator> alloc;
+    check(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "allocator");
+    auto list = guest_list(dev, alloc.Get());
+    list->CopyBufferRegion(out.Get(), 0, seed_buffer.Get(), 0, seed.size() * 4);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {out.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    list->ResourceBarrier(1, &barrier);
+    list->SetPipelineState(f.pipeline.Get());
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    using Heaps = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
+    using Root = void(WINAPI*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+    using Table = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+    method<Heaps>(list.Get(), 32)(list.Get(), 1, heaps);
+    method<Root>(list.Get(), 33)(list.Get(), f.root.Get());
+    method<Table>(list.Get(), 35)(list.Get(), 0, gpu(0));
+    method<Table>(list.Get(), 35)(list.Get(), 1, gpu(64));
+    list->Dispatch(1, 1, 1);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(read.Get(), 0, out.Get(), 0, seed.size() * 4);
+    submit(dev, f.queue.Get(), list.Get());
+    D3D12_RANGE range{0, seed.size() * 4}, none{};
+    void* data{};
+    check(read->Map(0, &range, &data), "map result");
+    const UINT* got = static_cast<const UINT*>(data);
+    UINT expected_mask = 0, observed_mask = 0, bad = 0;
+    float worst = 0;
+    for (UINT i = 0; i < lanes; ++i) {
+        const float t = i < count && s.beams[i].selected ? nearest(s.quads, s.beams[i]) : INFINITY;
+        const bool hit = t != INFINITY;
+        float observed;
+        std::memcpy(&observed, &got[2 * i], 4);
+        expected_mask |= UINT(hit) << i;
+        observed_mask |= UINT(got[2 * i] != 0x7f7fffffu) << i;
+        if (hit) {
+            const float error = std::fabs(observed - (t + 0.04f));
+            worst = std::fmax(worst, error);
+            bad += !(error <= 1e-4f * std::fmax(1.f, t));
+        } else {
+            bad += got[2 * i] != 0x7f7fffffu;
+        }
+        bad += got[2 * i + 1] != 7;
+    }
+    std::fprintf(receipt, "laser_%s=expected %08x observed %08x mismatches %u worst %g\n", s.name, expected_mask,
+                 observed_mask, bad, worst);
+    if (bad) std::fprintf(receipt, "laser_%s_lane0=%08x %08x\n", s.name, got[0], got[1]);
+    read->Unmap(0, &none);
+    std::fflush(receipt);
+    return bad == 0;
+}
+
+// Beams from a 4x8 grid at z = 0 along d, every lamp selected unless masked.
+static std::vector<Beam> beams(float dx, float dy, float dz, float length, UINT unselected = 0) {
+    std::vector<Beam> out;
+    for (UINT i = 0; i < lanes; ++i)
+        out.push_back({{-1.75f + 0.5f * float(i % 8), -0.75f + 0.5f * float(i / 8), 0.f},
+                       {dx, dy, dz},
+                       length,
+                       !(unselected >> i & 1)});
+    return out;
+}
+
+static int laser(const wchar_t* shader, FILE* receipt) {
+    Fixture f(shader, true);
+    const Quad wall{5.f, -100, 100, -100, 100}, near_wall{3.f, -100, 100, -100, 100};
+    const Quad behind{-5.f, -100, 100, -100, 100}, left{4.f, -100, 0, -100, 100};
+    const std::vector<LaserScenario> scenarios{
+        {"wall", {wall}, beams(0, 0, 1, 10)},
+        {"nearest_of_two", {wall, near_wall}, beams(0, 0, 1, 10)},
+        {"nearest_of_two_reversed", {near_wall, wall}, beams(0, 0, 1, 10)},
+        {"beyond_length", {wall}, beams(0, 0, 1, 4)},
+        {"behind", {behind}, beams(0, 0, 1, 10)},
+        {"empty", {}, beams(0, 0, 1, 10)},
+        {"half", {left, wall}, beams(0, 0, 1, 10)},
+        {"unnormalised", {wall}, beams(0, 0, 2, 10)},
+        {"oblique", {wall}, beams(0.5f, 0, 1, 10)},
+        {"unselected", {wall}, beams(0, 0, 1, 10, 0xf0f0000fu)},
+    };
+    int failed = 0;
+    for (const auto& s : scenarios) failed += !run_laser(f, s, receipt);
+    return failed;
+}
+
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 4 || (wcscmp(argv[2], L"near") && wcscmp(argv[2], L"far"))) return 2;
+    if (argc != 4 || (wcscmp(argv[2], L"near") && wcscmp(argv[2], L"far") && wcscmp(argv[2], L"laser"))) return 2;
     FILE* receipt{};
     if (_wfopen_s(&receipt, argv[3], L"wb")) return 2;
     const bool with_far = !wcscmp(argv[2], L"far");
     const char* label = with_far ? "shadow_far" : "shadow";
     int failed = 0;
     try {
+        if (!wcscmp(argv[2], L"laser")) {
+            failed = laser(argv[1], receipt);
+            std::fprintf(receipt, "failed=%d\n", failed);
+            std::fclose(receipt);
+            return failed ? 1 : 0;
+        }
         Fixture f(argv[1]);
         LUID luid = f.dev->GetAdapterLuid();
         ComPtr<IDXGIFactory4> factory;

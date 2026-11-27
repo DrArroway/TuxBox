@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay ProjectScarlett's irradiance-cache shadow programs with native ray queries.
+"""Replay ProjectScarlett's shadow ray programs with native ray queries.
 
 The programs come from the recorded shader requests of a ProjectScarlett run
 (see tools/triage_scarlett_shaders.py). The provider translates each one,
@@ -24,10 +24,12 @@ from project_tuxbox.runtime_shaders import runtime_shader_compiler
 
 SOURCE = ROOT / "tools/reference/scarlett"
 # (request hash prefix, walk). CS_RaytraceShadows_Mixed (641ecfc4956cc4c0) is
-# recorded without a root signature, so it cannot be replayed on its own.
+# recorded without a root signature and reads many resources, so it is not
+# replayed here; CS_LaserLightShadowRaytracing reads few and gets two tables.
 PROGRAMS = {
     "CS_IrradianceCache_ShadowTrace": ("03092f6759cdcd61", "near"),
     "CS_IrradianceCache_ShadowTrace_WithFar": ("2ac21a538145ecc0", "far"),
+    "CS_LaserLightShadowRaytracing": ("6247ee64c925b874", "laser"),
 }
 
 

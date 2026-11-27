@@ -366,6 +366,13 @@ struct Emitter<'a> {
     chosen_samplers: BTreeSet<usize>,
     /// Instruction ranges of a mesh program's loops.
     loop_ranges: Vec<(usize, usize)>,
+    /// Back-edge instruction indices proven safe for a shared exchange
+    /// (single-wave group, uniform back-edge, no other branch in body).
+    /// Back-edge indices of loops whose single-wave group runs an exchange the
+    /// same number of times: only these vote in the emitted while loop.
+    accepted_swizzle_loops: BTreeSet<usize>,
+    /// Nesting stack of whether each open loop is an accepted swizzle loop.
+    in_accepted_swizzle_loop_stack: Vec<bool>,
     fspx_wave: Option<u32>,
     hair_multisample: bool,
     hoist_wave_exchanges: bool,

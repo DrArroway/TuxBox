@@ -119,8 +119,12 @@ BINDLESS_INDEX = 80
 BINDLESS_EXPECTED = 0x7AB1E002
 
 
-def bindless_compute_shader():
-    """Direct-indexed raw UAV store at a guest index outside the paged limit."""
+def bindless_compute_shader(table=False):
+    """Direct-indexed raw UAV store at a guest index outside the paged limit.
+
+    With `table` the root also has a descriptor table of four UAVs, which the
+    program does not read: it still picks its UAV by heap index.
+    """
     code = [0xbe8403ff, BINDLESS_INDEX, 0x8f048504,
             0xf4080205, 0x08000000, 0xbf8cc07f,
             0x7e0002ff, BINDLESS_EXPECTED, 0xe0700000, 0x80020000, 0xbf810000]
@@ -128,6 +132,9 @@ def bindless_compute_shader():
     info[24] = 5
     struct.pack_into("<3I", info, 36, 64, 1, 1)
     root = pack([2, 0, 24, 0, 24, 0x400])
+    if table:
+        # One table parameter at 24, its header at 36 and one 1.1 range at 44.
+        root = pack([2, 1, 24, 0, 68, 0x400, 0, 0, 36, 1, 44, 1, 4, 0, 0, 0, 0])
     return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 10)]), [
         (b"SFI0", struct.pack("<Q", 1 << 25)),
         (b"PSV0", pack([48]) + info + pack([0])),
@@ -190,6 +197,7 @@ def header():
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
             + declaration("bindless_compute_shader", bindless_compute_shader())
+            + declaration("bindless_table_compute_shader", bindless_compute_shader(table=True))
             + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"
             + declaration("bindless_sampler_shader", bindless_sampler_shader())
             + f"constexpr unsigned bindless_texture = {BINDLESS_TEXTURE}, bindless_output = {BINDLESS_OUTPUT};\n"

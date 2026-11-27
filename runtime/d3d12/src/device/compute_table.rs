@@ -224,6 +224,13 @@ fn reflected_root(
             if !simple && !extended {
                 return Ok(TableLayout::Unsupported);
             }
+            // The program can still pick resources by heap index. Without the
+            // map the root stays the guest's and its dispatch is skipped once
+            // descriptors are paged.
+            if heap_indexed_tabled_root(&signature) {
+                scalar_index = Some((0, 0));
+                index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
             if signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
                 recovered_samplers = tuxbox_dxbc::inline_sampler::private(shader, 5).unwrap_or_default();
             } else {
@@ -542,6 +549,18 @@ fn bindless_compute_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
         _ => None,
     });
     signature.flags & 0x400 != 0 && cost.is_some_and(|cost| cost <= 62)
+}
+
+/// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with descriptor tables as well. Like a
+/// bindless root it takes the index map, if its root SRV still fits: a table
+/// costs one DWORD of 64, a root descriptor two.
+fn heap_indexed_tabled_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
+    let cost = signature.params.iter().fold(0u32, |cost, p| cost.saturating_add(match p.kind {
+        RootParamKind::Table(_) => 1,
+        RootParamKind::Constants { num32, .. } => num32,
+        RootParamKind::Descriptor { .. } => 2,
+    }));
+    signature.flags & 0x400 != 0 && cost <= 62
 }
 
 /// Keep every embedded range and append FSSM slots the root left out.

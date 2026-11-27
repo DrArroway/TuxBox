@@ -2344,11 +2344,17 @@ void descriptor_reclaim(ID3D12Device* device) {
 
 // A zero-parameter direct-indexed compute root, with the requested UAV at
 // logical slot 80. The paged trial caps native residency at 64 descriptors.
-// Check the entire buffer, including decoys and guard words.
-void bindless_compute(ID3D12Device* device) {
+// Check the entire buffer, including decoys and guard words. With `table`, the
+// root also has a bound table of four UAVs the program does not read.
+void bindless_compute_with(ID3D12Device* device, bool table) {
+    D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+    D3D12_ROOT_PARAMETER1 parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable = {1, &range};
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
     signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    signature.Desc_1_1 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
+    signature.Desc_1_1 = {table ? 1u : 0u, table ? &parameter : nullptr, 0, nullptr,
+                          D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
     ComPtr<ID3DBlob> serialized;
     check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize bindless compute root");
     ComPtr<ID3D12RootSignature> root;
@@ -2356,7 +2362,8 @@ void bindless_compute(ID3D12Device* device) {
                                       IID_PPV_ARGS(&root)), "create bindless compute root");
     D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
     shader.pRootSignature = root.Get();
-    shader.CS = {bindless_compute_shader, sizeof(bindless_compute_shader)};
+    shader.CS = table ? D3D12_SHADER_BYTECODE{bindless_table_compute_shader, sizeof(bindless_table_compute_shader)}
+                      : D3D12_SHADER_BYTECODE{bindless_compute_shader, sizeof(bindless_compute_shader)};
     ComPtr<ID3D12PipelineState> pipeline;
     check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
           IID_PPV_ARGS(&pipeline)), "create translated bindless compute pipeline");
@@ -2394,6 +2401,7 @@ void bindless_compute(ID3D12Device* device) {
     method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
     method<SetRoot>(list, slot_compute_root)(list, root.Get());
     list->SetPipelineState(pipeline.Get());
+    if (table) method<SetTable>(list, slot_compute_table)(list, 0, {method<GpuHandle>(heap.Get(), 10)(heap.Get())});
     list->Dispatch(1, 1, 1);
     compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2409,6 +2417,9 @@ void bindless_compute(ID3D12Device* device) {
     words[0] = bindless_expected;
     if (got != words) throw std::runtime_error("bindless compute output or guard words differ");
 }
+
+void bindless_compute(ID3D12Device* device) { bindless_compute_with(device, false); }
+void bindless_table_compute(ID3D12Device* device) { bindless_compute_with(device, true); }
 
 // A direct-indexed compute program samples the heap texture with a linear clamp
 // sampler it builds from literal words, which the zero-parameter root does not
@@ -2528,6 +2539,7 @@ constexpr Scenario scenarios[] = {
     {L"compute-root-recovery", compute_root_recovery},
     {L"bindless-compute", bindless_compute},
     {L"bindless-sampler", bindless_sampler},
+    {L"bindless-table-compute", bindless_table_compute},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -2584,7 +2596,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
                                              L"compute-root-recovery", L"bindless-compute",
-                                             L"bindless-sampler"};
+                                             L"bindless-sampler", L"bindless-table-compute"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

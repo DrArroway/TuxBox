@@ -1392,6 +1392,132 @@ void gpu_indirect_dispatch(ID3D12Device* device) {
     }
 }
 
+// A compute program writes dispatch arguments, and in half the cases a command
+// count, that an ExecuteIndirect later in the same list reads. Nothing waits on
+// the CPU between the write and the read, and every round writes different
+// values into the same two buffers, so an early or stale read shows in that
+// round's output. The cases differ in what the list records between the write
+// and the read. Each case has its own queue, so no case borrows another's
+// barriers. The combined state and the lone UAV barrier are what a console
+// title may record; the provider has to order the read itself.
+void gpu_indirect_order(ID3D12Device* device) {
+    constexpr UINT rounds = 48, words = 24, sentinel = 0xdeadbeef;
+    constexpr UINT arg_bytes = sizeof(D3D12_DISPATCH_ARGUMENTS), output_bytes = rounds * words * sizeof(UINT);
+    constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // Zero means the buffers stay in the unordered access state and only a UAV
+    // barrier separates the write from the read.
+    struct Case {
+        const char* name;
+        D3D12_RESOURCE_STATES read;
+        bool counted;
+    };
+    const auto unchanged = static_cast<D3D12_RESOURCE_STATES>(0);
+    const auto combined = static_cast<D3D12_RESOURCE_STATES>(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
+                                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const Case cases[]{
+        {"transition", D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, false},
+        {"combined-state", combined, false},
+        {"uav-barrier", unchanged, false},
+        {"transition+count", D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, true},
+        {"combined-state+count", combined, true},
+        {"uav-barrier+count", unchanged, true},
+    };
+    ComPtr<ID3D12RootSignature> root;
+    auto pipeline = compute_pipeline(device, root, {gpu_indirect_dxil, sizeof(gpu_indirect_dxil)});
+    auto command = dispatch_signature(device);
+    // What the buffers hold before the batch under test: three groups, which
+    // write every word of a round, and a count of one.
+    std::vector<UINT> initial(6 + rounds * words, sentinel);
+    initial[0] = 3;
+    initial[1] = initial[2] = initial[3] = initial[4] = initial[5] = 1;
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, initial.size() * sizeof(UINT), D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(seed.Get(), initial.data(), initial.size() * sizeof(UINT));
+    auto uav_barrier = [](ID3D12GraphicsCommandList* list) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        list->ResourceBarrier(1, &barrier);
+    };
+    std::string failed;
+    for (const auto& test : cases) {
+        auto gpu = [&](UINT64 bytes) {
+            return buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        };
+        auto args = gpu(arg_bytes), count = gpu(arg_bytes), output = gpu(output_bytes);
+        auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, output_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+        Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+        auto* list = compute.list.Get();
+        list->CopyBufferRegion(args.Get(), 0, seed.Get(), 0, arg_bytes);
+        list->CopyBufferRegion(count.Get(), 0, seed.Get(), arg_bytes, arg_bytes);
+        list->CopyBufferRegion(output.Get(), 0, seed.Get(), 2 * arg_bytes, output_bytes);
+        for (auto* resource : {args.Get(), count.Get(), output.Get()})
+            compute_fixture::transition(list, resource, D3D12_RESOURCE_STATE_COPY_DEST, uav);
+        compute.submit();
+        compute.finish("seed indirect arguments");
+
+        // One list, one submission, no CPU wait until the readback.
+        compute.reopen();
+        method<SetRoot>(list, slot_compute_root)(list, root.Get());
+        list->SetPipelineState(pipeline.Get());
+        auto groups = [](UINT round) { return round % 3; };
+        auto commands = [&](UINT round) { return !test.counted || round % 4 != 3 ? 1u : 0u; };
+        auto produce = [&](ID3D12Resource* target, UINT value) {
+            const UINT constants[]{1, value};
+            method<SetConstants>(list, slot_root_constants)(list, 0, 2, constants, 0);
+            method<SetUav>(list, slot_root_uav)(list, 1, target->GetGPUVirtualAddress());
+            list->Dispatch(1, 1, 1);
+        };
+        auto move = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+            compute_fixture::transition(list, args.Get(), before, after);
+            if (test.counted) compute_fixture::transition(list, count.Get(), before, after);
+        };
+        for (UINT round = 0; round < rounds; ++round) {
+            produce(args.Get(), groups(round));
+            if (test.counted) produce(count.Get(), commands(round));
+            if (test.read != unchanged) move(uav, test.read); else uav_barrier(list);
+            const UINT consumer = 0;
+            method<SetConstants>(list, slot_root_constants)(list, 0, 1, &consumer, 0);
+            method<SetUav>(list, slot_root_uav)(list, 1, output->GetGPUVirtualAddress() + round * words * sizeof(UINT));
+            method<ExecuteIndirect_>(list, slot_execute_indirect)(list, command.Get(), 1, args.Get(), 0,
+                                                                  test.counted ? count.Get() : nullptr, 0);
+            if (test.read != unchanged) move(test.read, uav); else uav_barrier(list);
+        }
+        compute_fixture::transition(list, output.Get(), uav, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, output_bytes);
+        compute.submit();
+        compute.finish("GPU-ordered indirect dispatches");
+
+        std::vector<UINT> actual(rounds * words);
+        D3D12_RANGE range{0, output_bytes}, empty{};
+        void* mapped{};
+        check(readback->Map(0, &range, &mapped), "map ordered indirect output");
+        std::memcpy(actual.data(), mapped, output_bytes);
+        readback->Unmap(0, &empty);
+        // Words a round wrote: a prefix of 1, 2, 3... or, failing that, words.
+        auto written = [&](UINT round) {
+            const UINT* row = &actual[round * words];
+            UINT n = 0;
+            while (n < words && row[n] == n + 1) ++n;
+            for (UINT i = n; i < words; ++i)
+                if (row[i] != sentinel) return words + 1;
+            return n;
+        };
+        auto expected = [&](UINT round) { return commands(round) * groups(round) * 8; };
+        UINT wrong = 0, first = rounds, as_seeded = 0, as_previous = 0;
+        for (UINT round = 0; round < rounds; ++round) {
+            const UINT found = written(round);
+            if (found == expected(round)) continue;
+            if (!wrong++) first = round;
+            as_seeded += found == words;
+            as_previous += round && found == expected(round - 1);
+        }
+        std::fprintf(stderr, "gpu-indirect-order case=%s rounds=%u wrong=%u first=%d as-seeded=%u as-previous-round=%u\n",
+                     test.name, rounds, wrong, wrong ? static_cast<int>(first) : -1, as_seeded, as_previous);
+        if (wrong) failed += std::string(failed.empty() ? "" : ", ") + test.name;
+    }
+    if (!failed.empty()) throw std::runtime_error("indirect arguments read out of order in: " + failed);
+}
+
 // Two adjacent allocations of title memory: ordinary read-write pages, then
 // pages that record CPU writes for GetWriteWatch.
 struct WatchedPair {
@@ -2509,6 +2635,7 @@ constexpr Scenario scenarios[] = {
     {L"shared-texture", shared_texture},
     {L"indirect-dispatch", indirect_dispatch},
     {L"gpu-indirect-dispatch", gpu_indirect_dispatch},
+    {L"gpu-indirect-order", gpu_indirect_order},
     {L"dispatch-wait", dispatch_wait},
     {L"texture-readback", texture_readback},
     {L"texture-publication", texture_publication},
@@ -2576,7 +2703,7 @@ std::string narrow(const wchar_t* text) {
 
 const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
                                              L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
-                                             L"indirect-dispatch", L"gpu-indirect-dispatch",
+                                             L"indirect-dispatch", L"gpu-indirect-dispatch", L"gpu-indirect-order",
                                              L"dispatch-wait", L"texture-readback", L"texture-publication",
                                              L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",

@@ -73,6 +73,16 @@ fn missing_literal_samplers(shader: &[u8], stage: u32, existing: &[[u32; 13]]) -
     if private.iter().all(covered) { Vec::new() } else { private }
 }
 
+/// The literal samplers of a pixel program under a root with no static samplers,
+/// which `inline_sampler::unmatched` leaves alone. One declared sampler keeps its
+/// register; otherwise each state takes a private register (space 32765) from 0,
+/// where the translation against a root with only those samplers reads them.
+pub(super) fn rootless_pixel_samplers(pixel: &[u8]) -> Option<Vec<[u32; 13]>> {
+    tuxbox_dxbc::inline_sampler::pixel(pixel)
+        .map(|s| vec![s])
+        .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
+}
+
 /// Private static samplers for each literal state no static sampler of the root
 /// visible to the stage has (`inline_sampler::unmatched`). They take registers
 /// after every sampler register the root uses: the translator names a sampler by
@@ -293,10 +303,7 @@ fn reflected_root(
                 return Ok(TableLayout::Unsupported);
             };
             if signature.static_samplers.is_empty() && ordinary {
-                recovered_samplers = tuxbox_dxbc::inline_sampler::pixel(pixel)
-                    .map(|s| vec![s])
-                    .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
-                    .unwrap_or_default();
+                recovered_samplers = rootless_pixel_samplers(pixel).unwrap_or_default();
             }
             else if !signature.static_samplers.is_empty() {
                 recovered_samplers = literal_samplers(pixel, 0, &signature);

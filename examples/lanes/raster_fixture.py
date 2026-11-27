@@ -21,6 +21,11 @@ literal state. Its mesh program is a records-only console container: its FSSM
 records name root constant `b501` where the root declares `b500`, so the
 provider rewrites the root for the mesh stage, and its translation is a desktop
 mesh shader (`mesh_samplers.hlsl`) prepared under its digest.
+
+`mesh-sampler-rootless` draws through that mesh program under a root with no
+static samplers, first with the `raster-samplers` pixel program and then with the
+two-sampler one carrying an empty feature part (`SFI0`), which shows that it
+reads no sampler from the heap.
 """
 from pathlib import Path
 import struct
@@ -182,6 +187,16 @@ def mesh_sampler_pixel():
     ])
 
 
+def rootless_sampler_pixel():
+    """The two-sampler pixel program with a feature part that names no heap indexing."""
+    return container(0x60, image(5, SAMPLER_PIXEL_CODE, SAMPLER_PIXEL_USER, MESH_SAMPLER_PIXEL_USED, inputs=2), [
+        (b"SFI0", bytes(8)),
+        (b"ISGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"OSGN", signature([("SV_Target", 0, 64, 3, 0, 1, 0)])),
+        (b"PSV0", validation(0, MESH_SAMPLER_PIXEL_RESOURCES)),
+    ])
+
+
 def mesh():
     """The records-only console mesh program (shader model 6.5, stage 13)."""
     return container(0xD0065, image(2, MESH_CODE, MESH_USER, MESH_USED), [
@@ -201,7 +216,8 @@ def header(vertex_data, pixel_data, sampler_data=None):
             + array("raster_sampler_pixel", sampler_data)
             + f"constexpr float raster_sampler_texels[] = {{{texels}}};\n"
             + f"constexpr float raster_sampler_linear = {SAMPLER_LINEAR!r}f, raster_sampler_point = {SAMPLER_POINT!r}f;\n"
-            + array("mesh_sampler_mesh", mesh()) + array("mesh_sampler_pixel", mesh_sampler_pixel()))
+            + array("mesh_sampler_mesh", mesh()) + array("mesh_sampler_pixel", mesh_sampler_pixel())
+            + array("mesh_rootless_pixel", rootless_sampler_pixel()))
 
 
 if __name__ == "__main__":

@@ -614,16 +614,21 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     the root has in another state, in a mesh pipeline. Only its records-only
     mesh program's desktop translation (`mesh_samplers.hlsl`) is prepared; the
     provider must add the literal state to the mesh root it builds and have the
-    worker translate the pixel program against that root.
+    worker translate the pixel program against that root. `mesh-sampler-single`:
+    the one-sampler pixel program in that mesh pipeline. `mesh-sampler-rootless`:
+    two pixel programs in mesh pipelines under a root with no static samplers,
+    whose literal samplers the provider must add to the mesh root whole.
     """
-    from examples.lanes.raster_fixture import mesh, mesh_sampler_pixel, pixel, sampler_pixel, vertex
+    from examples.lanes.raster_fixture import (mesh, mesh_sampler_pixel, pixel, rootless_sampler_pixel, sampler_pixel,
+                                               vertex)
     from examples.lanes.spill_fixture import pixel as spill_pixel
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE, compiler_tools, run_tool
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
     rootless = {hashlib.sha256(data).hexdigest()
-                for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel(), spill_pixel())}
+                for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel(), rootless_sampler_pixel(),
+                             spill_pixel())}
     mesh_key = hashlib.sha256(mesh()).hexdigest()
     messages = []
 
@@ -676,7 +681,8 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
         host.env.pop(name, None)
     try:
         for scenario, slots in (("raster-tables", 3), ("lane-spill-interp", None), ("raster-samplers", RASTER_SAMPLER_SLOTS),
-                                ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS)):
+                                ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS),
+                                ("mesh-sampler-rootless", MESH_SAMPLER_SLOTS)):
             forget(rootless | {mesh_key})
             if scenario.startswith("mesh-"):
                 prepare_mesh()
@@ -1162,6 +1168,7 @@ GATE_LABELS = {
     "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
     "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",
     "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
+    "lanes-mesh-sampler-rootless": "Literal samplers in mesh pipelines whose root has no static samplers",
     "lanes-compute-root-recovery": "Partially reflected compute root with an appended descriptor range and paging",
     "lanes-bindless-compute-wide": "A direct-indexed compute program's heap UAV through the paged index map",
     "lanes-bindless-compute-constrained": "The same with fewer resident descriptors than the index it uses",

@@ -67,7 +67,8 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertIn("raster_sampler_texels[] = {1.0f, 3.0f};", text)
         self.assertIn("raster_sampler_linear = 1.5f, raster_sampler_point = 1.0f;", text)
         for name, data in (("mesh_sampler_mesh", raster_fixture.mesh()),
-                           ("mesh_sampler_pixel", raster_fixture.mesh_sampler_pixel())):
+                           ("mesh_sampler_pixel", raster_fixture.mesh_sampler_pixel()),
+                           ("mesh_rootless_pixel", raster_fixture.rootless_sampler_pixel())):
             values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
             self.assertEqual(bytes(int(value) for value in values.split(",")), data)
 
@@ -107,6 +108,11 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertEqual(rows(program, 0xe8, 0xf8), [[0, 0, 1, 501, 0x200]])
         self.assertEqual(rows(program, 0xf0, 0xfc), [[2, 0, 501, 0, 0x2_0004]])
 
+    def test_rootless_program_adds_only_an_empty_feature_part(self):
+        found, base = parts(raster_fixture.rootless_sampler_pixel()), parts(raster_fixture.mesh_sampler_pixel())
+        self.assertEqual(found.pop(b"SFI0"), bytes(8))
+        self.assertEqual(found, base)
+
 
 def trace(slots):
     return ('multi-table raster roots after 1 pipelines: {"reflected": 1}\n'
@@ -119,7 +125,7 @@ class RasterGateTests(unittest.TestCase):
     def run_gate(self, output, compiled, scenario="raster-tables"):
         rootless = [hashlib.sha256(data).hexdigest()
                     for data in (raster_fixture.vertex(), raster_fixture.pixel(), raster_fixture.sampler_pixel(),
-                                 raster_fixture.mesh_sampler_pixel())]
+                                 raster_fixture.mesh_sampler_pixel(), raster_fixture.rootless_sampler_pixel())]
         mesh_key = hashlib.sha256(raster_fixture.mesh()).hexdigest()
         with TemporaryDirectory() as prefix:
             sources = Path(prefix) / SOURCE_CACHE
@@ -169,7 +175,8 @@ class RasterGateTests(unittest.TestCase):
 
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
+                                         "lanes-mesh-sampler-rootless"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
@@ -208,7 +215,8 @@ class RasterGateTests(unittest.TestCase):
         self.assertIsNone(seen["problem"])
         # Only this scenario has the prepared mesh translation, and it is removed after.
         self.assertEqual(seen["mesh"], True)
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
+                                         "lanes-mesh-sampler-rootless"])
         self.assertEqual(seen["mesh_command"][1:5], ["-T", "ms_6_5", "-E", "main"])
         self.assertTrue(seen["mesh_command"][-1].endswith("examples/lanes/mesh_samplers.hlsl"))
         self.assertEqual(seen["left"], ["title.cso"])
@@ -217,6 +225,15 @@ class RasterGateTests(unittest.TestCase):
         self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
                                                 "mesh-samplers")[0]["problem"])
         self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[3]], "mesh-samplers")[0]["problem"])
+        # The root with no static samplers runs the same gate, with the mesh translation prepared.
+        seen, _ = self.run_gate(mesh_trace, [], "mesh-sampler-rootless")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "mesh-sampler-rootless"])
+        self.assertEqual(seen["mesh"], True)
+        self.assertIsNone(seen["problem"])
+        self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
+                                                "mesh-sampler-rootless")[0]["problem"])
+        self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[4]],
+                                                        "mesh-sampler-rootless")[0]["problem"])
 
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)

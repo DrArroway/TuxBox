@@ -281,11 +281,17 @@ unsafe fn create(
     // to that register whatever its state. Build the mesh table again with the
     // missing states as private static samplers, as the vertex/pixel roots do,
     // and keep the root as declared only if the program does not translate then.
+    // Against a root with no static samplers the translation names private
+    // samplers instead, which the root needs just the same.
     if original[0].is_none()
         && let (Some(root), Some((pixel, _)), Some((mesh, _)), Some(field), Some(table)) =
             (guest_root, original[1], original[7], root_record, pipeline.raster_table.as_ref())
         && let Ok(signature) = tuxbox_dxbc::rootsig::parse_rts0(table.pixel_root.as_ref().unwrap_or(root).payload())
-        && let Some(samplers) = tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature)
+        && let Some(samplers) = if signature.static_samplers.is_empty() {
+            super::compute_table::rootless_pixel_samplers(pixel)
+        } else {
+            tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature)
+        }
         && let Ok(Some(extended)) =
             super::mesh_table::reflected(&device.native, root, mesh, Some(pixel), node_mask, &samplers)
         && let Some(variant) = extended.pixel_root.as_ref().and_then(|r| shader_cache::raster_with_root(pixel, r.payload()))

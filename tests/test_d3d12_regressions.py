@@ -163,7 +163,8 @@ class D3D12RegressionTests(unittest.TestCase):
             root=Path(temp)
             code,commands,report,launcher,_=self.run_controls(root,("root-cbv-window","root-cbv-offsets"),[settings])
             self.assertEqual(code,0)
-            window,offsets=commands
+            # Cases run side by side, so either guest can start first.
+            window,offsets=sorted(commands,key=lambda command:"--offsets" in command)
             for key,value in settings.items():
                 at=offsets.index(key)
                 self.assertEqual(offsets[at-1:at+2],["--setenv",key,value])

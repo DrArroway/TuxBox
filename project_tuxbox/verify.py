@@ -489,7 +489,8 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
     descriptor table. Each runs with a roomy and a constrained resident limit.
     """
     from functools import partial
-    from examples.lanes.shader_fixture import bindless_compute_shader, bindless_sampler_shader
+    from examples.lanes.shader_fixture import (bindless_compute_shader, bindless_sampler_shader,
+                                               bindless_texture_store_shader)
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
@@ -501,6 +502,8 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
         trials = [(scenario, hashlib.sha256(build()).hexdigest(), kind, limit)
                   for scenario, build in (("bindless-compute", bindless_compute_shader),
                                           ("bindless-sampler", bindless_sampler_shader),
+                                          ("bindless-heap-read", bindless_compute_shader),
+                                          ("bindless-texture-store", bindless_texture_store_shader),
                                           ("bindless-table-compute", partial(bindless_compute_shader, table=True)))
                   for kind, limit in (("wide", "1000000"), ("constrained", "64"))]
         for scenario, original, kind, limit in trials:
@@ -1180,6 +1183,10 @@ GATE_LABELS = {
     "lanes-bindless-sampler-constrained": "The same with fewer resident descriptors than the indices it uses",
     "lanes-bindless-table-compute-wide": "A direct-indexed compute program's heap UAV when its root also has a table",
     "lanes-bindless-table-compute-constrained": "The same with fewer resident descriptors than the index it uses",
+    "lanes-bindless-heap-read-wide": "A direct-indexed program with no image write leaving a heap UAV texture's title memory alone",
+    "lanes-bindless-heap-read-constrained": "The same with fewer resident descriptors than the indices in use",
+    "lanes-bindless-texture-store-wide": "A direct-indexed store to a heap UAV texture, published to title memory",
+    "lanes-bindless-texture-store-constrained": "The same with fewer resident descriptors than the index it uses",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

@@ -183,6 +183,40 @@ def bindless_sampler_shader():
     ])
 
 
+# The `bindless-texture-store` program, checked with `llvm-mc -mcpu=gfx1030
+# -show-encoding`. It stores one word to one texel of the heap texture at a
+# guest index: the only kind of write a placed texture can receive through the
+# heap. `bindless_compute_shader` above writes a buffer and no image.
+BINDLESS_STORE_TEXTURE = 100
+BINDLESS_STORE_TEXEL = (3, 2)
+BINDLESS_STORE_EXPECTED = 0x7AB1E003
+
+
+def bindless_texture_store_shader():
+    """Direct-indexed store to one texel of a heap texture."""
+    code = [
+        0xB0100000 | BINDLESS_STORE_TEXTURE,  # s_movk_i32 s16, the texture's heap index
+        0x8F008510,                           # s_lshl_b32 s0, s16, 5
+        0xF40C0101, 0x00000000,               # s_load_dwordx8 s[4:11], s[2:3], s0
+        0x7E0002FF, BINDLESS_STORE_EXPECTED,  # v_mov_b32 v0, the word
+        0x7E020280 | BINDLESS_STORE_TEXEL[0],  # v_mov_b32 v1, x
+        0x7E040280 | BINDLESS_STORE_TEXEL[1],  # v_mov_b32 v2, y
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0xF0201108, 0x00010001,               # image_store v0, v[1:2], s[4:11] dmask:0x1 dim:2D unorm
+        0xBF810000,                           # s_endpgm
+    ]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, 64, 1, 1)
+    root = pack([2, 0, 24, 0, 24, 0x400])
+    # FSSM user data: class 5, the resource heap base in s2.
+    return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 2)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", pack([48]) + info + pack([0])),
+        (b"RTS0", root),
+    ])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -201,6 +235,10 @@ def header():
             + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"
             + declaration("bindless_sampler_shader", bindless_sampler_shader())
             + f"constexpr unsigned bindless_texture = {BINDLESS_TEXTURE}, bindless_output = {BINDLESS_OUTPUT};\n"
+            + declaration("bindless_texture_store_shader", bindless_texture_store_shader())
+            + f"constexpr unsigned bindless_store_texture = {BINDLESS_STORE_TEXTURE}, "
+              f"bindless_store_x = {BINDLESS_STORE_TEXEL[0]}, bindless_store_y = {BINDLESS_STORE_TEXEL[1]}, "
+              f"bindless_store_expected = {BINDLESS_STORE_EXPECTED:#x};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
 

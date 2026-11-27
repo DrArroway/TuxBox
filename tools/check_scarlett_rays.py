@@ -23,13 +23,13 @@ from project_tuxbox.inspect import digest
 from project_tuxbox.runtime_shaders import runtime_shader_compiler
 
 SOURCE = ROOT / "tools/reference/scarlett"
-# (request hash prefix, walk). CS_RaytraceShadows_Mixed (641ecfc4956cc4c0) is
-# recorded without a root signature and reads many resources, so it is not
-# replayed here; CS_LaserLightShadowRaytracing reads few and gets two tables.
+# (request hash prefix, walk). The laser and sun programs are recorded without
+# a root signature; the guest declares one naming the registers they read.
 PROGRAMS = {
     "CS_IrradianceCache_ShadowTrace": ("03092f6759cdcd61", "near"),
     "CS_IrradianceCache_ShadowTrace_WithFar": ("2ac21a538145ecc0", "far"),
     "CS_LaserLightShadowRaytracing": ("6247ee64c925b874", "laser"),
+    "CS_RaytraceShadows_Mixed": ("641ecfc4956cc4c0", "sun"),
 }
 
 

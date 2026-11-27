@@ -65,6 +65,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |
+| `raster-heap-stride` | A console vertex program reading its positions by index from a structured buffer in the resource heap ([raster tables](#raster-tables)); not part of `all` |
 | `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
 | `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
 | `mesh-sampler-single` | The one-sampler pixel program in a mesh pipeline whose root's `s0` is point-filtered ([raster tables](#raster-tables)); not part of `all` |
@@ -144,6 +145,8 @@ python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-t
 ```
 
 The suite runs on the Proton backend and removes only these programs' cache entries from the prefix.
+
+The `raster-heap-stride` scenario draws with its own vertex and pixel pair under a root with no parameters and a paged resource heap (resident limit 64). The vertex program takes the descriptor of a structured buffer with 32-byte records from heap slot 100 and reads its position at its vertex number. The program carries no stride, so the provider has to retry the translation against a root with its stride table and bind that table for the draw; every texel must then hold the pixel program's constant. A refused pipeline, a skipped draw or another stride leaves the target at its clear value. `verify` requires the paged stride table bind and a translation made against the pipeline's root.
 
 ## Compute roots
 

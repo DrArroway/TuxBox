@@ -556,13 +556,14 @@ ComPtr<ID3D12PipelineState> console_pipeline(ID3D12Device* device, Stream& parts
     return pipeline;
 }
 
-// Draws a fullscreen triangle with the console vertex program, or with `mesh`
-// when it is given, and `pixel` under `root`, into a 16x16 target of 32-bit
+// Draws a fullscreen triangle with `vertex` (the console vertex program unless
+// another is given), or with `mesh` when that is given, and `pixel` under `root`, into a 16x16 target of 32-bit
 // `format` cleared to zero. Table N is bound at view `tables[N]` of `view_heap`.
 // Returns the texels, row by row.
 std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature* root, D3D12_SHADER_BYTECODE pixel,
                                       DXGI_FORMAT format, ID3D12DescriptorHeap* view_heap,
-                                      std::initializer_list<UINT> tables, D3D12_SHADER_BYTECODE mesh = {}) {
+                                      std::initializer_list<UINT> tables, D3D12_SHADER_BYTECODE mesh = {},
+                                      D3D12_SHADER_BYTECODE vertex = {raster_vertex, sizeof(raster_vertex)}) {
     ComPtr<ID3D12PipelineState> pipeline;
     if (mesh.BytecodeLength) {
         frame_abi::MeshPipelineStream parts;
@@ -570,7 +571,7 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
         pipeline = console_pipeline(device, parts, root, pixel, format);
     } else {
         frame_abi::RasterPipelineStream parts;
-        parts.vs.payload = {raster_vertex, sizeof(raster_vertex)};
+        parts.vs.payload = vertex;
         pipeline = console_pipeline(device, parts, root, pixel, format);
     }
 
@@ -629,7 +630,7 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
     to.PlacedFootprint = {0, {format, side, side, 1, pitch}};
     method<frame_abi::Copy>(list, slot_copy_texture)(list, &to, 0, 0, 0, &from, nullptr, 0);
     direct.submit();
-    direct.finish("draw with two root tables");
+    direct.finish("console raster draw");
 
     std::vector<UINT> rows(side * pitch / 4), texels(side * side);
     D3D12_RANGE range{0, side * pitch}, empty{};
@@ -730,6 +731,55 @@ void raster_tables(ID3D12Device* device) {
         else
             std::snprintf(message, sizeof(message), "texel %u,%u: expected %#x, found %#x", x, y,
                           raster_expected, found);
+        throw std::runtime_error(message);
+    }
+}
+
+// A console vertex program takes a structured buffer's descriptor from the
+// resource heap, under a root with no parameters, and reads its position at its
+// vertex number (`raster_fixture.py`). That load needs the stride of the view at
+// that heap slot. The provider must translate the pair against a root with its
+// stride table and bind it for the draw. Without it the pipeline is refused or
+// becomes a stand-in, and with another stride the triangle misses the target.
+void raster_heap_stride(ID3D12Device* device) {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize heap stride root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create heap stride root");
+
+    auto data = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(heap_stride_records),
+                       D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(data.Get(), heap_stride_records, sizeof(heap_stride_records));
+    D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> view_heap;
+    check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view_heap)), "create heap stride view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(view_heap.Get(), 9)(view_heap.Get());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer = {0, UINT(sizeof(heap_stride_records)) / heap_stride_bytes, heap_stride_bytes,
+                  D3D12_BUFFER_SRV_FLAG_NONE};
+    device->CreateShaderResourceView(data.Get(), &srv, {cpu_base + SIZE_T(heap_stride_index) * stride});
+
+    const auto texels = draw_console_raster(device, root.Get(), {heap_stride_pixel, sizeof(heap_stride_pixel)},
+                                            DXGI_FORMAT_R32_UINT, view_heap.Get(), {}, {},
+                                            {heap_stride_vertex, sizeof(heap_stride_vertex)});
+    for (UINT i = 0; i < texels.size(); ++i) {
+        if (texels[i] == heap_stride_expected) continue;
+        char message[200];
+        if (!texels[i])
+            std::snprintf(message, sizeof(message),
+                          "texel %u,%u is 0: a stand-in pipeline, a skipped draw or a wrong buffer stride", i % 16, i / 16);
+        else
+            std::snprintf(message, sizeof(message), "texel %u,%u: expected %#x, found %#x", i % 16, i / 16,
+                          heap_stride_expected, texels[i]);
         throw std::runtime_error(message);
     }
 }
@@ -3118,6 +3168,7 @@ constexpr Scenario scenarios[] = {
     {L"bindless-texture-store", bindless_texture_store},
     {L"bindless-table-store", bindless_table_store},
     {L"bindless-table-compute", bindless_table_compute},
+    {L"raster-heap-stride", raster_heap_stride},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -3175,7 +3226,8 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
                                              L"compute-root-recovery", L"bindless-compute",
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
-                                             L"bindless-table-store", L"bindless-table-compute"};
+                                             L"bindless-table-store", L"bindless-table-compute",
+                                             L"raster-heap-stride"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -3187,8 +3239,8 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its mesh program's translation prepared first.
-        // mixed-lane also needs the live compiler.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
+        // mixed-lane and raster-heap-stride also need the live compiler.
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
             continue;
         const auto name = narrow(scenario.name);
         try {

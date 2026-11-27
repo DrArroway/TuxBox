@@ -71,6 +71,16 @@ class RasterFixtureTests(unittest.TestCase):
                            ("mesh_rootless_pixel", raster_fixture.rootless_sampler_pixel())):
             values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
             self.assertEqual(bytes(int(value) for value in values.split(",")), data)
+        for name, data in (("heap_stride_vertex", raster_fixture.heap_stride_vertex()),
+                           ("heap_stride_pixel", raster_fixture.heap_stride_pixel())):
+            values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
+            self.assertEqual(bytes(int(value) for value in values.split(",")), data)
+
+    def test_heap_stride_program_takes_the_resource_heap_and_no_root(self):
+        found = parts(raster_fixture.heap_stride_vertex())
+        self.assertNotIn(b"RTS0", found)
+        self.assertEqual(found[b"SFI0"], struct.pack("<Q", 1 << 25))
+        self.assertEqual(rows(fssm(found[b"DXIL"]), 0xe8, 0xf8), [[5, 0, 1, 0, 8]])
 
     def test_sampler_program_declares_the_roots_register_and_builds_a_literal_state(self):
         data = raster_fixture.sampler_pixel()
@@ -176,7 +186,7 @@ class RasterGateTests(unittest.TestCase):
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
         self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
-                                         "lanes-mesh-sampler-rootless"])
+                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
@@ -216,7 +226,7 @@ class RasterGateTests(unittest.TestCase):
         # Only this scenario has the prepared mesh translation, and it is removed after.
         self.assertEqual(seen["mesh"], True)
         self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
-                                         "lanes-mesh-sampler-rootless"])
+                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride"])
         self.assertEqual(seen["mesh_command"][1:5], ["-T", "ms_6_5", "-E", "main"])
         self.assertTrue(seen["mesh_command"][-1].endswith("examples/lanes/mesh_samplers.hlsl"))
         self.assertEqual(seen["left"], ["title.cso"])
@@ -235,10 +245,23 @@ class RasterGateTests(unittest.TestCase):
         self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[4]],
                                                         "mesh-sampler-rootless")[0]["problem"])
 
+    def test_heap_stride_draw_pages_the_heap_and_needs_the_table(self):
+        bound = "bound paged resource descriptor stride table at graphics root slot 1\n"
+        seen, _ = self.run_gate(bound, ["a" * 64], "raster-heap-stride")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-heap-stride"])
+        self.assertEqual(seen["env"]["TUXBOX_DESCRIPTOR_HEAP_LIMIT"], "64")
+        self.assertNotIn("TUXBOX_DESCRIPTOR_HEAP_LIMIT", seen["env_after"])
+        self.assertIsNone(seen["problem"])
+        self.assertIn("did not bind", self.run_gate("", ["a" * 64], "raster-heap-stride")[0]["problem"])
+        self.assertIn("translated nothing", self.run_gate(bound, [], "raster-heap-stride")[0]["problem"])
+        key = hashlib.sha256(raster_fixture.heap_stride_vertex()).hexdigest()
+        self.assertIn("without its root", self.run_gate(bound, [key], "raster-heap-stride")[0]["problem"])
+
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)
         self.assertNotIn("raster-samplers", LANES_SCENARIOS)
         self.assertNotIn("mesh-samplers", LANES_SCENARIOS)
+        self.assertNotIn("raster-heap-stride", LANES_SCENARIOS)
         self.assertIn("lanes-raster-tables", BASE_SUITES)
 
 

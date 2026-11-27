@@ -1,4 +1,4 @@
-"""The synthetic Xbox programs of the `raster-tables` and `raster-samplers` self-tests.
+"""The synthetic Xbox programs of the raster self-tests.
 
 All are small hand-written console programs, not taken from any game. The
 vertex program draws a fullscreen triangle. The `raster-tables` pixel program
@@ -95,6 +95,33 @@ MESH_USER = ([0, 0, 1, 501, 0x200],)
 MESH_USED = ([2, 0, 501, 0, 0x2_0004],)
 MESH_RESOURCES = ([2, 0, 501, 501],)
 MESH_CODE = (0xBF810000,)  # s_endpgm: the desktop replacement runs instead
+
+# The `raster-heap-stride` programs, checked the same way. The vertex program
+# takes the descriptor of a structured buffer from the resource heap (its base in
+# s8, the one FSSM class-5 user record) and reads its position at its vertex
+# number: an indexed raw load, whose byte address needs the buffer's stride.
+HEAP_STRIDE_INDEX = 100
+HEAP_STRIDE_VERTEX_CODE = (
+    0xB0140000 | HEAP_STRIDE_INDEX,  # s_movk_i32 s20, the buffer's heap index
+    0x8F158514,                      # s_lshl_b32 s21, s20, 5
+    0xF4080304, 0x2A000000,          # s_load_dwordx4 s[12:15], s[8:9], s21
+    0xBF8CC07F,                      # s_waitcnt lgkmcnt(0)
+    0xE0382000, 0x80030400,          # buffer_load_dwordx4 v[4:7], v0, s[12:15], 0 idxen
+    0xBF8C3F70,                      # s_waitcnt vmcnt(0)
+    0xF80008CF, 0x07060504,          # exp pos0 v4, v5, v6, v7 done
+    0xBF810000,                      # s_endpgm
+)
+HEAP_STRIDE_USER = ([5, 0, 1, 0, 8],)
+HEAP_STRIDE_EXPECTED = 0x7AB1E005
+HEAP_STRIDE_PIXEL_CODE = (
+    0x7E0002FF, HEAP_STRIDE_EXPECTED,  # v_mov_b32 v0, the word
+    0xF8001801, 0x00000000,            # exp mrt0 v0, off, off, off done vm
+    0xBF810000,                        # s_endpgm
+)
+# One 32-byte record per vertex of a fullscreen triangle: the position, then four
+# zero floats. A load with any other stride reads a different triangle.
+HEAP_STRIDE_BYTES = 32
+HEAP_STRIDE_POSITIONS = ((-1.0, -1.0), (-1.0, 3.0), (3.0, -1.0))
 
 ABSENT = 0xDEADBEEFDEADBEEF
 ROWS_AT, CODE_AT = 0x240, 0x280
@@ -197,6 +224,23 @@ def rootless_sampler_pixel():
     ])
 
 
+def heap_stride_vertex():
+    return container(0x10060, image(7, HEAP_STRIDE_VERTEX_CODE, HEAP_STRIDE_USER), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"ISGN", signature([("SV_VertexID", 0, 6, 1, 0, 1, 1)])),
+        (b"OSGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"PSV0", validation(1)),
+    ])
+
+
+def heap_stride_pixel():
+    return container(0x60, image(5, HEAP_STRIDE_PIXEL_CODE, inputs=2), [
+        (b"ISGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"OSGN", signature([("SV_Target", 0, 64, 1, 0, 1, 0)])),
+        (b"PSV0", validation(0)),
+    ])
+
+
 def mesh():
     """The records-only console mesh program (shader model 6.5, stage 13)."""
     return container(0xD0065, image(2, MESH_CODE, MESH_USER, MESH_USED), [
@@ -210,6 +254,8 @@ def header(vertex_data, pixel_data, sampler_data=None):
         return f"constexpr unsigned char {name}[] = {{{','.join(str(byte) for byte in data)}}};\n"
     sampler_data = sampler_pixel() if sampler_data is None else sampler_data
     texels = ", ".join(f"{texel!r}f" for texel in SAMPLER_TEXELS)
+    records = ", ".join(f"{value!r}f" for x, y in HEAP_STRIDE_POSITIONS
+                        for value in (x, y, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0))
     return ("// Generated from raster_fixture.py.\n"
             + array("raster_vertex", vertex_data) + array("raster_pixel", pixel_data)
             + f"constexpr UINT raster_expected = {EXPECTED:#x}, raster_decoy = {DECOY:#x};\n"
@@ -217,7 +263,11 @@ def header(vertex_data, pixel_data, sampler_data=None):
             + f"constexpr float raster_sampler_texels[] = {{{texels}}};\n"
             + f"constexpr float raster_sampler_linear = {SAMPLER_LINEAR!r}f, raster_sampler_point = {SAMPLER_POINT!r}f;\n"
             + array("mesh_sampler_mesh", mesh()) + array("mesh_sampler_pixel", mesh_sampler_pixel())
-            + array("mesh_rootless_pixel", rootless_sampler_pixel()))
+            + array("mesh_rootless_pixel", rootless_sampler_pixel())
+            + array("heap_stride_vertex", heap_stride_vertex()) + array("heap_stride_pixel", heap_stride_pixel())
+            + f"constexpr UINT heap_stride_index = {HEAP_STRIDE_INDEX}, heap_stride_bytes = {HEAP_STRIDE_BYTES}, "
+              f"heap_stride_expected = {HEAP_STRIDE_EXPECTED:#x};\n"
+            + f"constexpr float heap_stride_records[] = {{{records}}};\n")
 
 
 if __name__ == "__main__":

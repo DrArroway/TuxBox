@@ -12,8 +12,14 @@ impl<'a> Emitter<'a> {
         }
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
-            let not = if vote.none { "!" } else { "" };
-            self.line(&format!("scc = uint({not}WaveActiveAnyTrue(({mask} & 1u) != 0u));"));
+            if vote.count {
+                let dst = ins.dst.first().ok_or("missing lane count destination")?;
+                self.ws(dst, &format!("WaveActiveCountBits(({mask} & 1u) != 0u)"))?;
+                self.line(&format!("scc = uint({} != 0u);", r(dst)?));
+            } else {
+                let not = if vote.none { "!" } else { "" };
+                self.line(&format!("scc = uint({not}WaveActiveAnyTrue(({mask} & 1u) != 0u));"));
+            }
         }
         if self.vote_defs.contains(&idx) {
             let mask = r(&ins.dst[0])?;

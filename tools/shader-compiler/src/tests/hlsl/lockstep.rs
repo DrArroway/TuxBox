@@ -38,9 +38,50 @@ fn mask_operations_vote_on_their_condition_code() {
         insn("s_cmp_eq_u32", Enc::Sopc, 0, vec![Opnd::Scc], vec![Opnd::Sgpr(4), Opnd::ConstInt(0)]),
     ]);
     let votes = prove(&ops, 32).unwrap();
-    assert_eq!(votes[&1], Vote { mask: Opnd::Sgpr(4), none: false });
-    assert_eq!(votes[&3], Vote { mask: Opnd::ExecLo, none: false });
-    assert_eq!(votes[&4], Vote { mask: Opnd::Sgpr(4), none: true });
+    assert_eq!(votes[&1], Vote { mask: Opnd::Sgpr(4), none: false, count: false });
+    assert_eq!(votes[&3], Vote { mask: Opnd::ExecLo, none: false, count: false });
+    assert_eq!(votes[&4], Vote { mask: Opnd::Sgpr(4), none: true, count: false });
+}
+
+#[test]
+fn a_counted_mask_is_a_number_for_the_whole_wave() {
+    let ops = program(vec![
+        compare(),
+        scalar("s_bcnt1_i32_b32", 4, vec![Opnd::VccLo]),
+        scalar("s_add_u32", 5, vec![Opnd::Sgpr(4), Opnd::ConstInt(1)]),
+    ]);
+    let votes = prove(&ops, 32).unwrap();
+    assert_eq!(votes[&1], Vote { mask: Opnd::VccLo, none: false, count: true });
+    assert_eq!(votes.len(), 1);
+}
+
+#[test]
+fn wrexec_leaves_a_mask_and_votes() {
+    let ops = program(vec![
+        scalar("s_mov_b32", 4, vec![Opnd::ExecLo]),
+        scalar("s_andn2_wrexec_b32", 4, vec![Opnd::Sgpr(4)]),
+        scalar("s_mov_b32", 5, vec![Opnd::Sgpr(4)]),
+    ]);
+    assert_eq!(prove(&ops, 32).unwrap()[&1], Vote { mask: Opnd::ExecLo, none: false, count: false });
+    let number = program(vec![scalar("s_andn2_wrexec_b32", 4, vec![Opnd::Sgpr(8)])]);
+    assert_eq!(prove(&number, 32), None);
+}
+
+#[test]
+fn lane_reads_name_their_scalar_destination() {
+    let read = insn("v_readlane_b32", Enc::Vop3, 0, vec![Opnd::Vgpr(2)],
+        vec![Opnd::Vgpr(1), Opnd::ConstInt(0), Opnd::Sgpr(0)]);
+    let save = scalar("s_and_saveexec_b32", 8, vec![Opnd::VccLo]);
+    let mut ops = program(vec![save.clone(), read.clone()]);
+    lower_lane_reads([32, 1, 1], &mut ops).unwrap();
+    assert_eq!(ops[1].dst, [Opnd::Sgpr(2)]);
+    assert_eq!(ops[1].src, [Opnd::Vgpr(1), Opnd::ConstInt(0)]);
+    // Partial waves, 64-lane masks and shared swizzles are not covered.
+    assert!(lower_lane_reads([48, 1, 1], &mut program(vec![save.clone(), read.clone()])).is_err());
+    let wide = scalar("s_and_saveexec_b64", 8, vec![Opnd::VccLo]);
+    assert!(lower_lane_reads([64, 1, 1], &mut program(vec![wide, read.clone()])).is_err());
+    let swizzle = insn("ds_swizzle_b32", Enc::Ds, 0, vec![Opnd::Vgpr(3)], vec![Opnd::Vgpr(1)]);
+    assert!(lower_lane_reads([32, 1, 1], &mut program(vec![save, swizzle, read])).is_err());
 }
 
 #[test]
@@ -58,7 +99,9 @@ fn masks_used_as_numbers_are_refused() {
     let mask = || scalar("s_mov_b32", 4, vec![Opnd::ExecLo]);
     for misuse in [
         scalar("s_add_u32", 5, vec![Opnd::Sgpr(4), Opnd::ConstInt(1)]),
-        scalar("s_bcnt1_i32_b32", 5, vec![Opnd::Sgpr(4)]),
+        // A count cannot replace the mask it counts.
+        scalar("s_bcnt1_i32_b32", 4, vec![Opnd::Sgpr(4)]),
+        scalar("s_bcnt1_i32_b64", 6, vec![Opnd::Sgpr(4)]),
         scalar("s_and_b32", 5, vec![Opnd::Sgpr(4), Opnd::Sgpr(0)]),
         insn("v_mov_b32", Enc::Vop1, 0, vec![Opnd::Vgpr(2)], vec![Opnd::Sgpr(4)]),
         insn("s_cmp_gt_u32", Enc::Sopc, 0, vec![Opnd::Scc], vec![Opnd::Sgpr(4), Opnd::ConstInt(0)]),

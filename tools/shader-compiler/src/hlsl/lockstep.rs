@@ -7,11 +7,58 @@
 //! mask votes across the wave, and so does the condition code a mask operation
 //! sets. That is only faithful while every scalar register holds either a value
 //! all lanes agree on or a lane mask, so a program that treats a mask as a
-//! number, or a number as a mask, is refused.
+//! number, or a number as a mask, is refused. Counting the lanes of a mask is
+//! the exception: the emitter counts them across the wave.
+//!
+//! A program whose lane reads sit in a loop that lanes would leave at different
+//! times is translated a second time this way ([`retry`]). The loop is then one
+//! loop for the wave, so a read reaches its lane in every iteration.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use super::{ray_resolve, Emitter, Enc, Insn, Opnd, COUNT_LANES};
+
+thread_local!(static LANE_READS: Cell<bool> = const { Cell::new(false) });
+
+/// Whether this translation keeps the wave together for its lane reads.
+pub(super) fn for_lane_reads() -> bool { LANE_READS.with(Cell::get) }
+
+pub(super) fn retry<T>(run: impl FnOnce() -> T) -> T {
+    LANE_READS.with(|c| c.set(true));
+    let result = run();
+    LANE_READS.with(|c| c.set(false));
+    result
+}
+
+/// Make every lane read of a 32-lane program a read by the whole wave. The
+/// encoding names the destination SGPR in its vector destination field.
+pub(super) fn lower_lane_reads(group: [u32; 3], insns: &mut [Insn]) -> Result<(), String> {
+    let threads = group.into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
+    let wide = |i: &Insn| i.mnemonic.ends_with("_b64") && (i.mnemonic.contains("saveexec") || i.mnemonic.contains("wrexec"));
+    let narrow = |i: &Insn| i.mnemonic.ends_with("_b32") && (i.mnemonic.contains("saveexec") || i.mnemonic.contains("wrexec"));
+    if threads == 0 || threads % 32 != 0 || insns.iter().any(wide) || !insns.iter().any(narrow) {
+        return Err("whole-wave lane reads need a program of complete 32-lane waves".into());
+    }
+    if insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") {
+        return Err("whole-wave lane reads do not cover compute swizzles".into());
+    }
+    for op in insns.iter_mut().filter(|i| i.mnemonic == "v_readlane_b32") {
+        let dst = match op.dst.first() {
+            Some(&Opnd::Vgpr(n)) if n <= 105 => n as u8,
+            Some(&Opnd::Sgpr(n)) if n <= 105 => n,
+            _ => return Err(format!("v_readlane_b32 at {:#x}: unsupported destination", op.offset)),
+        };
+        if !matches!(op.src[..], [Opnd::Vgpr(_), Opnd::ConstInt(0..=31) | Opnd::Sgpr(0..=105), ..]) {
+            return Err(format!("v_readlane_b32 at {:#x}: unsupported source or lane", op.offset));
+        }
+        op.enc = Enc::Sop1;
+        op.dst = vec![Opnd::Sgpr(dst)];
+        op.src.truncate(2);
+        op.mnemonic = super::indexed_lane::WAVE32_READ_LANE.into();
+    }
+    Ok(())
+}
 
 /// What a scalar register holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +99,8 @@ pub(super) struct Vote {
     pub mask: Opnd,
     /// The code is set when no lane's bit is.
     pub none: bool,
+    /// The destination receives the number of lanes in the mask.
+    pub count: bool,
 }
 
 const VCC: u16 = 106;
@@ -189,6 +238,25 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
             if name.starts_with("tb_") {
                 return None;
             }
+            if name == "s_andn2_wrexec_b32" {
+                // EXEC and the destination: the source's lanes that EXEC does not hold.
+                let combined = state.get(EXEC).join(state.read(op.src.first()?, 1));
+                if !combined.is_mask() {
+                    return None;
+                }
+                state.set(destination?, 1, combined);
+                state.set(EXEC, 1, combined);
+                return Some((combined == Class::Mask).then_some(Vote { mask: Opnd::ExecLo, none: false, count: false }));
+            }
+            if name == "s_bcnt1_i32_b32" && inputs == Class::Mask {
+                let mask = *op.src.first()?;
+                // The count replaces the destination, so the mask must survive it.
+                if op.dst.first() == Some(&mask) {
+                    return None;
+                }
+                state.set(destination?, 1, Class::Uniform);
+                return Some(Some(Vote { mask, none: false, count: true }));
+            }
             if name.contains("saveexec") {
                 let exec = state.get(EXEC);
                 let combined = exec.join(state.read(op.src.first()?, size));
@@ -197,7 +265,7 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
                 }
                 state.set(destination?, size, exec);
                 state.set(EXEC, size, combined);
-                return Some((combined == Class::Mask).then_some(Vote { mask: Opnd::ExecLo, none: false }));
+                return Some((combined == Class::Mask).then_some(Vote { mask: Opnd::ExecLo, none: false, count: false }));
             }
             if op.enc == Enc::Sopc {
                 if inputs.is_value() {
@@ -208,7 +276,7 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
                     else if name.starts_with("s_cmp_lg_") { false }
                     else { return None };
                 return match op.src[..] {
-                    [mask, Opnd::ConstInt(0)] | [Opnd::ConstInt(0), mask] => Some(Some(Vote { mask, none })),
+                    [mask, Opnd::ConstInt(0)] | [Opnd::ConstInt(0), mask] => Some(Some(Vote { mask, none, count: false })),
                     _ => None,
                 };
             }
@@ -236,7 +304,7 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
             }
             if logic(name) {
                 state.set(destination, size, inputs);
-                return Some((inputs == Class::Mask).then_some(Vote { mask: op.dst[0], none: false }));
+                return Some((inputs == Class::Mask).then_some(Vote { mask: op.dst[0], none: false, count: false }));
             }
             if !inputs.is_value() {
                 return None;

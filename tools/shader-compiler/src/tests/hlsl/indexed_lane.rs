@@ -424,7 +424,7 @@ fn refuses_out_of_range_unproven_dynamic_and_non_uniform_loop_readlanes() {
 }
 
 #[test]
-fn f1_refuses_non_uniform_branch_skipping_entire_readlane_loop_and_prior_non_uniform_loop() {
+fn f1_non_uniform_branch_skipping_a_readlane_loop_takes_the_whole_wave_and_prior_loop_is_refused() {
     let [r0, r1] = readlane_const(7, 1, 31);
     // F1a: `if (exec != 0) { for (s10 = 4; s10 != 0; --s10) v_readlane_b32 ... }`
     let skip_loop = [
@@ -437,10 +437,11 @@ fn f1_refuses_non_uniform_branch_skipping_entire_readlane_loop_and_prior_non_uni
         0xbf85_fffb, // 0x1c: s_cbranch_scc1 L_loop
         0xbf81_0000, // 0x20: s_endpgm
     ];
-    let err = crate::hlsl::translate(&compute_shader([32, 1, 1], &skip_loop, None))
-        .err()
-        .expect("non-uniform branch skipping entire barrier loop must be refused");
-    assert!(err.contains("non-uniform loop"), "{err}");
+    // The barrier lowering refuses it; the whole wave then takes the branch.
+    let kept = crate::hlsl::translate(&compute_shader([32, 1, 1], &skip_loop, None)).unwrap();
+    assert_eq!(kept.required_wave_size, Some(32));
+    assert!(kept.hlsl.contains("WaveActiveAnyTrue((exec_lo & 1u) != 0u)"), "{}", kept.hlsl);
+    assert!(kept.hlsl.contains("WaveReadLaneAt(") && !kept.hlsl.contains("tb_swizzle"), "{}", kept.hlsl);
 
     // F1b: Preceding non-uniform loop would desync function-wide `tb_guard` before barrier loop.
     let prior_non_uniform = [

@@ -130,6 +130,9 @@ impl<'a> Emitter<'a> {
         if matches!(m.as_str(), "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16") {
             return self.emit_f16_interp(ins);
         }
+        if lockstep::for_lane_reads() && m == "v_mov_b32" && matches!(s.first(), Some(Opnd::Raw(233 | 250))) {
+            return self.emit_lockstep_dpp_move(d, ins);
+        }
         if ins.enc == Enc::Vop2 && ins.op == wave_sum::DPP8_EXCHANGE {
             return self.emit_dpp8_exchange(m.clone(), s, d, ins);
         }

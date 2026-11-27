@@ -4,7 +4,9 @@
 Each synthetic wave32 program branches on a lane mask, then runs a reduction
 behind a mask branch, which the translator can only express by branching with
 the whole wave. One program also runs as a ray tracing resolve shader, whose
-interleaved loops go through the block dispatcher. The reference models the console: one program counter per wave,
+interleaved loops go through the block dispatcher. Two more read a lane inside
+a loop that lanes leave at different times: a sum for each distinct key, and a
+read of lanes that have already left. The reference models the console: one program counter per wave,
 shared scalar registers and per-lane vector writes under EXEC. Only the
 translator's input and output are instrumented. No game data is needed.
 """
@@ -71,8 +73,52 @@ BODIES = {
 }
 
 
+# Loops that lanes leave at different times, around a lane read. Each is a
+# whole program body and needs no reduction after it.
+LANE_READ_BODIES = {
+    # For each distinct key among the pending lanes, add up the values of the
+    # lanes that hold it with a lane-exchange sum, and give the first of them
+    # the total.
+    "keysum": [
+        "v_and_b32_e32 v11, 3, v0", "v_mov_b32_e32 v10, 0", "v_mov_b32_e32 v13, 1", label("again"),
+        "s_add_u32 s21, s21, 1", "v_cmp_ne_u32_e32 vcc_lo, 0, v13", "v_mov_b32_e32 v13, 0",
+        "s_and_saveexec_b32 s8, vcc_lo", branch("s_cbranch_execz", "tail"),
+        "v_readfirstlane_b32 s9, v11", "v_cmp_eq_u32_e64 s1, s9, v11", "s_and_saveexec_b32 s10, s1",
+        branch("s_cbranch_execz", "other"), "v_mov_b32_e32 v1, v0", "v_mov_b32_e32 v14, 0",
+        "s_or_saveexec_b32 s11, -1", "v_mov_b32_e32 v2, 0", "v_mov_b32_e32 v3, 0",
+        "v_cndmask_b32_e64 v2, v2, v1, s11", "v_cndmask_b32_e64 v3, v3, v14, s11",
+        *(line for move in ("dpp8:[1,0,3,2,5,4,7,6]", "dpp8:[2,2,0,0,6,6,4,4]", "dpp8:[4,4,4,4,0,0,0,0]",
+                            "row_mirror bound_ctrl:1")
+          for line in (f"v_mov_b32 v4, v2 {move}", f"v_mov_b32 v5, v3 {move}",
+                       "v_add_co_u32 v2, vcc_lo, v4, v2", "v_add_co_ci_u32_e32 v3, vcc_lo, v5, v3, vcc_lo")),
+        "v_permlanex16_b32 v4, v2, 0, 0", "v_permlanex16_b32 v5, v3, 0, 0",
+        "v_add_co_u32 v2, vcc_lo, v4, v2", "v_add_co_ci_u32_e32 v3, vcc_lo, v5, v3, vcc_lo",
+        "v_readlane_b32 s2, v2, 0", "v_readlane_b32 s3, v3, 0", "s_mov_b32 exec_lo, s11",
+        "v_mbcnt_lo_u32_b32 v15, -1, 0", "s_ff1_i32_b32 s11, exec_lo", "v_cmpx_eq_i32_e32 s11, v15",
+        branch("s_cbranch_execz", "other"), "v_lshl_add_u32 v10, s3, 16, s2", label("other"),
+        "s_mov_b32 exec_lo, s10", "v_cndmask_b32_e64 v13, 0, 1, s1", "v_xor_b32_e32 v13, 1, v13",
+        label("tail"), "s_mov_b32 exec_lo, s8", "v_cmp_ne_u32_e32 vcc_lo, 0, v13",
+        "s_bcnt1_i32_b32 s1, vcc_lo", branch("s_cbranch_scc1", "again"),
+        "s_bcnt1_i32_b32 s20, exec_lo",
+    ],
+    # A waterfall over the keys that reads two fixed lanes in every iteration,
+    # whether or not they are still in the loop.
+    "retired": [
+        "v_and_b32_e32 v11, 3, v0", "v_mov_b32_e32 v10, 0", "s_mov_b32 s16, exec_lo",
+        "s_mov_b32 s17, exec_lo", label("again"), "v_readfirstlane_b32 s18, v11",
+        "v_cmpx_eq_u32_e32 s18, v11", "v_readlane_b32 s22, v0, 5",
+        "v_readlane_b32 s23, v0, 30", "s_add_u32 s22, s22, s23", "s_xor_b32 s21, s21, s22",
+        "s_add_u32 s21, s21, s20", "v_add_nc_u32_e32 v10, s22, v10",
+        "s_add_u32 s20, s20, 1", "s_andn2_wrexec_b32 s17, s17", branch("s_cbranch_execnz", "again"),
+        "s_mov_b32 exec_lo, s16",
+    ],
+}
+
+
 def program(body, resolve=False):
     """Assembler lines and branch positions of one complete program."""
+    if body in LANE_READ_BODIES.values():
+        return ["s_mov_b32 s12, exec_lo", *body, "s_mov_b32 exec_lo, s12", "s_endpgm"]
     return [
         "s_mov_b32 s12, exec_lo",
         # The resolve mode is selected by a compare into an odd scalar register.
@@ -110,9 +156,39 @@ def words_of(items, llvm_mc, *options):
     return words
 
 
+def lane_read_model(name, active, values):
+    """The console's registers after `LANE_READ_BODIES[name]`."""
+    lanes = range(len(values))
+    keys = [value & 3 for value in values]
+    v10, iterations, mixed = [0] * len(values), 0, 0
+    pending = [i for i in lanes if active[i]]
+    while True:
+        # `v_readfirstlane_b32` reads lane 0 when EXEC is empty.
+        key = keys[pending[0] if pending else 0]
+        group = [i for i in pending if keys[i] == key]
+        if name == "keysum":
+            iterations += 1
+            if group:
+                total = sum(values[i] for i in group)
+                v10[group[0]] = ((total >> 32 << 16) + total) & 0xffffffff
+        else:
+            read = (values[5] + values[30]) & 0xffffffff
+            mixed = ((mixed ^ read) + iterations) & 0xffffffff
+            for i in group:
+                v10[i] = (v10[i] + read) & 0xffffffff
+            iterations += 1
+        pending = [i for i in pending if i not in group]
+        if not pending:
+            break
+    s20, s21 = (sum(active), iterations) if name == "keysum" else (iterations, mixed)
+    return [(s20, s21, v10[i], 0) for i in lanes]
+
+
 def model(name, active, values):
     """The console's registers after `BODIES[name]`, as one row per lane."""
     lanes = range(len(values))
+    if name in LANE_READ_BODIES:
+        return lane_read_model(name, active, values)
     taken = [active[i] and values[i] > LIMIT for i in lanes]
     some = any(taken)
     s20 = s21 = 0
@@ -205,8 +281,9 @@ def main(argv=None):
     with TemporaryDirectory(dir=work) as tmp:
         trial = Path(tmp)
         expected, shaders = {}, {}
-        for name, body, resolve in [*((name, name, False) for name in BODIES), ("resolve", "dispatch", True)]:
-            words = words_of(program(BODIES[body], resolve), args.llvm_mc)
+        bodies = BODIES | LANE_READ_BODIES
+        for name, body, resolve in [*((name, name, False) for name in bodies), ("resolve", "dispatch", True)]:
+            words = words_of(program(bodies[body], resolve), args.llvm_mc)
             emitted = subprocess.check_output(
                 [args.emitter.resolve(), *(["resolve"] if resolve else []), str(WIDTH),
                  *(f"{word:08x}" for word in words)], text=True, timeout=30)

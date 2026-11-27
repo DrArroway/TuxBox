@@ -109,6 +109,15 @@ pub(in crate::hlsl) fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&I
     stencil_target: Option<u32>) -> Result<Translated, String> {
     let mut lane_read_failed = false;
     let first = translate_outputs_once_impl(ex, feeds_ps, output_order, stencil_target, &mut lane_read_failed);
+    if lane_read_failed && ex.stage == Stage::Compute && stencil_target.is_none()
+        && first.as_ref().is_err_and(|reason| reason.contains("inside non-uniform loop"))
+    {
+        // Keeping the wave together makes every loop one the reads can use.
+        return lockstep::retry(|| translate_outputs_once(ex, feeds_ps, output_order, stencil_target)).or_else(|e| {
+            if std::env::var_os("TB_DFDEBUG").is_some() { eprintln!("{e}"); }
+            first
+        });
+    }
     if first.is_ok() || lane_read_failed || ex.stage != Stage::Compute || stencil_target.is_some() { return first; }
     // Once this exact exchange subset is recognized, a later binding or
     // emitter error must not silently replace its collectives with copies.
@@ -236,7 +245,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         && wave_sum::straight_exchange(&mut insns, compute_group(ex));
     let required_wave_size = if wave_cull {
         fspx_wave.filter(|&width| width == 32)
-    } else if straight_exchange { None }
+    } else if straight_exchange || lockstep::for_lane_reads() { None }
       else { lower_wave_reductions(&mut insns)? };
     // A masked DPP prefix/total scan is a whole-wave collective: the host wave must
     // match the guest wave width (32 or 64 lanes). Only compute shaders need this
@@ -265,10 +274,12 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     let scan_width = scan.as_ref().map(|s| s.width);
     let ordinary_wave = !wave_cull && !page_waves && !lone_lane::on();
     // A waterfall loop is one per-lane read of a lane; exchange it once.
-    let waterfall_gathers = ex.stage == Stage::Compute && !resolve_wave32 && lower_waterfall_gathers(&mut insns) > 0;
+    let waterfall_gathers = ex.stage == Stage::Compute && !resolve_wave32 && !lockstep::for_lane_reads()
+        && lower_waterfall_gathers(&mut insns) > 0;
     let group = compute_group(ex);
     let group_count = group.into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
     let allow_group_read_fallback = ex.stage == Stage::Compute
+        && !lockstep::for_lane_reads()
         && !resolve_wave32
         && ordinary_wave
         && scan_width.is_none()
@@ -278,7 +289,13 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     let prepared_election_lane = !resolve_wave32 && ex.stage == Stage::Compute
         && indexed_lane::prepare(group, &mut insns);
     let fspx_wave32 = ex.fspx_config.is_some_and(|cfg| cfg[4] == 0x100001);
-    let read_plan = if !resolve_wave32 && ordinary_wave && ex.stage == Stage::Compute {
+    let read_plan = if lockstep::for_lane_reads() {
+        if !ordinary_wave || resolve_wave32 || scan_width.is_some() || required_wave_size.is_some_and(|w| w != 32) {
+            return Err("whole-wave lane reads conflict with another wave lowering".into());
+        }
+        lockstep::lower_lane_reads(group, &mut insns)?;
+        indexed_lane::ConstantReadPlan::default()
+    } else if !resolve_wave32 && ordinary_wave && ex.stage == Stage::Compute {
         indexed_lane::lower_constant_reads(
             group,
             &mut insns,
@@ -429,7 +446,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         *lane_read_failed = true;
         return Err("conflicting wave widths for Wave32 lane read".into());
     }
-    let required_wave_size = required_wave_size.or((uses_quad_add && em.straight_pixel_quad.is_none() && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema || wave32_readlane || wave32_mbcnt_mask).then_some(32));
+    let required_wave_size = required_wave_size.or((uses_quad_add && em.straight_pixel_quad.is_none() && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema || wave32_readlane || wave32_mbcnt_mask || lockstep::for_lane_reads()).then_some(32));
     // A ballot or minimum over active invocations also works in the final
     // partial subgroup. Keep the full-wave requirement for every other user.
     let partial_election = required_wave_size.is_none() && election == Some(ElectionLowering::Native32);
@@ -491,7 +508,13 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     if mixed_lane_wave32 && !wave_loops::uniform_dispatch(&em) {
         return Err("mixed lane Wave32 requires proven whole-wave scalar dispatch".into());
     }
-    if let Some(width) = required_wave_size {
+    if lockstep::for_lane_reads() {
+        if required_wave_size != Some(32) || em.compute_swizzle || em.indexed_lane {
+            return Err("whole-wave lane reads conflict with another wave lowering".into());
+        }
+        em.lockstep = Some(lockstep::prove(&em.insns, 32).ok_or("whole-wave lane reads: masks and numbers mix")?);
+    }
+    if let Some(width) = required_wave_size.filter(|_| !lockstep::for_lane_reads()) {
         match wave_sum::check_control_flow(&em.insns, width) {
             Ok(guards) => em.reduction_execz_guards = guards,
             Err(reason) if em.resolve_wave32 && !requires_ballot && scan_width.is_none() => {

@@ -47,7 +47,7 @@ impl<'a> Emitter<'a> {
         // Validate loop structure.
         // Several back-edges to one header = `continue`s. The last one (highest address)
         // closes the loop; each earlier one becomes a forward jump to that closing branch
-        // which also forces another iteration (see the `|| j{B}` at the loop bottom).
+        // which also forces another iteration (see the `tb_skip == B` at the loop bottom).
         let mut heads: HashMap<usize, usize> = HashMap::new(); // L -> B
         for (&b, &l) in &back {
             let e = heads.entry(l).or_insert(b);
@@ -90,8 +90,9 @@ impl<'a> Emitter<'a> {
         for (&branch, &label) in &target {
             earliest.entry(label).and_modify(|first| *first = (*first).min(branch)).or_insert(branch);
         }
-        for l in &labels {
-            self.line(&format!("bool j{l} = false;"));
+        if !labels.is_empty() {
+            // See `skip_to`.
+            self.line("uint tb_skip = 0u;");
         }
         if !loops.is_empty() {
             self.line("uint tb_guard = 0u;");
@@ -198,7 +199,7 @@ impl<'a> Emitter<'a> {
                 self.end_guard(&mut open);
                 cur.clear();
                 let mut condition=String::from("(exec_lo & 1u) != 0u");
-                for t in &active { write!(condition," && !j{t}").unwrap(); }
+                for &t in &active { write!(condition, " && {}", not_skipping(t)).unwrap(); }
                 self.line(&format!("uint election{i}base = tb_lane & ~63u;"));
                 self.line(&format!("if ((tb_lane & 63u)==0) tb_swizzle[election{i}base]=0xffffffffu;"));
                 self.line("GroupMemoryBarrierWithGroupSync();");
@@ -305,9 +306,10 @@ impl<'a> Emitter<'a> {
             }
             if active != cur || (open && heads.contains_key(&i)) {
                 self.end_guard(&mut open);
-                if !active.is_empty() {
-                    let c: Vec<String> = active.iter().map(|t| format!("j{t}")).collect();
-                    self.line(&format!("if (!({})) {{", c.join(self.flag_or())));
+                // Every pending target lies past the nearest one, so one comparison
+                // decides for all of them.
+                if let Some(&nearest) = active.iter().min() {
+                    self.line(&format!("if {} {{", not_skipping(nearest)));
                     open = true;
                 }
                 cur = active;
@@ -362,15 +364,16 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("tb_c{i} = ({cond});"));
                 if labels.contains(&i) {
                     // A `continue` jumped here: iterate again regardless of the condition.
-                    self.line(&format!("tb_c{i} = tb_c{i} || j{i};"));
+                    self.line(&format!("tb_c{i} = tb_c{i} || (tb_skip == {i}u);"));
                 }
                 self.end_guard(&mut open);
                 cur.clear();
-                // Clear the flags of labels inside this loop body for the next iteration.
-                for t in labels.iter().filter(|&&t| t > head && t <= i) {
-                    self.line(&format!("j{t} = false;"));
+                // Forget targets inside this loop body before the next iteration. A
+                // target past the latch stays pending and leaves the loop.
+                if labels.range(head + 1..=i).next().is_some() {
+                    self.line(&format!("tb_skip *= uint(tb_skip > {i}u);"));
                 }
-                let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
+                let exits = labels.range(i + 1..).next().is_some();
                 let guard = if self.wave_cull || self.light_grid || probe_trace
                     || self.wave_bounded_latches.contains(&i)
                     || self.packed.as_ref().is_some_and(|p| p.copy_backedges.contains(&i) || p.bounded_backedges.contains(&i))
@@ -386,10 +389,10 @@ impl<'a> Emitter<'a> {
                 } else if vote {
                     // Keep the whole wave in the loop while any lane still needs to
                     // run; finished lanes stay in the loop, masked, and still hit the barriers.
-                    let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
+                    let exit = if exits { format!(" && tb_skip <= {i}u") } else { String::new() };
                     self.line(&format!("}} while (WaveActiveAnyTrue(tb_c{i}{exit}){guard});"));
                 } else {
-                    let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
+                    let exit = if exits { format!(" && tb_skip <= {i}u") } else { String::new() };
                     self.line(&format!("}} while (tb_c{i}{exit}{guard});"));
                 }
                 self.loop_depth = self.loop_depth.saturating_sub(1);
@@ -573,16 +576,26 @@ impl<'a> Emitter<'a> {
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(())
     }
+
+    /// Take a forward branch to the instruction at `target` when `condition` holds.
+    ///
+    /// `tb_skip` is the farthest target this invocation has branched to, and it
+    /// skips everything before that instruction. One variable keeps large programs
+    /// from carrying a flag per target through every loop and join, which costs DXC
+    /// much of a large compile. Compute programs update it without a branch, which
+    /// keeps the control flow of an unoptimised compile small.
+    pub(in crate::hlsl) fn skip_to(&mut self, target: usize, condition: Option<&str>) {
+        let statement = match condition {
+            None => format!("tb_skip = max(tb_skip, {target}u);"),
+            Some(c) if self.ex.stage == Stage::Compute => format!("tb_skip = max(tb_skip, uint({c}) * {target}u);"),
+            Some(c) => format!("if ({c}) tb_skip = max(tb_skip, {target}u);"),
+        };
+        self.line(&statement);
+    }
 }
 
-impl Emitter<'_> {
-    /// How a guard combines jump flags. `||` makes one block per flag, and a
-    /// guard can name hundreds. Compute programs compile unoptimised or under
-    /// a DXC budget, so they take `|`: the resolve kernels' unoptimised DXIL
-    /// lost a third of its blocks and DXC finished optimising in 45 s instead
-    /// of 83-110 s. Optimised graphics stages keep `||`, which DXC threads
-    /// into smaller code (a mesh shader grew from 18 to 26 KiB with `|`).
-    fn flag_or(&self) -> &'static str {
-        if self.ex.stage == Stage::Compute { " | " } else { " || " }
-    }
+/// Whether this invocation runs the instructions before `target`, as far as the
+/// forward branches to it are concerned.
+pub(in crate::hlsl) fn not_skipping(target: usize) -> String {
+    format!("(tb_skip < {target}u)")
 }

@@ -7,7 +7,7 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from project_tuxbox.runtime_shaders import COMPUTE_TIMEOUT, O0_TIMEOUT, O0_TIMEOUT_MAX, ShaderRefused, archive_request, compile_dxil, compile_request, o0_timeout, serve, snapshot_compiler_cache
 from project_tuxbox.scarlett_prep import scarlett_requests
@@ -366,7 +366,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         store = Mock()
         store.key.return_value = "content"
         store.fetch.return_value = False
-        store.is_slow.return_value = True
+        store.is_slow.side_effect = lambda request, target: target == "ps_6_6"
 
         def run(args, *, timeout):
             if args[0] == "xshader":
@@ -387,13 +387,13 @@ class RuntimeShaderLinks(unittest.TestCase):
             self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
             self.assertFalse(compile_request(source, key, self.tools, self.cache, self.session))
         self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxv"])
-        store.is_slow.assert_not_called()
+        store.is_slow.assert_called_once_with(key, "ps_6_6.unmarked")
         store.mark_slow.assert_not_called()
         store.save.assert_called_once()
         self.assertEqual((self.session / (key + ".cso")).read_bytes(), dxil)
 
     def test_large_pixel_candidate_failures_clean_output_and_preserve_baseline_policy(self):
-        """Rejected candidates retry the baseline with its original slow-marker policy."""
+        """Rejected candidates retry the default compile; a timeout goes straight to -O0."""
         hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
         hlsl.write_bytes(b"x" * (256 << 10))
         dxil = portable_program(0, b"baseline")
@@ -402,7 +402,8 @@ class RuntimeShaderLinks(unittest.TestCase):
                 with self.subTest(failure=failure, slow=slow):
                     output.unlink(missing_ok=True)
                     store = Mock()
-                    store.is_slow.return_value = slow
+                    # An older marker, from a compile that kept lifetime markers.
+                    store.is_slow.side_effect = lambda request, target, slow=slow: slow and target == "ps_6_6"
                     candidate = False
                     def run(args, *, timeout):
                         nonlocal candidate
@@ -410,7 +411,7 @@ class RuntimeShaderLinks(unittest.TestCase):
                             candidate = "-disable-lifetime-markers" in args
                             if candidate:
                                 self.assertEqual(timeout, 15)
-                                store.is_slow.assert_not_called()
+                                store.is_slow.assert_called_once_with("request", "ps_6_6.unmarked")
                                 if failure != "missing":
                                     output.write_bytes(portable_program(1, b"wrong") if failure == "stage" else b"partial")
                                 if failure == "flag":
@@ -419,18 +420,25 @@ class RuntimeShaderLinks(unittest.TestCase):
                                     raise subprocess.TimeoutExpired("dxc", timeout)
                             else:
                                 self.assertFalse(output.exists())
-                                self.assertEqual("-O0" in args, slow)
-                                self.assertEqual(timeout, O0_TIMEOUT if slow else 15)
+                                unoptimised = slow or failure == "timeout"
+                                self.assertEqual("-O0" in args, unoptimised)
+                                self.assertEqual(timeout, O0_TIMEOUT if unoptimised else 15)
                                 output.write_bytes(dxil)
                         elif candidate and failure == "dxv":
                             raise ToolFailure("dxv", 1, "invalid DXIL")
                     with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run):
                         self.assertEqual(compile_dxil("dxc", "dxv", "ps_6_6", hlsl, output, store, "request", 0), dxil)
-                    store.is_slow.assert_called_once_with("request", "ps_6_6")
-                    store.mark_slow.assert_not_called()
+                    asked = [call("request", "ps_6_6.unmarked")]
+                    if failure == "timeout":
+                        self.assertEqual(store.is_slow.call_args_list, asked)
+                        self.assertEqual(store.mark_slow.call_args_list,
+                                         [call("request", "ps_6_6"), call("request", "ps_6_6.unmarked")])
+                    else:
+                        self.assertEqual(store.is_slow.call_args_list, [*asked, call("request", "ps_6_6")])
+                        store.mark_slow.assert_not_called()
 
     def test_large_pixel_baseline_timeout_still_marks_slow(self):
-        """A baseline timeout alone persists the slow marker and retries at O0."""
+        """When the flag is rejected, a default timeout marks the request slow and retries at O0."""
         hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
         hlsl.write_bytes(b"x" * (256 << 10))
         store = Mock()
@@ -442,6 +450,8 @@ class RuntimeShaderLinks(unittest.TestCase):
                 if "-O0" not in args:
                     store.mark_slow.assert_not_called()
                     output.write_bytes(b"partial")
+                    if "-disable-lifetime-markers" in args:
+                        raise ToolFailure("dxc", 1, "unknown argument")
                     raise subprocess.TimeoutExpired("dxc", timeout)
                 self.assertEqual(timeout, O0_TIMEOUT)
                 output.write_bytes(dxil)
@@ -459,17 +469,18 @@ class RuntimeShaderLinks(unittest.TestCase):
                 compile_dxil("dxc", "dxv", "ps_6_6", hlsl, output, None, "request", 0)
         self.assertEqual(compiler.call_count, 1)
 
-    def test_large_pixel_policy_leaves_other_profiles_and_small_sources_unchanged(self):
-        """Of these, only compute programs with a wave size turn lifetime markers off."""
+    def test_every_profile_compiles_without_lifetime_markers(self):
+        """The default optimisation level is kept, except for cs_6_6."""
         hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
-        for target, stage, size in (("ps_6_6", 0, (256 << 10) - 1), ("ps_6_0", 0, 256 << 10),
-                                    ("cs_6_6", 5, 256 << 10), ("gs_6_6", 2, 256 << 10)):
-            with self.subTest(target=target, size=size):
-                hlsl.write_bytes(b"x" * size)
-                dxil = portable_program(stage, b"baseline")
+        hlsl.write_bytes(b"small program")
+        for target, stage in (("ps_6_6", 0), ("ps_6_0", 0), ("vs_6_6", 1), ("gs_6_6", 2),
+                              ("ms_6_5", 13), ("cs_6_0", 5), ("cs_6_6", 5)):
+            with self.subTest(target=target):
+                dxil = portable_program(stage, b"unmarked")
                 def run(args, *, timeout):
                     if args[0] == "dxc":
-                        self.assertEqual("-disable-lifetime-markers" in args, target == "cs_6_6")
+                        self.assertIn("-disable-lifetime-markers", args)
+                        self.assertEqual("-O1" in args, target == "cs_6_6")
                         self.assertNotIn("-O0", args)
                         output.write_bytes(dxil)
                 with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:

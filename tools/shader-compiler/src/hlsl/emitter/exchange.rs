@@ -16,7 +16,7 @@ impl<'a> Emitter<'a> {
         if active.is_empty() {
             self.line(&format!("uint readlane{idx} = {load};"));
         } else {
-            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+            let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
             self.line(&format!("uint readlane{idx} = ({}) ? {load} : 0u;", guard.join(" && ")));
         }
         self.line("GroupMemoryBarrierWithGroupSync();");
@@ -26,7 +26,7 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_compute_swizzle(&mut self, idx: usize, ins: &Insn, active: &[usize]) -> Result<(), String> {
         if ins.mnemonic == GROUP_GATHER {
             // Every lane publishes its value; each reads the lane its index names.
-            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+            let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
             let value = r(&ins.src[0])?;
             let value = if guard.is_empty() { value } else { format!("({}) ? {value} : 0u", guard.join(" && ")) };
             self.line(&format!("tb_swizzle[tb_lane] = {value};"));
@@ -55,7 +55,7 @@ impl<'a> Emitter<'a> {
             // mask the publish too, so the remaining lanes read a zero.
             let value = r(&ins.src[0])?;
             let value = if self.in_accepted_swizzle_loop() && !active.is_empty() {
-                let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+                let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
                 format!("({}) ? {value} : 0u", guard.join(" && "))
             } else {
                 value
@@ -66,7 +66,7 @@ impl<'a> Emitter<'a> {
             if active.is_empty() {
                 self.line(&format!("uint swizzle{idx} = {load};"));
             } else {
-                let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+                let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
                 self.line(&format!("uint swizzle{idx} = ({}) ? {load} : 0u;", guard.join(" && ")));
             }
             self.line("GroupMemoryBarrierWithGroupSync();");
@@ -82,7 +82,7 @@ impl<'a> Emitter<'a> {
         // Skipped and EXEC-masked lanes contribute zero. Rendezvous before
         // reapplying the guest branch guard to the destination write.
         let mut predicate = String::from("(exec_lo & 1u) != 0u");
-        for label in active { write!(predicate, " && !j{label}").unwrap(); }
+        for &label in active { write!(predicate, " && {}", not_skipping(label)).unwrap(); }
         let value = r(&ins.src[0])?;
         self.line(&format!("tb_swizzle[tb_lane] = ({predicate}) ? {value} : 0u;"));
         self.line("GroupMemoryBarrierWithGroupSync();");

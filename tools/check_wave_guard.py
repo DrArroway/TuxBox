@@ -35,9 +35,9 @@ def instrument(hlsl, width=32, mode='all', variant='original', group=None):
     if width == 64:
         if mode not in ("values", "state") or "[WaveSize(" in hlsl or "tb_reduction_read(" not in hlsl:
             raise ValueError("fixture must use portable wave64")
-        compare, end, label = "0x0050", "0x00ac", "j27"
+        compare, end, label = "0x0050", "0x00ac", "tb_skip == 27u"
         if variant != "original":
-            end, label = "0x00b4", "j29"
+            end, label = "0x00b4", "tb_skip == 29u"
         outputs = ("first", "s7") if mode == "values" else (f"uint({label})", "exec_lo & 1u")
         stores = (f"    output[64u + {index}] = {outputs[0]};\n"
                   f"    output[128u + {index}] = {outputs[1]};\n")
@@ -45,9 +45,9 @@ def instrument(hlsl, width=32, mode='all', variant='original', group=None):
         if width != 32 or mode != "all" or "[WaveSize(32)]" not in hlsl:
             raise ValueError("fixture must require wave32")
         compare, end = "0x0044", "0x0094"
-        label = "j23"
+        label = "tb_skip == 23u"
         if variant != "original":
-            end, label = "0x009c", "j25"
+            end, label = "0x009c", "tb_skip == 25u"
         stores = (
             "    output[32u + gtid.x] = first;\n"
             "    output[64u + gtid.x] = s7;\n"

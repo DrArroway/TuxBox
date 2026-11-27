@@ -208,8 +208,8 @@ fn accepts_full_mask_branches_and_uniform_scalar_reads() {
     ] {
         let translated = translate(&shader(32, shape)).expect("bounded reduction");
         assert_eq!(translated.required_wave_size, Some(32));
-        assert!(translated.hlsl.contains(" | (vcc_lo == 0u);"));
-        assert!(translated.hlsl.contains(" | (exec_lo == 0u);"));
+        assert!(translated.hlsl.contains("uint(vcc_lo == 0u) * "));
+        assert!(translated.hlsl.contains("uint(exec_lo == 0u) * "));
         assert!(!translated.hlsl.contains("++tb_guard < 65536u"));
     }
 }
